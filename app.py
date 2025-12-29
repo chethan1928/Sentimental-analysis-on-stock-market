@@ -3,17 +3,7 @@ Language Analysis Functions for FastAPI
 Two functions: analyze_speaking() and analyze_writing()
 """
 
-import numpy as np
-import whisper
-import librosa
-from g2p_en import G2p
-import jellyfish
-from openai import AzureOpenAI
-from typing import Optional
-
-# Azure OpenAI Configuration 
-
-# Initialize
+import numpy as np 
 g2p = G2p()
 llm_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
@@ -42,13 +32,14 @@ def _to_python_type(value):
 _whisper_model = None
 
 def _get_whisper_model():
-    """Load Whisper model (cached)"""
+    """Load Faster-Whisper model (cached)"""
     global _whisper_model
     if _whisper_model is None:
         try:
-            _whisper_model = whisper.load_model("base")
+            # Using 'base' model on CPU with int8 quantization for speed and memory efficiency
+            _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
         except Exception as e:
-            raise Exception(f"Failed to load Whisper model. Check internet connection. Error: {str(e)}")
+            raise Exception(f"Failed to load Faster-Whisper model. Error: {str(e)}")
     return _whisper_model
 
 
@@ -92,20 +83,21 @@ def analyze_speaking(audio_path: str, expected_text: str) -> dict:
     
     try:
         model = _get_whisper_model()
-        whisper_result = model.transcribe(audio_path, word_timestamps=True, language="en")
-        transcription = whisper_result["text"].strip()
+        segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True, language="en")
+        
+        segments = list(segments)
+        transcription = "".join([s.text for s in segments]).strip()
         result["transcription"] = transcription
         
         words_with_timing = []
-        if "segments" in whisper_result:
-            for segment in whisper_result["segments"]:
-                if "words" in segment:
-                    for word in segment["words"]:
-                        words_with_timing.append({
-                            "word": word["word"].strip(),
-                            "start": word["start"],
-                            "end": word["end"]
-                        })
+        for segment in segments:
+            if segment.words:
+                for word in segment.words:
+                    words_with_timing.append({
+                        "word": word.word.strip(),
+                        "start": word.start,
+                        "end": word.end
+                    })
         
         y, sr = librosa.load(audio_path, sr=16000)
         duration = librosa.get_duration(y=y, sr=sr)
@@ -460,17 +452,27 @@ Find ALL errors. JSON only."""
             "level_match": detected_level == expected_cefr,
             "explanation": "Basic heuristic assessment (LLM unavailable)"
         }
+        result["word_analysis"] = {
+            "total_words": word_count,
+            "misspelled_words": [],
+            "grammar_errors": []
+        }
+        result["fluency"] = {
+            "flow_score": 50,
+            "connectors_used": []
+        }
         result["writing_quality"] = {
             "grammar_score": basic_score,
+            "spelling_score": basic_score,
+            "punctuation_score": basic_score,
             "vocabulary_score": basic_score,
-            "coherence_score": basic_score,
-            "task_achievement_score": basic_score,
             "overall_score": basic_score
         }
         result["feedback"] = {
             "strengths": ["Text was provided"],
             "improvements": ["LLM analysis unavailable for detailed feedback"],
-            "suggestions": ["Configure Azure OpenAI for full assessment"]
+            "suggestions": ["Configure Azure OpenAI for full assessment"],
+            "corrected_text": user_text
         }
         result["overall_score"] = basic_score
         result["success"] = True
