@@ -1,523 +1,145 @@
-"""
-Language Analysis Functions for FastAPI
-Two functions: analyze_speaking() and analyze_writing()
-"""
 
-import numpy as np 
-g2p = G2p()
-llm_client = AzureOpenAI(
-    api_key=AZURE_OPENAI_API_KEY,
-    api_version=AZURE_OPENAI_VERSION,
-    azure_endpoint=AZURE_OPENAI_ENDPOINT
-)
-
-IDEAL_WPM_MIN = 120
-IDEAL_WPM_MAX = 160
-
-
-def _to_python_type(value):
-    """Convert numpy types to Python native types for JSON serialization"""
-    if isinstance(value, (np.integer, np.int32, np.int64)):
-        return int(value)
-    elif isinstance(value, (np.floating, np.float32, np.float64)):
-        return float(value)
-    elif isinstance(value, np.ndarray):
-        return value.tolist()
-    elif isinstance(value, dict):
-        return {k: _to_python_type(v) for k, v in value.items()}
-    elif isinstance(value, list):
-        return [_to_python_type(v) for v in value]
-    return value
-
-_whisper_model = None
-
-def _get_whisper_model():
-    """Load Faster-Whisper model (cached)"""
-    global _whisper_model
-    if _whisper_model is None:
-        try:
-            # Using 'base' model on CPU with int8 quantization for speed and memory efficiency
-            _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        except Exception as e:
-            raise Exception(f"Failed to load Faster-Whisper model. Error: {str(e)}")
-    return _whisper_model
-
-
-def call_gpt(prompt: str, system_prompt: str = "") -> Optional[str]:
-    """Call Azure OpenAI GPT"""
-    try:
-        response = llm_client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": system_prompt or "You are an expert language assessment evaluator."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=1500,
-            temperature=0.3
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"LLM Error: {str(e)}"
-
-
-def analyze_speaking(audio_path: str, expected_text: str) -> dict:
+def analyze_speaking_advanced(audio_path: str, target_cefr: str = "B1") -> dict:
     """
-    Analyze speaking/pronunciation from audio file.
-    
-    Args:
-        audio_path: Path to audio file (MP3, WAV, M4A)
-        expected_text: The text that should have been spoken
-    
-    Returns:
-        dict with transcription, pronunciation, fluency, comparison metrics
+    Advanced speaking analysis: transcription, fluency, pronunciation, 
+    grammar errors, filler words, and CEFR vocabulary assessment.
     """
     result = {
         "success": False,
         "error": None,
         "transcription": "",
-        "pronunciation": {},
         "fluency": {},
-        "comparison": {},
-        "overall_score": 0.0
+        "pronunciation": {},
+        "grammar_assessment": {
+            "errors": [],
+            "filler_words": [],
+            "corrected_text": "",
+            "filler_count": 0
+        },
+        "vocabulary_analysis": {
+            "cefr_level": "",
+            "vocabulary_score": 0,
+            "suggestions": []
+        },
+        "overall_score": 0.0,
+        "llm_feedback": ""
     }
     
     try:
+        # 1. Transcription
         model = _get_whisper_model()
         segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True, language="en")
-        
         segments = list(segments)
-        transcription = "".join([s.text for s in segments]).strip()
+        transcription = " ".join([s.text.strip() for s in segments]).strip()
         result["transcription"] = transcription
         
-        words_with_timing = []
-        for segment in segments:
-            if segment.words:
-                for word in segment.words:
-                    words_with_timing.append({
-                        "word": word.word.strip(),
-                        "start": word.start,
-                        "end": word.end
-                    })
-        
+        if not transcription:
+            result["error"] = "No speech detected"
+            return _to_python_type(result)
+
+        # 2. Acoustic Analysis (Fluency & Pronunciation)
         y, sr = librosa.load(audio_path, sr=16000)
         duration = librosa.get_duration(y=y, sr=sr)
-        
         word_count = len(transcription.split())
         wpm = (word_count / duration) * 60 if duration > 0 else 0
         
+        # Fluency calculation
         intervals = librosa.effects.split(y, top_db=30)
         pauses = []
         if len(intervals) > 1:
             for i in range(1, len(intervals)):
-                pause_duration = (intervals[i][0] - intervals[i-1][1]) / sr
-                if pause_duration > 0.3:
-                    pauses.append(pause_duration)
-        
+                p_dur = (intervals[i][0] - intervals[i-1][1]) / sr
+                if p_dur > 0.3: pauses.append(p_dur)
         
         wpm_score = 100
-        if wpm < IDEAL_WPM_MIN:
-            wpm_score = max(0, 100 - (IDEAL_WPM_MIN - wpm) * 2)
-        elif wpm > IDEAL_WPM_MAX:
-            wpm_score = max(0, 100 - (wpm - IDEAL_WPM_MAX) * 2)
+        if wpm < IDEAL_WPM_MIN: wpm_score = max(0, 100 - (IDEAL_WPM_MIN - wpm) * 2)
+        elif wpm > IDEAL_WPM_MAX: wpm_score = max(0, 100 - (wpm - IDEAL_WPM_MAX) * 2)
         
         pause_score = max(0, 100 - len(pauses) * 5 - sum(p for p in pauses if p > 2) * 10)
-        overall_fluency = (wpm_score * 0.5 + pause_score * 0.5)
+        fluency_score = (wpm_score * 0.5 + pause_score * 0.5)
         
         result["fluency"] = {
-            "duration_seconds": round(duration, 2),
-            "word_count": word_count,
-            "words_per_minute": round(wpm, 1),
-            "wpm_score": round(wpm_score, 1),
+            "wpm": round(wpm, 1),
             "pause_count": len(pauses),
-            "avg_pause_duration": round(sum(pauses) / len(pauses), 2) if pauses else 0,
-            "pause_score": round(pause_score, 1),
-            "overall_score": round(overall_fluency, 1)
+            "score": round(fluency_score, 1)
         }
         
+        # Pronunciation calculation
         pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-        pitch_values = []
-        for t in range(pitches.shape[1]):
-            index = magnitudes[:, t].argmax()
-            pitch = pitches[index, t]
-            if pitch > 0:
-                pitch_values.append(pitch)
-        
-        pitch_std = np.std(pitch_values) if pitch_values else 0
-        pitch_mean = np.mean(pitch_values) if pitch_values else 0
-        
-        if pitch_std < 20:
-            intonation_score = 60
-        elif pitch_std > 100:
-            intonation_score = 70
-        else:
-            intonation_score = 85 + (pitch_std - 20) * 0.2
-        intonation_score = min(100, max(0, intonation_score))
+        pitch_vals = [pitches[magnitudes[:, t].argmax(), t] for t in range(pitches.shape[1]) if pitches[magnitudes[:, t].argmax(), t] > 0]
+        pitch_std = np.std(pitch_vals) if pitch_vals else 0
         
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
         clarity_score = min(100, np.mean(spectral_centroids) / 30)
+        intonation_score = min(100, max(0, 85 + (pitch_std - 20) * 0.2)) if 20 < pitch_std < 100 else (60 if pitch_std < 20 else 75)
         
-        rms = librosa.feature.rms(y=y)[0]
-        volume_consistency = 100 - (np.std(rms) / np.mean(rms) * 100) if np.mean(rms) > 0 else 50
-        volume_consistency = min(100, max(0, volume_consistency))
-        
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo, beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        
-        rhythm_consistency = 70
-        if len(beats) > 2:
-            beat_intervals = np.diff(beats)
-            if np.mean(beat_intervals) > 0:
-                rhythm_consistency = 100 - (np.std(beat_intervals) / np.mean(beat_intervals) * 50)
-        rhythm_consistency = min(100, max(0, rhythm_consistency))
-        
-        phoneme_accuracy = 75.0
-        if expected_text and transcription:
-            try:
-                expected_phonemes = g2p(expected_text.lower())
-                spoken_phonemes = g2p(transcription.lower())
-                
-                expected_set = set([p for p in expected_phonemes if p.isalpha()])
-                spoken_set = set([p for p in spoken_phonemes if p.isalpha()])
-                
-                if expected_set:
-                    matched = expected_set & spoken_set
-                    phoneme_accuracy = (len(matched) / len(expected_set)) * 100
-            except:
-                phoneme_accuracy = 75.0
-        
-        overall_pronunciation = (
-            intonation_score * 0.2 + 
-            clarity_score * 0.2 + 
-            volume_consistency * 0.15 + 
-            rhythm_consistency * 0.15 +
-            phoneme_accuracy * 0.3
-        )
-        
+        pron_score = (intonation_score * 0.4 + clarity_score * 0.6)
         result["pronunciation"] = {
-            "phoneme_accuracy": round(phoneme_accuracy, 1),
-            "intonation_score": round(intonation_score, 1),
-            "pitch_variation": round(pitch_std, 1),
-            "pitch_mean": round(pitch_mean, 1),
-            "clarity_score": round(min(100, clarity_score), 1),
-            "volume_consistency": round(volume_consistency, 1),
-            "rhythm_consistency": round(rhythm_consistency, 1),
-            "tempo": round(float(tempo), 1),
-            "overall_score": round(min(100, overall_pronunciation), 1)
+            "clarity": round(clarity_score, 1),
+            "intonation": round(intonation_score, 1),
+            "score": round(pron_score, 1)
         }
+
+        # 3. LLM Deep Analysis (Grammar, Fillers, Vocab)
+        prompt = f"""Analyze the following spoken transcript for a language learner targeting CEFR level {target_cefr}.
         
-        if expected_text and transcription:
-            def normalize(text):
-                return ' '.join(text.lower().split())
-            
-            def get_words(text):
-                return [w for w in text.lower().split() if w.isalnum() or w.replace("'", "").isalnum()]
-            
-            spoken_norm = normalize(transcription)
-            expected_norm = normalize(expected_text)
-            
-            spoken_words = get_words(transcription)
-            expected_words = get_words(expected_text)
-            
-            spoken_set = set(spoken_words)
-            expected_set = set(expected_words)
-            
-            matched = spoken_set & expected_set
-            missing = expected_set - spoken_set
-            extra = spoken_set - expected_set
-            
-            word_match_pct = (len(matched) / len(expected_words) * 100) if expected_words else 100
-            
-            try:
-                similarity = jellyfish.jaro_winkler_similarity(spoken_norm, expected_norm) * 100
-            except:
-                similarity = word_match_pct
-            
-            order_score = 100
-            if spoken_words and expected_words:
-                matches_in_order = 0
-                exp_idx = 0
-                for word in spoken_words:
-                    if exp_idx < len(expected_words) and word == expected_words[exp_idx]:
-                        matches_in_order += 1
-                        exp_idx += 1
-                    elif word in expected_words[exp_idx:]:
-                        try:
-                            exp_idx = expected_words.index(word, exp_idx) + 1
-                            matches_in_order += 1
-                        except:
-                            pass
-                order_score = (matches_in_order / len(expected_words) * 100) if expected_words else 100
-            
-            completeness = (len(matched) / len(expected_words) * 100) if expected_words else 100
-            overall_accuracy = (word_match_pct * 0.4 + similarity * 0.3 + order_score * 0.2 + completeness * 0.1)
-            
-            result["comparison"] = {
-                "word_match_percentage": round(word_match_pct, 1),
-                "similarity": round(similarity, 1),
-                "order_accuracy": round(order_score, 1),
-                "completeness": round(completeness, 1),
-                "words_matched": len(matched),
-                "words_expected": len(expected_words),
-                "words_spoken": len(spoken_words),
-                "missing_words": list(missing)[:10],
-                "extra_words": list(extra)[:10],
-                "overall_accuracy": round(overall_accuracy, 1)
-            }
-            
-            result["overall_score"] = round(
-                (result["pronunciation"]["overall_score"] * 0.4 +
-                 result["fluency"]["overall_score"] * 0.3 +
-                 result["comparison"]["overall_accuracy"] * 0.3), 1
-            )
-            
-            # Get LLM feedback for speaking analysis
-            llm_prompt = f"""You are a language assessment expert. Compare what the student SPOKE vs what they SHOULD have said.
-
-Expected Text (Correct Answer):
-{expected_text}
-
-What Student Said (Transcription):
-{transcription}
-
-Analysis Metrics:
-- Pronunciation Score: {result["pronunciation"]["overall_score"]}/100
-- Fluency Score: {result["fluency"]["overall_score"]}/100
-- Word Match: {word_match_pct:.1f}%
-- Words Per Minute: {result["fluency"]["words_per_minute"]}
-- Missing Words: {', '.join(list(missing)[:5]) if missing else 'None'}
-- Extra Words: {', '.join(list(extra)[:5]) if extra else 'None'}
-
-Provide a detailed analysis:
-
-1. Accuracy Assessment (1-2 sentences)
-   - How closely does the spoken text match the expected text?
-
-2. Word-by-Word Analysis
-   - Correct words
-   - Missing words (should have said but didn't)
-   - Extra words (said but shouldn't have)
-   - Substituted words (said differently)
-
-3. Pronunciation and Fluency Feedback
-   - Any words that might have been mispronounced
-   - Flow and natural speech patterns
-
-4. Improvement Suggestions (2-3 bullet points)
-   - Specific tips to improve
-
-5. Score: X/100 (numerical score based on accuracy)
-
-Be encouraging but honest. Keep response concise."""
-
-            llm_feedback = call_gpt(llm_prompt, "You are an expert language assessment evaluator providing helpful, concise feedback.")
-            result["llm_feedback"] = llm_feedback if llm_feedback else "LLM feedback not available"
-            
-        else:
-            result["comparison"] = {"available": False}
-            result["overall_score"] = round(
-                (result["pronunciation"]["overall_score"] * 0.5 +
-                 result["fluency"]["overall_score"] * 0.5), 1
-            )
-            result["llm_feedback"] = "Provide expected text to get AI feedback"
+        TRANSCRIPT: "{transcription}"
         
-        result["success"] = True
+        INSTRUCTIONS:
+        1. Identify GRAMMAR ERRORS and provide corrections.
+        2. Identify FILLER WORDS (like "um", "ah", "like", "you know", "er").
+        3. Provide a FULL CORRECTED VERSION of the text.
+        4. Analyze VOCABULARY:
+           - Is it appropriate for {target_cefr}?
+           - Suggest 3 better/more advanced words.
+        5. Provide an overall linguistic feedback.
+
+        Respond ONLY in this JSON format:
+        {{
+            "grammar_assessment": {{
+                "errors": [
+                    {{"error": "incorrect phrase", "correction": "correct phrase", "rule": "why it was wrong"}}
+                ],
+                "filler_words": ["um", "like"],
+                "corrected_text": "Complete corrected transcription here"
+            }},
+            "vocabulary_analysis": {{
+                "detected_cefr": "B1",
+                "vocabulary_score": 85,
+                "suggestions": [
+                    {{"original": "good", "advanced": "exceptional", "context": "describing weather"}}
+                ]
+            }},
+            "linguistic_score": 80,
+            "feedback": "Overall assessment of language usage."
+        }}
+        """
         
-    except Exception as e:
-        result["error"] = str(e)
-        result["success"] = False
-    
-    return _to_python_type(result)
-
-
-def analyze_writing(user_text: str, topic: str, expected_cefr: str = "B1") -> dict:
-    """
-    Analyze writing for topic relevance and CEFR level.
-    
-    Args:
-        user_text: The text written by the user
-        topic: The topic/prompt the user was asked to write about
-        expected_cefr: Expected CEFR level (A1, A2, B1, B2, C1, C2)
-    
-    Returns:
-        dict with topic_relevance, cefr_assessment, writing_quality, feedback
-    """
-    result = {
-        "success": False,
-        "error": None,
-        "topic_relevance": {},
-        "cefr_assessment": {},
-        "word_analysis": {},
-        "fluency": {},
-        "writing_quality": {},
-        "feedback": {},
-        "overall_score": 0.0
-    }
-    
-    if not user_text or not topic:
-        result["error"] = "Both user_text and topic are required"
-        return _to_python_type(result)
-    
-    expected_cefr = expected_cefr.upper()
-    if expected_cefr not in ["A1", "A2", "B1", "B2", "C1", "C2"]:
-        expected_cefr = "B1"
-    
-    prompt = f"""Analyze this writing sample. Respond ONLY with valid JSON.
-
-**TOPIC:** {topic}
-**TEXT:** {user_text}
-**EXPECTED CEFR:** {expected_cefr}
-
-JSON Response:
-{{
-    "topic_relevance": {{
-        "score": <0-100>,
-        "is_on_topic": <true/false>
-    }},
-    "cefr_assessment": {{
-        "level_match": <true/false>,
-        "vocabulary_level": "<A1/A2/B1/B2/C1/C2>",
-        "grammar_level": "<A1/A2/B1/B2/C1/C2>",
-        "too_simple_words": ["word1"],
-        "too_complex_words": ["word1"],
-        "suggested_vocabulary": ["better_word1"],
-        "explanation": "Why vocabulary matches or doesn't match {expected_cefr}"
-    }},
-    "word_analysis": {{
-        "total_words": <number>,
-        "misspelled_words": [{{"word": "wrong", "correction": "correct"}}],
-        "grammar_errors": [{{"error": "text", "correction": "fixed"}}]
-    }},
-    "fluency": {{
-        "flow_score": <0-100>,
-        "connectors_used": ["and", "but"]
-    }},
-    "writing_quality": {{
-        "grammar_score": <0-100>,
-        "spelling_score": <0-100>,
-        "punctuation_score": <0-100>,
-        "vocabulary_score": <0-100>,
-        "overall_score": <0-100>
-    }},
-    "feedback": {{
-        "strengths": ["strength1"],
-        "improvements": ["area1"],
-        "suggestions": ["tip1"],
-        "corrected_text": "Full corrected text"
-    }},
-    "overall_score": <0-100>
-}}
-
-CEFR Guidelines:
-- A1: Basic (I, you, like, good)
-- A2: Simple (weekend, friend, usually)
-- B1: Abstract (opinion, experience)
-- B2: Sophisticated (significant, consequently)
-- C1: Advanced (unprecedented, nuanced)
-- C2: Near-native (quintessential, paradigm)
-
-Find ALL errors. JSON only."""
-
-    llm_response = call_gpt(prompt, "You are an expert CEFR language assessor. Respond only with valid JSON.")
-    
-    if not llm_response or llm_response.startswith("LLM Error"):
-        result["error"] = llm_response or "LLM not available"
+        llm_response = call_gpt(prompt, "You are an expert language examiner. Focus on grammar, filler words, and CEFR vocabulary.")
         
-        word_count = len(user_text.split())
-        sentence_count = user_text.count('.') + user_text.count('!') + user_text.count('?')
-        avg_word_length = sum(len(w) for w in user_text.split()) / max(word_count, 1)
-        
-        if avg_word_length < 4 and word_count < 50:
-            detected_level = "A1"
-        elif avg_word_length < 5 and word_count < 100:
-            detected_level = "A2"
-        elif avg_word_length < 5.5:
-            detected_level = "B1"
-        elif avg_word_length < 6:
-            detected_level = "B2"
-        elif avg_word_length < 6.5:
-            detected_level = "C1"
-        else:
-            detected_level = "C2"
-        
-        basic_score = min(100, word_count * 2)
-        
-        result["topic_relevance"] = {
-            "score": 70,
-            "is_on_topic": True,
-            "feedback": "Unable to fully assess - LLM unavailable"
-        }
-        result["cefr_assessment"] = {
-            "detected_level": detected_level,
-            "expected_level": expected_cefr,
-            "level_match": detected_level == expected_cefr,
-            "explanation": "Basic heuristic assessment (LLM unavailable)"
-        }
-        result["word_analysis"] = {
-            "total_words": word_count,
-            "misspelled_words": [],
-            "grammar_errors": []
-        }
-        result["fluency"] = {
-            "flow_score": 50,
-            "connectors_used": []
-        }
-        result["writing_quality"] = {
-            "grammar_score": basic_score,
-            "spelling_score": basic_score,
-            "punctuation_score": basic_score,
-            "vocabulary_score": basic_score,
-            "overall_score": basic_score
-        }
-        result["feedback"] = {
-            "strengths": ["Text was provided"],
-            "improvements": ["LLM analysis unavailable for detailed feedback"],
-            "suggestions": ["Configure Azure OpenAI for full assessment"],
-            "corrected_text": user_text
-        }
-        result["overall_score"] = basic_score
-        result["success"] = True
-        return _to_python_type(result)
-    
-    try:
         import json
-        
-        json_start = llm_response.find('{')
-        json_end = llm_response.rfind('}') + 1
-        if json_start != -1 and json_end > json_start:
-            json_str = llm_response[json_start:json_end]
-            parsed = json.loads(json_str)
-            
-            result["topic_relevance"] = parsed.get("topic_relevance", {})
-            result["cefr_assessment"] = parsed.get("cefr_assessment", {})
-            result["word_analysis"] = parsed.get("word_analysis", {})
-            result["fluency"] = parsed.get("fluency", {})
-            result["writing_quality"] = parsed.get("writing_quality", {})
-            result["feedback"] = parsed.get("feedback", {})
-            result["overall_score"] = parsed.get("overall_score", 0)
-            result["success"] = True
-        else:
-            result["error"] = "Could not parse LLM response as JSON"
-            result["raw_response"] = llm_response
-            
-    except json.JSONDecodeError as e:
-        result["error"] = f"JSON parse error: {str(e)}"
-        result["raw_response"] = llm_response
+        try:
+            json_start = llm_response.find('{')
+            json_end = llm_response.rfind('}') + 1
+            if json_start != -1:
+                parsed = json.loads(llm_response[json_start:json_end])
+                
+                # Merge into result
+                result["grammar_assessment"] = parsed.get("grammar_assessment", {})
+                result["grammar_assessment"]["filler_count"] = len(result["grammar_assessment"].get("filler_words", []))
+                
+                result["vocabulary_analysis"] = parsed.get("vocabulary_analysis", {})
+                result["llm_feedback"] = parsed.get("feedback", "")
+                
+                # Overall Score: Balanced average of Fluency, Pronunciation, and linguistic quality
+                ling_score = parsed.get("linguistic_score", 0)
+                result["overall_score"] = round((fluency_score * 0.3 + pron_score * 0.3 + ling_score * 0.4), 1)
+        except Exception as e:
+            result["llm_feedback"] = f"AI Analysis failed to parse: {str(e)}"
+            result["overall_score"] = round((fluency_score + pron_score) / 2, 1)
+
+        result["success"] = True
     except Exception as e:
         result["error"] = str(e)
-    
+        
     return _to_python_type(result)
-
-
-if __name__ == "__main__":
-    print("Testing analyze_writing...")
-    writing_result = analyze_writing(
-        user_text="I like to play football with my friends. We play every weekend in the park. It is very fun.",
-        topic="Write about your favorite hobby",
-        expected_cefr="A2"
-    )
-    print(f"Writing Analysis Success: {writing_result['success']}")
-    if writing_result['success']:
-        print(f"Overall Score: {writing_result['overall_score']}")
-        print(f"CEFR Detected: {writing_result['cefr_assessment'].get('detected_level', 'N/A')}")
-    else:
-        print(f"Error: {writing_result['error']}")
