@@ -673,7 +673,8 @@ async def writing_analysis(request: WritingRequest):
 
 
 
- 
+ pip install fastapi uvicorn python-multipart python-dotenv openai openai-whisper librosa numpy g2p_en jellyfish
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
