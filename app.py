@@ -1,39 +1,25 @@
- 
 """
 Language Analysis Functions for FastAPI
 Two functions: analyze_speaking() and analyze_writing()
 """
 
-import os
-import tempfile
-from pathlib import Path
-from typing import Optional
 import numpy as np
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 import whisper
 import librosa
+from g2p_en import G2p
+import jellyfish
+from openai import AzureOpenAI
+from typing import Optional
 
-try:
-    from g2p_en import G2p
-    import jellyfish
-    G2P_AVAILABLE = True
-    g2p = G2p()
-except ImportError:
-    G2P_AVAILABLE = False
-    g2p = None
+# Azure OpenAI Configuration 
 
-try:
-    from openai import AzureOpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-
+# Initialize
+g2p = G2p()
+llm_client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
 
 IDEAL_WPM_MIN = 120
 IDEAL_WPM_MAX = 160
@@ -59,45 +45,18 @@ def _get_whisper_model():
     """Load Whisper model (cached)"""
     global _whisper_model
     if _whisper_model is None:
-        _whisper_model = whisper.load_model("base")
+        try:
+            _whisper_model = whisper.load_model("base")
+        except Exception as e:
+            raise Exception(f"Failed to load Whisper model. Check internet connection. Error: {str(e)}")
     return _whisper_model
 
 
-def _get_llm_client():
-    """Get Azure OpenAI client"""
-    if not OPENAI_AVAILABLE:
-        return None
-    
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "")
-    api_key = os.getenv("AZURE_OPENAI_API_KEY", "")
-    api_version = os.getenv("AZURE_OPENAI_VERSION", "2024-02-15-preview")
-    
-    if not endpoint or not api_key:
-        return None
-    
-    if "/openai/" in endpoint:
-        endpoint = endpoint.split("/openai/")[0]
-    
-    return AzureOpenAI(
-        azure_endpoint=endpoint,
-        api_key=api_key,
-        api_version=api_version
-    )
-
-
-def _call_llm(prompt: str, system_prompt: str = "") -> Optional[str]:
-    """Call Azure OpenAI LLM"""
-    client = _get_llm_client()
-    if not client:
-        return None
-    
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "")
-    if not deployment:
-        return None
-    
+def call_gpt(prompt: str, system_prompt: str = "") -> Optional[str]:
+    """Call Azure OpenAI GPT"""
     try:
-        response = client.chat.completions.create(
-            model=deployment,
+        response = llm_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": system_prompt or "You are an expert language assessment evaluator."},
                 {"role": "user", "content": prompt}
@@ -220,7 +179,7 @@ def analyze_speaking(audio_path: str, expected_text: str) -> dict:
         rhythm_consistency = min(100, max(0, rhythm_consistency))
         
         phoneme_accuracy = 75.0
-        if G2P_AVAILABLE and expected_text and transcription:
+        if expected_text and transcription:
             try:
                 expected_phonemes = g2p(expected_text.lower())
                 spoken_phonemes = g2p(transcription.lower())
@@ -276,12 +235,9 @@ def analyze_speaking(audio_path: str, expected_text: str) -> dict:
             
             word_match_pct = (len(matched) / len(expected_words) * 100) if expected_words else 100
             
-            if G2P_AVAILABLE:
-                try:
-                    similarity = jellyfish.jaro_winkler_similarity(spoken_norm, expected_norm) * 100
-                except:
-                    similarity = word_match_pct
-            else:
+            try:
+                similarity = jellyfish.jaro_winkler_similarity(spoken_norm, expected_norm) * 100
+            except:
                 similarity = word_match_pct
             
             order_score = 100
@@ -361,7 +317,7 @@ Provide a detailed analysis:
 
 Be encouraging but honest. Keep response concise."""
 
-            llm_feedback = _call_llm(llm_prompt, "You are an expert language assessment evaluator providing helpful, concise feedback.")
+            llm_feedback = call_gpt(llm_prompt, "You are an expert language assessment evaluator providing helpful, concise feedback.")
             result["llm_feedback"] = llm_feedback if llm_feedback else "LLM feedback not available"
             
         else:
@@ -469,7 +425,7 @@ CEFR Guidelines:
 
 Find ALL errors. JSON only."""
 
-    llm_response = _call_llm(prompt, "You are an expert CEFR language assessor. Respond only with valid JSON.")
+    llm_response = call_gpt(prompt, "You are an expert CEFR language assessor. Respond only with valid JSON.")
     
     if not llm_response or llm_response.startswith("LLM Error"):
         result["error"] = llm_response or "LLM not available"
@@ -563,118 +519,3 @@ if __name__ == "__main__":
         print(f"CEFR Detected: {writing_result['cefr_assessment'].get('detected_level', 'N/A')}")
     else:
         print(f"Error: {writing_result['error']}")
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional
-import tempfile
-import os
-
-from analysis_functions import analyze_speaking, analyze_writing
-
-app = FastAPI(
-    title="Language Analysis API" 
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-class WritingRequest(BaseModel):
-    user_text: str
-    topic: str
-    expected_cefr: str = "B1"
-
-
-class WritingResponse(BaseModel):
-    success: bool
-    error: Optional[str] = None
-    topic_relevance: dict = {}
-    cefr_assessment: dict = {}
-    word_analysis: dict = {}
-    fluency: dict = {}
-    writing_quality: dict = {}
-    feedback: dict = {}
-    overall_score: float = 0.0
-
-
-class SpeakingResponse(BaseModel):
-    success: bool
-    error: Optional[str] = None
-    transcription: str = ""
-    pronunciation: dict = {}
-    fluency: dict = {}
-    comparison: dict = {}
-    llm_feedback: str = ""
-    overall_score: float = 0.0
-
-
- 
-@app.post("/speaking", response_model=SpeakingResponse)
-async def speaking_analysis(
-    audio: UploadFile = File(..., description="Audio file (MP3, WAV, M4A)"),
-    expected_text: str = Form(..., description="The text that should have been spoken")
-):
-    """ 
-    """
-    allowed_types = ["audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a"]
-    
-    suffix = os.path.splitext(audio.filename)[1].lower()
-    if suffix not in [".mp3", ".wav", ".m4a"]:
-        raise HTTPException(status_code=400, detail="Invalid file type. Use MP3, WAV, or M4A")
-    
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            content = await audio.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        result = analyze_speaking(tmp_path, expected_text)
-        
-        os.unlink(tmp_path)
-        
-        return SpeakingResponse(**result)
-        
-    except Exception as e:
-        if 'tmp_path' in locals():
-            try:
-                os.unlink(tmp_path)
-            except:
-                pass
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/writing", response_model=WritingResponse)
-async def writing_analysis(request: WritingRequest):
-    """
-    Analyze writing for topic relevance and CEFR level.
-    
-     """
-    if not request.user_text or not request.topic:
-        raise HTTPException(status_code=400, detail="user_text and topic are required")
-    
-    try:
-        result = analyze_writing(
-            user_text=request.user_text,
-            topic=request.topic,
-            expected_cefr=request.expected_cefr
-        )
-        
-        return WritingResponse(**result)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
- pip install fastapi uvicorn python-multipart python-dotenv openai openai-whisper librosa numpy g2p_en jellyfish
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-
