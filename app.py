@@ -1,145 +1,81 @@
-
-def analyze_speaking_advanced(audio_path: str, target_cefr: str = "B1") -> dict:
+@router.get("/feedback/{session_id}")
+async def get_interview_feedback(session_id: str):
     """
-    Advanced speaking analysis: transcription, fluency, pronunciation, 
-    grammar errors, filler words, and CEFR vocabulary assessment.
-    """
-    result = {
-        "success": False,
-        "error": None,
-        "transcription": "",
-        "fluency": {},
-        "pronunciation": {},
-        "grammar_assessment": {
-            "errors": [],
-            "filler_words": [],
-            "corrected_text": "",
-            "filler_count": 0
-        },
-        "vocabulary_analysis": {
-            "cefr_level": "",
-            "vocabulary_score": 0,
-            "suggestions": []
-        },
-        "overall_score": 0.0,
-        "llm_feedback": ""
-    }
+    Get detailed per-turn feedback for an interview session.
     
-    try:
-        # 1. Transcription
-        model = _get_whisper_model()
-        segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True, language="en")
-        segments = list(segments)
-        transcription = " ".join([s.text.strip() for s in segments]).strip()
-        result["transcription"] = transcription
-        
-        if not transcription:
-            result["error"] = "No speech detected"
-            return _to_python_type(result)
+    Returns structured grammar, vocabulary, pronunciation, fluency and answer evaluation feedback for each turn.
+    """
+    feedback = await db.get_session_feedback(session_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if feedback["session_type"] != "interview":
+        raise HTTPException(status_code=400, detail="Not an interview session")
+    return feedback
 
-        # 2. Acoustic Analysis (Fluency & Pronunciation)
-        y, sr = librosa.load(audio_path, sr=16000)
-        duration = librosa.get_duration(y=y, sr=sr)
-        word_count = len(transcription.split())
-        wpm = (word_count / duration) * 60 if duration > 0 else 0
-        
-        # Fluency calculation
-        intervals = librosa.effects.split(y, top_db=30)
-        pauses = []
-        if len(intervals) > 1:
-            for i in range(1, len(intervals)):
-                p_dur = (intervals[i][0] - intervals[i-1][1]) / sr
-                if p_dur > 0.3: pauses.append(p_dur)
-        
-        wpm_score = 100
-        if wpm < IDEAL_WPM_MIN: wpm_score = max(0, 100 - (IDEAL_WPM_MIN - wpm) * 2)
-        elif wpm > IDEAL_WPM_MAX: wpm_score = max(0, 100 - (wpm - IDEAL_WPM_MAX) * 2)
-        
-        pause_score = max(0, 100 - len(pauses) * 5 - sum(p for p in pauses if p > 2) * 10)
-        fluency_score = (wpm_score * 0.5 + pause_score * 0.5)
-        
-        result["fluency"] = {
-            "wpm": round(wpm, 1),
-            "pause_count": len(pauses),
-            "score": round(fluency_score, 1)
-        }
-        
-        # Pronunciation calculation
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-        pitch_vals = [pitches[magnitudes[:, t].argmax(), t] for t in range(pitches.shape[1]) if pitches[magnitudes[:, t].argmax(), t] > 0]
-        pitch_std = np.std(pitch_vals) if pitch_vals else 0
-        
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        clarity_score = min(100, np.mean(spectral_centroids) / 30)
-        intonation_score = min(100, max(0, 85 + (pitch_std - 20) * 0.2)) if 20 < pitch_std < 100 else (60 if pitch_std < 20 else 75)
-        
-        pron_score = (intonation_score * 0.4 + clarity_score * 0.6)
-        result["pronunciation"] = {
-            "clarity": round(clarity_score, 1),
-            "intonation": round(intonation_score, 1),
-            "score": round(pron_score, 1)
-        }
 
-        # 3. LLM Deep Analysis (Grammar, Fillers, Vocab)
-        prompt = f"""Analyze the following spoken transcript for a language learner targeting CEFR level {target_cefr}.
-        
-        TRANSCRIPT: "{transcription}"
-        
-        INSTRUCTIONS:
-        1. Identify GRAMMAR ERRORS and provide corrections.
-        2. Identify FILLER WORDS (like "um", "ah", "like", "you know", "er").
-        3. Provide a FULL CORRECTED VERSION of the text.
-        4. Analyze VOCABULARY:
-           - Is it appropriate for {target_cefr}?
-           - Suggest 3 better/more advanced words.
-        5. Provide an overall linguistic feedback.
+@router.get("/user_sessions/{user_id}")
+async def get_interview_sessions_by_user(user_id: int):
+    """
+    Get all Interview sessions for a specific user.
+    
+    Returns all session_ids, scores, and status for the user.
+    """
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
+    # Add session_number for frontend display
+    for idx, session in enumerate(sessions, 1):
+        session["session_number"] = f"Session {idx}"
+    return {
+        "user_id": user_id,
+        "total_sessions": len(sessions),
+        "sessions": sessions
+    }
+	
+	
 
-        Respond ONLY in this JSON format:
-        {{
-            "grammar_assessment": {{
-                "errors": [
-                    {{"error": "incorrect phrase", "correction": "correct phrase", "rule": "why it was wrong"}}
-                ],
-                "filler_words": ["um", "like"],
-                "corrected_text": "Complete corrected transcription here"
-            }},
-            "vocabulary_analysis": {{
-                "detected_cefr": "B1",
-                "vocabulary_score": 85,
-                "suggestions": [
-                    {{"original": "good", "advanced": "exceptional", "context": "describing weather"}}
-                ]
-            }},
-            "linguistic_score": 80,
-            "feedback": "Overall assessment of language usage."
-        }}
-        """
-        
-        llm_response = call_gpt(prompt, "You are an expert language examiner. Focus on grammar, filler words, and CEFR vocabulary.")
-        
-        import json
-        try:
-            json_start = llm_response.find('{')
-            json_end = llm_response.rfind('}') + 1
-            if json_start != -1:
-                parsed = json.loads(llm_response[json_start:json_end])
-                
-                # Merge into result
-                result["grammar_assessment"] = parsed.get("grammar_assessment", {})
-                result["grammar_assessment"]["filler_count"] = len(result["grammar_assessment"].get("filler_words", []))
-                
-                result["vocabulary_analysis"] = parsed.get("vocabulary_analysis", {})
-                result["llm_feedback"] = parsed.get("feedback", "")
-                
-                # Overall Score: Balanced average of Fluency, Pronunciation, and linguistic quality
-                ling_score = parsed.get("linguistic_score", 0)
-                result["overall_score"] = round((fluency_score * 0.3 + pron_score * 0.3 + ling_score * 0.4), 1)
-        except Exception as e:
-            result["llm_feedback"] = f"AI Analysis failed to parse: {str(e)}"
-            result["overall_score"] = round((fluency_score + pron_score) / 2, 1)
 
-        result["success"] = True
-    except Exception as e:
-        result["error"] = str(e)
-        
-    return _to_python_type(result)
+
+
+
+@router.get("/user_sessions/{user_id}")
+async def get_fluent_sessions_by_user(user_id: int):
+    """
+    Get all Fluent sessions for a specific user.
+    
+    Returns all session_ids, scores, and status for the user.
+    """
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="fluent")
+    # Add session_number for frontend display
+    for idx, session in enumerate(sessions, 1):
+        session["session_number"] = f"Session {idx}"
+    return {
+        "user_id": user_id,
+        "total_sessions": len(sessions),
+        "sessions": sessions
+    }
+
+
+@router.get("/user_sessions/{user_id}/ids")
+async def get_fluent_session_ids(user_id: int):
+    """
+    Get just the session IDs for a user.
+    
+    Returns only session_ids list that can be used to fetch individual feedback.
+    """
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="fluent")
+    return {
+        "user_id": user_id,
+        "total_sessions": len(sessions),
+        "session_ids": [s.get("session_id") for s in sessions]
+    }
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	        {{"word": "good", "current_level": "A2", "better_word": "excellent", "suggested_level": "B1", "context": "appropriate for {user_type}", "example_sentence": "The presentation was excellent and impressed everyone."}},
+        {{"word": "awareded", "current_level": "spelling_error", "better_word": "awarded", "suggested_level": "B1", "context": "correct spelling", "example_sentence": "She was awarded the prize for her hard work."}}
