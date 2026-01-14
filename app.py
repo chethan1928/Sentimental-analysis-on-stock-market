@@ -7,8 +7,7 @@
 
 
 
-
-async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", user_type: str = "student", model: str = "gpt") -> dict:
+ async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", user_type: str = "student", model: str = "gpt") -> dict:
     """llm-based grammar analysis for spoken language with detailed suggestions"""
     
     level_context = ""
@@ -478,3 +477,4 @@ IMPORTANT RULES:
         "professional_words_used": [], "suggestions": [],
         "feedback": "Vocabulary analysis could not be completed."
     }
+
