@@ -1,49 +1,18 @@
-async def get_faq_questions(
-    category: Optional[str] = None,
-    current_user: User = Depends(get_current_user),
-):
-    """Get FAQ questions. If user_id provided, includes attempt counts for that user."""
-    async with async_session() as sess:
-        query = "SELECT id, category, question, min_time, max_time, sample_answer FROM faq_questions"
-        if category:
-            result = await sess.execute(
-                text(query + " WHERE LOWER(category) LIKE :cat ORDER BY category, id"),
-                {"cat": f"%{category.lower()}%"}
-            )
-        else:
-            result = await sess.execute(text(query + " ORDER BY category, id"))
-        rows = result.fetchall()
-    
-    questions = []
-    
-    user_id = current_user.id if current_user else None
-    user_sessions_data = None
-    if user_id:
-        user_sessions_data = await db.get_sessions_by_user_id(user_id, session_type="faq")
-    
-    for r in rows:
-        q = {
-            "id": r[0],
-            "category": r[1],
-            "question": r[2],
-            "min_time": r[3],
-            "max_time": r[4],
-            "sample_answer": r[5],
-            "attempt_count": 0,  
-            "sessions": []       
-        }
-        
-        
-        if user_id and user_sessions_data:
-            
-            question_sessions = [
-                {"session_id": s["session_id"], "attempt_count": s["attempt_count"]}
-                for s in user_sessions_data if s.get("question_id") == r[0]
-            ]
-            q["sessions"] = question_sessions
-            
-            q["attempt_count"] = sum(s["attempt_count"] for s in question_sessions)
-        
-        questions.append(q)
-    
-    return {"total": len(questions), "questions": questions}
+
+
+
+
+user_text = ""
+
+
+
+audio_path = None
+
+
+
+temp_upload = None
+
+
+
+if 'audio_path' in locals() and audio_path and os.path.exists(audio_path):
+
