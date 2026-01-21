@@ -1,18 +1,8 @@
-
-
-
-
-user_text = ""
-
-
-
-audio_path = None
-
-
-
-temp_upload = None
-
-
-
-if 'audio_path' in locals() and audio_path and os.path.exists(audio_path):
-
+engine = create_async_engine(
+    DATABASE_URL, 
+    echo=False,
+    pool_pre_ping=True,  
+    pool_recycle=300,  
+    pool_size=5,         
+    max_overflow=10     
+)
