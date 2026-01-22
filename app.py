@@ -40,8 +40,6 @@ WEIGHTS = {
 }
 
 
-
-
 llm_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_VERSION,
@@ -731,7 +729,24 @@ async def practice_faq(
         if not session_data:
             raise HTTPException(status_code=404, detail="Session not found")
         
-        cur_q = session_data["question"]
+        # Safe fallback for legacy sessions that may not have full question dict
+        cur_q = session_data.get("question")
+        if not cur_q or not isinstance(cur_q, dict):
+            # Legacy session - fetch question from DB
+            q_id = cur_q if isinstance(cur_q, int) else session_data.get("question_id")
+            if q_id:
+                async with async_session() as sess:
+                    result = await sess.execute(
+                        text("SELECT id, category, question, sample_answer FROM faq_questions WHERE id = :qid"),
+                        {"qid": q_id}
+                    )
+                    row = result.fetchone()
+                if row:
+                    cur_q = {"id": row[0], "category": row[1], "question": row[2], "sample_answer": row[3]}
+                else:
+                    raise HTTPException(status_code=404, detail="Question not found for this session")
+            else:
+                raise HTTPException(status_code=400, detail="Session has no valid question data")
         native = session_data.get("native_lang", native_lang)
     else:
         
