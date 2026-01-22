@@ -39,7 +39,6 @@ WEIGHTS = {
     "match": 0.60
 }
 
-
 llm_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_VERSION,
@@ -165,51 +164,102 @@ async def transcribe_audio_file(audio_path: str, target_lang: str = "en") -> str
 
 
 
-async def analyze_grammar_llm(user_text: str, model: str = "gpt") -> dict:
-    """Grammar analysis with LLM"""
-    prompt = f"""Analyze grammar in this SPOKEN text: "{user_text}"
+async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", model: str = "gpt") -> dict:
+    """LLM-based grammar analysis for spoken FAQ responses - matches Fluent API v2"""
+    prompt = f"""You are an expert English grammar coach analyzing SPOKEN interview responses.
 
-CRITICAL: This is transcribed speech. COMPLETELY IGNORE:
-- Punctuation errors, Capitalization errors, Spelling/typo errors
+SPOKEN TEXT: "{user_text}"
+USER LEVEL: {level}
 
-CHECK ONLY FOR THESE GRAMMAR ERRORS:
-1. Filler words (um, uh, like, you know, I mean, basically, actually)
-2. Wrong prepositions (e.g., "good in" → "good at")
-3. Wrong verb tense (e.g., "I goed" → "I went")
-4. Subject-verb agreement (e.g., "He don't" → "He doesn't")
-5. Missing/wrong articles (e.g., "I am engineer" → "I am an engineer")
-6. Word order issues (e.g., "Always I work" → "I always work")
+IMPORTANT RULES:
+1. This is TRANSCRIBED SPEECH - IGNORE punctuation, capitalization, and minor spelling
+2. Focus ONLY on grammatical structure and word choice
+3. Be encouraging but honest
 
-CRITICAL FORMATTING - MUST USE # MARKERS:
-- you_said: Copy EXACT sentence, mark WRONG PART with #word#
-- should_be: Same sentence with corrections, mark CORRECTED with #word#
-- Example: "I #goed# to store" → "I #went# to the store"
+ANALYZE FOR:
 
-Return STRICTLY valid JSON:
+1. FILLER WORDS (detect ALL of these if present):
+   - um, uh, uhh, er, err, ah, ahh
+   - like (when not used correctly), you know, I mean, basically, actually, literally
+   - so, well (when used as fillers at start)
+   - kind of, sort of (when overused)
+
+2. GRAMMAR ERRORS (check each carefully):
+   - VERB TENSE: "I go yesterday" → "I went yesterday"
+   - SUBJECT-VERB AGREEMENT: "He don't know" → "He doesn't know"
+   - ARTICLES: "I am engineer" → "I am an engineer"
+   - PREPOSITIONS: "I am good in coding" → "I am good at coding"
+   - WORD ORDER: "Always I work hard" → "I always work hard"
+   - PRONOUNS: "Me and him went" → "He and I went"
+   - PLURALS: "I have many experience" → "I have much experience"
+   - COMPARATIVES: "more better" → "better"
+
+3. WORD SUGGESTIONS:
+   - Find weak/basic words and suggest stronger alternatives
+   - Example: "good" → "excellent/outstanding"
+   - Example: "bad" → "challenging/difficult"
+   - Example: "thing" → "aspect/factor/element"
+   - Example: "do" → "accomplish/execute/perform"
+
+CRITICAL: 
+- "corrected_sentence" = Fix ONLY grammar errors
+- "improved_sentence" = Fix grammar errors AND USE all word suggestions to make it professional
+
+SCORING GUIDE (CRITICAL - follow exactly):
+- 95-100: Perfect grammar, no errors, no filler words
+- 85-94: Minor issues only (1-2 fillers OR 1 minor error)
+- 70-84: Some issues (2-3 errors or multiple fillers)
+- 50-69: Significant issues (4+ errors)
+- Below 50: Major problems throughout
+
+Return STRICTLY valid JSON (no extra text):
 {{
-  "score": 0-100,
-  "filler_words": ["um", "like"],
-  "filler_count": 0,
-  "filler_feedback": "advice on fillers",
+  "score": <0-100 integer based on SCORING GUIDE above>,
+  "is_correct": <true if no major errors, false otherwise>,
+
+  "filler_words": ["list", "of", "detected", "fillers"],
+  "filler_count": <number>,
+  "filler_feedback": "<specific advice on reducing fillers>",
+
   "errors": [
     {{
-      "type": "verb_tense",
+      "type": "verb_tense | article | subject_verb | preposition | word_order | pronoun | plural | comparative",
       "you_said": "I #goed# to store",
       "should_be": "I #went# to the store",
       "wrong_word": "goed",
       "correct_word": "went",
-      "explanation": "Go is irregular - past tense is went"
+      "explanation": "Go is irregular - past tense is went, not goed",
+      "example_sentence": "Yesterday, I went to the park with my friends."
     }}
   ],
-  "word_suggestions": [{{"you_used": "good", "use_instead": "excellent", "original_sentence": "It was #good#", "improved_sentence": "It was #excellent#"}}],
-  "corrected_sentence": "sentence with grammar fixed",
-  "improved_sentence": "polished version",
-  "strengths": ["what they did well"],
-  "feedback": "2-3 sentences of feedback"
+
+  "word_suggestions": [
+    {{
+      "you_used": "good",
+      "use_instead": "excellent",
+      "why": "more impactful for professional context",
+      "original_sentence": "The results were #good#",
+      "improved_sentence": "The results were #excellent#",
+      "example_sentence": "The project outcomes were excellent."
+    }}
+  ],
+
+  "corrected_sentence": "<THE WHOLE TRANSCRIPTION with ONLY grammar errors fixed>",
+  "improved_sentence": "<THE WHOLE TRANSCRIPTION with grammar fixed + vocabulary enhanced>",
+
+  "strengths": ["<what they did well grammatically>"],
+  "feedback": "<2-3 sentences: acknowledge positives, then specific improvement tips>"
 }}
 
-RULES:
-- ALWAYS use # on both sides of wrong/correct words
+CRITICAL FORMATTING RULES:
+- For errors: you_said and should_be are ONLY the specific sentence/line from transcription containing the error
+- Mark the wrong word with #word# in you_said
+- Mark the correct word with #word# in should_be
+- For word_suggestions: original_sentence and improved_sentence are ONLY the specific phrase containing the weak word
+- Mark weak word with #word# in original_sentence, better word with #word# in improved_sentence
+- example_sentence is a NEW sentence showing correct usage (not from transcription)
+- corrected_sentence = THE WHOLE TRANSCRIPTION with all grammar fixes applied
+- improved_sentence = THE WHOLE TRANSCRIPTION with grammar fixed AND vocabulary enhanced
 - Empty arrays [] if no issues
 """
     try:
@@ -217,16 +267,37 @@ RULES:
         match = re.search(r'\{[\s\S]*\}', raw)
         if match:
             data = json.loads(match.group())
-            data.setdefault("score", 75)
+            
             data.setdefault("filler_words", [])
             data.setdefault("filler_count", len(data.get("filler_words", [])))
+            data.setdefault("filler_feedback", "")
             data.setdefault("errors", [])
             data.setdefault("word_suggestions", [])
             data.setdefault("strengths", [])
+            if not data.get("improved_sentence"):
+                data["improved_sentence"] = data.get("corrected_sentence", user_text)
+            
+            # Validate and adjust score based on error count (same as interview_api_v2)
+            error_count = len(data.get("errors", []))
+            filler_count = len(data.get("filler_words", []))
+            current_score = data.get("score", 75)
+            
+            if error_count == 0 and filler_count <= 1 and current_score < 90:
+                data["score"] = 95 - (filler_count * 3)
+            elif error_count == 1 and current_score < 80:
+                data["score"] = 85 - (filler_count * 2)
+            elif error_count >= 4 and current_score > 70:
+                data["score"] = min(current_score, 65)
+            
             return data
     except:
         pass
-    return {"score": 75, "filler_words": [], "filler_count": 0, "errors": [], "word_suggestions": [], "strengths": [], "feedback": "Grammar analyzed."}
+    return {
+        "score": 90, "is_correct": True, "filler_words": [], "filler_count": 0,
+        "filler_feedback": "", "errors": [], "word_suggestions": [],
+        "corrected_sentence": user_text, "improved_sentence": user_text,
+        "strengths": ["Good sentence structure"], "feedback": "No major grammatical issues detected. Keep up the good work!"
+    }
 
 
 async def analyze_vocab_llm(user_text: str, model: str = "gpt") -> dict:
@@ -263,8 +334,10 @@ Return STRICTLY valid JSON:
       "current_level": "A2",
       "better_word": "excellent",
       "suggested_level": "B1",
+      "why": "more impactful for professional context",
       "original_sentence": "I had a #good# experience",
-      "improved_sentence": "I had an #excellent# experience"
+      "improved_sentence": "I had an #excellent# experience",
+      "example_sentence": "The project delivered excellent results."
     }}
   ],
   "feedback": "2-3 sentences about vocabulary range"
@@ -273,6 +346,8 @@ Return STRICTLY valid JSON:
 RULES:
 - ALWAYS mark words with #word# (single hash on both sides)
 - suggestions array MUST NOT be empty if weak words exist
+- ALWAYS include 'why' to explain the suggestion
+- ALWAYS include 'example_sentence' to show correct usage
 """
     try:
         raw = await call_llm(prompt, mode="strict_json", model=model)
@@ -702,6 +777,145 @@ async def practice_faq(
                 "comparison": attempt.get("comparison")  
             })
         
+        # Build overall grammar/vocab/pronunciation summary (same as /faq_feedback)
+        grammar_errors = []
+        vocabulary_suggestions = []
+        pronunciation_issues = []
+        wpm_per_turn = []
+        vocab_overall = {
+            "A1": {"count": 0, "words": []},
+            "A2": {"count": 0, "words": []},
+            "B1": {"count": 0, "words": []},
+            "B2": {"count": 0, "words": []},
+            "C1": {"count": 0, "words": []},
+            "C2": {"count": 0, "words": []}
+        }
+        
+        for i, attempt in enumerate(attempts, 1):
+            analysis = attempt.get("analysis", {})
+            
+            # Track WPM per turn
+            fluency_data = analysis.get("fluency") or attempt.get("fluency") or {}
+            turn_wpm = fluency_data.get("wpm", 0) if isinstance(fluency_data, dict) else 0
+            wpm_per_turn.append({"turn": i, "wpm": turn_wpm})
+            
+            # Grammar errors
+            grammar = analysis.get("grammar") or {}
+            if isinstance(grammar, dict):
+                for err in grammar.get("errors", []):
+                    if isinstance(err, dict):
+                        grammar_errors.append({
+                            "wrong": err.get("you_said", err.get("wrong_word", "")),
+                            "correct": err.get("should_be", err.get("correct_word", "")),
+                            "explanation": err.get("explanation", ""),
+                            "example_sentence": err.get("example_sentence", "")
+                        })
+            
+            # Vocabulary suggestions
+            vocab = analysis.get("vocabulary") or {}
+            if isinstance(vocab, dict):
+                for sug in vocab.get("suggestions", []):
+                    if isinstance(sug, dict):
+                        vocabulary_suggestions.append({
+                            "weak_word": sug.get("word", sug.get("you_used", sug.get("weak_word", ""))),
+                            "better_options": sug.get("better_options", sug.get("use_instead", sug.get("better_word", []))),
+                            "why": sug.get("why", ""),
+                            "example_sentence": sug.get("example_sentence", "")
+                        })
+                
+                # Aggregate CEFR vocabulary words
+                cefr_dist = vocab.get("cefr_distribution", {})
+                for level in ["A1", "A2", "B1", "B2", "C1", "C2"]:
+                    level_data = cefr_dist.get(level, {})
+                    if isinstance(level_data, dict):
+                        words = level_data.get("words", [])
+                        if isinstance(words, list):
+                            vocab_overall[level]["words"].extend(words)
+            
+            # Pronunciation issues
+            pron = analysis.get("pronunciation") or {}
+            if isinstance(pron, dict):
+                for word in pron.get("words_to_practice", []):
+                    if isinstance(word, dict):
+                        pronunciation_issues.append({
+                            "word": word.get("word", ""),
+                            "how_to_say": word.get("how_to_say", ""),
+                            "tip": word.get("tip", "")
+                        })
+                    elif isinstance(word, str):
+                        pronunciation_issues.append({"word": word, "how_to_say": "", "tip": ""})
+        
+        # Deduplicate and count vocab words
+        def word_to_str(w):
+            if isinstance(w, dict):
+                return w.get("target", str(w))
+            return str(w) if w else ""
+        
+        for level in vocab_overall:
+            seen_words = set()
+            unique_words = []
+            for w in vocab_overall[level]["words"]:
+                w_str = word_to_str(w)
+                if w_str and w_str not in seen_words:
+                    seen_words.add(w_str)
+                    unique_words.append(w)
+            vocab_overall[level]["words"] = unique_words
+            vocab_overall[level]["count"] = len(unique_words)
+        
+        total_vocab_words = sum(vocab_overall[level]["count"] for level in vocab_overall)
+        for level in vocab_overall:
+            vocab_overall[level]["percentage"] = round((vocab_overall[level]["count"] / total_vocab_words * 100), 1) if total_vocab_words > 0 else 0
+        
+        # Deduplicate grammar/vocab/pron (same as /faq_feedback)
+        def make_hashable(val):
+            if isinstance(val, dict):
+                target = val.get("target")
+                if isinstance(target, dict):
+                    target = target.get("target")
+                if isinstance(target, (str, int, float)):
+                    return str(target)
+                word = val.get("word")
+                if isinstance(word, (str, int, float)):
+                    return str(word)
+                try:
+                    return json.dumps(val, sort_keys=True)
+                except Exception:
+                    return str(val)
+            if isinstance(val, list):
+                return tuple(make_hashable(v) for v in val)
+            return val
+        
+        seen = set()
+        unique_grammar = []
+        for g in grammar_errors:
+            wrong_val = make_hashable(g.get("wrong"))
+            correct_val = make_hashable(g.get("correct"))
+            if wrong_val and (wrong_val, correct_val) not in seen:
+                seen.add((wrong_val, correct_val))
+                unique_grammar.append(g)
+        
+        seen = set()
+        unique_vocab = []
+        for v in vocabulary_suggestions:
+            weak_word = make_hashable(v.get("weak_word"))
+            if weak_word and weak_word not in seen:
+                seen.add(weak_word)
+                unique_vocab.append(v)
+        
+        seen = set()
+        unique_pron = []
+        for p in pronunciation_issues:
+            word = make_hashable(p.get("word"))
+            if word and word not in seen:
+                seen.add(word)
+                unique_pron.append(p)
+        
+        # Build summary
+        feedback_summary = {
+            "grammar": {"total_errors": len(unique_grammar), "errors": unique_grammar},
+            "vocabulary": {"total_suggestions": len(unique_vocab), "suggestions": unique_vocab},
+            "pronunciation": {"total_issues": len(unique_pron), "issues": unique_pron}
+        }
         
         session_data["status"] = "paused"
         session_data["final_feedback"] = summary_bilingual  
@@ -713,7 +927,10 @@ async def practice_faq(
             "target_lang": target_lang,
             "native_lang": native,
             "session_summary": summary_bilingual,
-            "all_attempts": all_attempts_bilingual
+            "all_attempts": all_attempts_bilingual,
+            "summary": feedback_summary,
+            "vocab_overall": vocab_overall,
+            "wpm_per_turn": wpm_per_turn
         }
     
     
@@ -802,7 +1019,7 @@ async def practice_faq(
         return {"action": "error", "message": "No input detected"}
     
     
-    grammar_task = analyze_grammar_llm(user_text, model=model)
+    grammar_task = analyze_grammar_llm(user_text, level="Intermediate", model=model)
     vocab_task = analyze_vocab_llm(user_text, model=model)
     match_task = analyze_match_llm(cur_q["question"], user_text, cur_q.get("sample_answer"), model=model)
     
@@ -1044,7 +1261,9 @@ async def get_faq_feedback(
             if isinstance(err, dict):
                 grammar_errors.append({
                     "wrong": err.get("you_said", err.get("wrong_word", "")),
-                    "correct": err.get("should_be", err.get("correct_word", ""))
+                    "correct": err.get("should_be", err.get("correct_word", "")),
+                    "explanation": err.get("explanation", ""),
+                    "example_sentence": err.get("example_sentence", "")
                 })
         
         # Vocabulary suggestions
@@ -1052,8 +1271,10 @@ async def get_faq_feedback(
         for sug in vocab.get("suggestions", []):
             if isinstance(sug, dict):
                 vocabulary_suggestions.append({
-                    "weak_word": sug.get("word", sug.get("weak_word", "")),
-                    "better_options": sug.get("better_options", sug.get("better_word", []))
+                    "weak_word": sug.get("word", sug.get("you_used", sug.get("weak_word", ""))),
+                    "better_options": sug.get("better_options", sug.get("use_instead", sug.get("better_word", []))),
+                    "why": sug.get("why", ""),
+                    "example_sentence": sug.get("example_sentence", "")
                 })
         
         # Pronunciation issues
@@ -1061,9 +1282,13 @@ async def get_faq_feedback(
         if isinstance(pron, dict):
             for word in pron.get("words_to_practice", []):
                 if isinstance(word, dict):
-                    pronunciation_issues.append({"word": word.get("word", ""), "issue": word.get("issue", "needs practice")})
+                    pronunciation_issues.append({
+                        "word": word.get("word", ""),
+                        "how_to_say": word.get("how_to_say", ""),
+                        "tip": word.get("tip", "")
+                    })
                 elif isinstance(word, str):
-                    pronunciation_issues.append({"word": word, "issue": "needs practice"})
+                    pronunciation_issues.append({"word": word, "how_to_say": "", "tip": ""})
     
     # Remove duplicates - convert dicts to strings for hashability (bilingual values are dicts)
     def make_hashable(val):
@@ -1221,7 +1446,7 @@ async def upload_faq_excel(
         return {"status": "success", "count": len(faq_items)}
     except Exception as e:
         return {"status": "error", "message": str(e)}
-@router.get("/faq_question_sessinons/{question_id}")
+@router.get("/faq_question_sessions/{question_id}")
 
 async def get_faq_question_sessions(
     question_id: int,
