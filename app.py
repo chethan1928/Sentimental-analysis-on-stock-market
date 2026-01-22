@@ -38,7 +38,9 @@ WEIGHTS = {
     "fluency": 0.10,
     "match": 0.60
 }
- 
+
+
+
 
 llm_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
@@ -996,6 +998,10 @@ async def get_faq_feedback(
     if not feedback:
         raise HTTPException(status_code=404, detail="Session not found")
     
+    # Validate session type
+    if feedback.get("session_type") != "faq":
+        raise HTTPException(status_code=400, detail="Invalid session type. This is not a FAQ session.")
+    
     # If specific attempt requested, return just that attempt's feedback
     if attempt is not None:
         turn_feedback = feedback.get("turn_feedback", [])
@@ -1295,6 +1301,10 @@ async def get_faq_feedback(
     feedback = await db.get_session_feedback(session_id)
     if not feedback:
         raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Validate session type
+    if feedback.get("session_type") != "faq":
+        raise HTTPException(status_code=400, detail="Invalid session type. This is not a FAQ session.")
     
     # Get full session data for auto-generating final feedback if needed
     session_data = await db.get_user_session(session_id)
