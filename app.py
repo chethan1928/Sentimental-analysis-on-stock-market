@@ -1,6767 +1,1457 @@
-"""
-Exam Generation API v2 - FastAPI with pgvector
-Complete API with embeddings, chunking, LLM topic extraction, and vector search.
-Uses integer exam_id with exams lookup table.
-"""
 
+import asyncio
 import json
-import uuid
-import random
-import os
-import shutil
-from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, HTTPException, File, Form, UploadFile
-from pydantic import BaseModel, Field
-import tempfile
-import os as os_module
-
-# Database imports
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy import text
-
-# Import functions from q.py
-from q import (
-    extract_text_and_images_from_pdf,
-    process_json,
-    jsons_to_question_bank,
-    detect_pattern,
-    call_gpt
-)
-
-# =============================================
-# Embedding Model Setup (bge-small-en)
-# =============================================
-from sentence_transformers import SentenceTransformer
-
-EMBEDDING_MODEL = None
-
-def get_embedding_model():
-    global EMBEDDING_MODEL
-    if EMBEDDING_MODEL is None:
-        EMBEDDING_MODEL = SentenceTransformer('BAAI/bge-small-en')
-    return EMBEDDING_MODEL
-
-def get_embedding(text: str) -> List[float]:
-    """Get 384-dimensional embedding for text using bge-small-en"""
-    model = get_embedding_model()
-    embedding = model.encode(text, normalize_embeddings=True)
-    return embedding.tolist()
-
-# =============================================
-# Database Setup
-# =============================================
-DATABASE_URL = "postgresql+asyncpg://postgres:1234@localhost:5432/competitive"
-
-engine = create_async_engine(DATABASE_URL, echo=False)
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-# =============================================
-# Helper Functions
-# =============================================
-def extract_topic_from_chunk(chunk_text: str) -> str:
-    """Use LLM to extract the main topic from a text chunk"""
-    prompt = f"""Extract the single main topic from this text. 
-Return ONLY the topic name (2-4 words max), nothing else.
-
-Text:
-{chunk_text[:1000]}
-
-Topic:"""
-    try:
-        topic = call_gpt(prompt).strip()
-        topic = topic.replace('"', '').replace("'", "").strip()
-        return topic[:50] if len(topic) > 50 else topic
-    except:
-        return "General"
-
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[Dict]:
-    """Split text into overlapping chunks"""
-    words = text.split()
-    chunks = []
-    i = 0
-    chunk_num = 0
-    while i < len(words):
-        chunk_words = words[i:i + chunk_size]
-        chunk_txt = ' '.join(chunk_words)
-        if len(chunk_txt.strip()) > 50:
-            chunks.append({
-                "chunk_num": chunk_num,
-                "text": chunk_txt,
-                "start_word": i,
-                "end_word": i + len(chunk_words)
-            })
-            chunk_num += 1
-        i += chunk_size - overlap
-    return chunks
-
-def _parse_json_response(text: str) -> Optional[Dict[str, Any]]:
-    """Parse JSON from LLM response"""
-    if not text:
-        return None
-    t = text.strip()
-    if t.startswith("```"):
-        parts = t.split("```")
-        if len(parts) >= 2:
-            t = parts[1].strip()
-            if t.startswith("json"):
-                t = t[4:].strip()
-    try:
-        return json.loads(t)
-    except:
-        import re
-        match = re.search(r"\{[\s\S]*\}", t)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except:
-                return None
-    return None
-
-# =============================================
-# Pydantic Models
-# =============================================
-
-class ExamCreate(BaseModel):
-    exam_name: str = Field(..., example="JEE")
-    subject: str = Field(None, example="Math")
-    country: str = Field(None, example="India")
-    category: str = Field(None, example="engineering")
-
-class ExamResponse(BaseModel):
-    exam_id: int
-    exam_name: str
-    subject: Optional[str]
-    country: Optional[str]
-    category: Optional[str]
-
-class PDFUploadResponse(BaseModel):
-    exam_id: int
-    exam_name: str
-    year: int
-    questions_count: int
-    success: bool
-
-class PatternGenerateResponse(BaseModel):
-    exam_id: int
-    pattern: Dict[str, Any]
-    years_analyzed: List[int]
-    success: bool
-
-class RAGUploadResponse(BaseModel):
-    exam_id: int
-    chunks_stored: int
-    topics_extracted: List[str]
-    success: bool
-
-class GenerateTestResponse(BaseModel):
-    mock_id: str
-    exam_id: int
-    total_questions: int
-    source_distribution: Dict[str, int]
-    questions: List[Dict[str, Any]]
-
-# =============================================
-# FastAPI App
-# =============================================
-app = FastAPI(
-    title="Exam Generation API v2",
-    description="Complete API with pgvector, embeddings, int exam_id, and form-data upload.",
-    version="2.0.0"
-)
-
-# =============================================
-# Database Initialization
-# =============================================
-@app.on_event("startup")
-async def startup_event():
-    """Initialize database with pgvector extension"""
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-        
-        # Exams lookup table
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS exams (
-                exam_id SERIAL PRIMARY KEY,
-                exam_name TEXT NOT NULL,
-                subject TEXT,
-                country TEXT,
-                category TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS previous_year_questions (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                year INTEGER NOT NULL,
-                questions JSONB NOT NULL,
-                total_questions INTEGER,
-                source TEXT DEFAULT 'pdf',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS patterns (
-                pattern_id INTEGER PRIMARY KEY REFERENCES exams(exam_id),
-                pattern JSONB NOT NULL,
-                as_of_year INTEGER,
-                lookback_years INTEGER,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS rag_handbook (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                topic TEXT,
-                chunk_text TEXT NOT NULL,
-                embedding vector(384),
-                metadata JSONB,
-                source_file TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS rag_books (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                topic TEXT,
-                chunk_text TEXT NOT NULL,
-                embedding vector(384),
-                metadata JSONB,
-                book_name TEXT,
-                source_file TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS tests (
-                mock_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                questions JSONB NOT NULL,
-                total_questions INTEGER NOT NULL,
-                source_distribution JSONB,
-                pattern_used JSONB,
-                generated_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-        
-        # Create indexes
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_pyq_exam_id ON previous_year_questions(exam_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_rag_handbook_exam_id ON rag_handbook(exam_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_rag_books_exam_id ON rag_books(exam_id)"))
-        await conn.execute(text("CREATE INDEX IF NOT EXISTS idx_tests_exam_id ON tests(exam_id)"))
-        
-    print("✅ Database initialized with pgvector and exams table")
-
-# =============================================
-# Exam CRUD Endpoints
-# =============================================
-@app.post("/exams", response_model=ExamResponse, tags=["Exams"])
-async def create_exam(exam: ExamCreate):
-    """Register a new exam and get exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("""
-                    INSERT INTO exams (exam_name, subject, country, category)
-                    VALUES (:exam_name, :subject, :country, :category)
-                    RETURNING exam_id, exam_name, subject, country, category
-                """),
-                {
-                    "exam_name": exam.exam_name,
-                    "subject": exam.subject,
-                    "country": exam.country,
-                    "category": exam.category
-                }
-            )
-            row = result.fetchone()
-            await sess.commit()
-        
-        return ExamResponse(
-            exam_id=row[0],
-            exam_name=row[1],
-            subject=row[2],
-            country=row[3],
-            category=row[4]
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exam creation failed: {str(e)}")
-
-@app.get("/exams", tags=["Exams"])
-async def list_exams():
-    """List all registered exams"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id, exam_name, subject, country, category FROM exams ORDER BY exam_id"))
-            rows = result.fetchall()
-        
-        return {
-            "total": len(rows),
-            "exams": [
-                {"exam_id": r[0], "exam_name": r[1], "subject": r[2], "country": r[3], "category": r[4]}
-                for r in rows
-            ]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exams fetch failed: {str(e)}")
-
-@app.get("/exams/{exam_id}", response_model=ExamResponse, tags=["Exams"])
-async def get_exam(exam_id: int):
-    """Get exam details by exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_id, exam_name, subject, country, category FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            row = result.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        return ExamResponse(exam_id=row[0], exam_name=row[1], subject=row[2], country=row[3], category=row[4])
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exam fetch failed: {str(e)}")
-
-# =============================================
-# PDF Upload (Form Data)
-# =============================================
-@app.post("/pdf/upload", response_model=PDFUploadResponse, tags=["PDF Upload"])
-async def upload_pdf_questions(
-    exam_id: int = Form(..., description="Exam ID (integer from /exams)"),
-    year: int = Form(..., description="Year of the exam"),
-    file: UploadFile = File(..., description="PDF file to upload")
-):
-    """
-    Upload a PDF question paper using form data:
-    - exam_id: integer from /exams endpoint
-    - year: e.g., 2023
-    - file: PDF file
-    """
-    try:
-        # Verify exam exists and get exam_name
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-        
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        exam_name = exam_row[0]
-        
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        try:
-            # Extract text and images from PDF
-            extracted_data = extract_text_and_images_from_pdf(pdf_path=tmp_path, exam=exam_name)
-            
-            # Process to structured JSON
-            process_json(extracted_data, exam_name, year=year)
-            
-            # Load the generated JSON
-            json_filename = f"structured_question_paper_with_diagrams_{exam_name}_{year}.json"
-            try:
-                with open(json_filename, "r", encoding="utf-8") as f:
-                    json_data = json.load(f)
-            except:
-                json_data = extracted_data
-            
-            # Convert to question bank format
-            df = jsons_to_question_bank([json_data])
-            questions = df.to_dict(orient='records') if not df.empty else []
-            
-            # Clean NaN values (PostgreSQL JSON doesn't accept NaN)
-            import math
-            def clean_nans(obj):
-                if isinstance(obj, dict):
-                    return {k: clean_nans(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [clean_nans(v) for v in obj]
-                elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
-                    return None
-                return obj
-            
-            questions = clean_nans(questions)
-            
-            # Store in database
-            async with async_session() as sess:
-                await sess.execute(
-                    text("""
-                        INSERT INTO previous_year_questions (exam_id, year, questions, total_questions, source)
-                        VALUES (:exam_id, :year, :questions, :total_questions, 'pdf')
-                    """),
-                    {
-                        "exam_id": exam_id,
-                        "year": year,
-                        "questions": json.dumps(questions, allow_nan=False),
-                        "total_questions": len(questions)
-                    }
-                )
-                await sess.commit()
-            
-            return PDFUploadResponse(
-                exam_id=exam_id,
-                exam_name=exam_name,
-                year=year,
-                questions_count=len(questions),
-                success=True
-            )
-        finally:
-            os_module.unlink(tmp_path)  # Clean up temp file
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF upload failed: {str(e)}")
-
-# =============================================
-# Pattern Endpoints
-# =============================================
-@app.post("/patterns/generate", response_model=PatternGenerateResponse, tags=["Patterns"])
-async def generate_pattern_for_exam(
-    exam_id: int = Form(..., description="Exam ID"),
-    lookback_years: int = Form(default=3, description="Years to analyze")
-):
-    """Generate pattern from previous year questions"""
-    try:
-        import pandas as pd
-        
-        # Get exam info
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name, subject, country FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-        
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        exam_name, subject, country = exam_row[0], exam_row[1] or "", exam_row[2] or ""
-        
-        # Fetch questions
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT year, questions FROM previous_year_questions WHERE exam_id = :eid ORDER BY year DESC"),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-        
-        if not rows:
-            raise HTTPException(status_code=404, detail=f"No questions found for exam_id: {exam_id}")
-        
-        all_questions = []
-        years_found = []
-        for r in rows:
-            years_found.append(r[0])
-            qs = r[1] if isinstance(r[1], list) else json.loads(r[1])
-            for q in qs:
-                q['year'] = r[0]
-            all_questions.extend(qs)
-        
-        years_to_use = sorted(years_found, reverse=True)[:lookback_years]
-        filtered_questions = [q for q in all_questions if q.get('year') in years_to_use]
-        df = pd.DataFrame(filtered_questions)
-        
-        pattern = detect_pattern(df, country, exam_name, subject, lookback_years)
-        
-        # Store pattern (upsert)
-        async with async_session() as sess:
-            await sess.execute(text("DELETE FROM patterns WHERE pattern_id = :pid"), {"pid": exam_id})
-            await sess.execute(
-                text("""
-                    INSERT INTO patterns (pattern_id, pattern, as_of_year, lookback_years)
-                    VALUES (:pattern_id, :pattern, :as_of_year, :lookback_years)
-                """),
-                {
-                    "pattern_id": exam_id,
-                    "pattern": json.dumps(pattern),
-                    "as_of_year": max(years_to_use) if years_to_use else None,
-                    "lookback_years": lookback_years
-                }
-            )
-            await sess.commit()
-        
-        return PatternGenerateResponse(exam_id=exam_id, pattern=pattern, years_analyzed=years_to_use, success=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pattern generation failed: {str(e)}")
-
-@app.get("/patterns/{exam_id}", tags=["Patterns"])
-async def get_pattern_by_exam_id(exam_id: int):
-    """Get stored pattern for an exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT pattern, as_of_year, lookback_years, created_at FROM patterns WHERE pattern_id = :pid"),
-                {"pid": exam_id}
-            )
-            row = result.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Pattern not found for exam_id: {exam_id}")
-        
-        pattern = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-        return {"exam_id": exam_id, "pattern": pattern, "as_of_year": row[1], "lookback_years": row[2], "created_at": str(row[3])}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pattern fetch failed: {str(e)}")
-
-# =============================================
-# RAG Upload Endpoints
-# =============================================
-@app.post("/rag/handbook/upload", response_model=RAGUploadResponse, tags=["RAG Content"])
-async def upload_rag_handbook(
-    file: UploadFile = File(..., description="Handbook PDF"),
-    exam_id: int = Form(..., description="Exam ID"),
-    source_name: str = Form(None, description="Source name")
-):
-    """Upload handbook for RAG with LLM topic extraction"""
-    try:
-        import fitz
-        
-        # Verify exam exists
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id FROM exams WHERE exam_id = :eid"), {"eid": exam_id})
-            if not result.fetchone():
-                raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        # Save and process file
-        temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
-        
-        try:
-            with open(temp_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
-            
-            doc = fitz.open(temp_path)
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n\n"
-            doc.close()
-            
-            chunks = chunk_text(full_text, chunk_size=500, overlap=100)
-            topics_found = set()
-            chunks_stored = 0
-            
-            async with async_session() as sess:
-                for chunk in chunks:
-                    chunk_txt = chunk["text"]
-                    topic = extract_topic_from_chunk(chunk_txt)
-                    topics_found.add(topic)
-                    embedding = get_embedding(chunk_txt)
-                    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-                    
-                    await sess.execute(
-                        text("""
-                            INSERT INTO rag_handbook (exam_id, topic, chunk_text, embedding, metadata, source_file)
-                            VALUES (:exam_id, :topic, :chunk_text, :embedding::vector, :metadata, :source_file)
-                        """),
-                        {
-                            "exam_id": exam_id,
-                            "topic": topic,
-                            "chunk_text": chunk_txt,
-                            "embedding": embedding_str,
-                            "metadata": json.dumps({"chunk_num": chunk["chunk_num"]}),
-                            "source_file": source_name or file.filename
-                        }
-                    )
-                    chunks_stored += 1
-                await sess.commit()
-            
-            return RAGUploadResponse(exam_id=exam_id, chunks_stored=chunks_stored, topics_extracted=list(topics_found), success=True)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Handbook upload failed: {str(e)}")
-
-@app.post("/rag/books/upload", response_model=RAGUploadResponse, tags=["RAG Content"])
-async def upload_rag_books(
-    file: UploadFile = File(..., description="Book PDF"),
-    exam_id: int = Form(..., description="Exam ID"),
-    book_name: str = Form(None, description="Book name")
-):
-    """Upload textbook for RAG"""
-    try:
-        import fitz
-        
-        # Verify exam exists
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id FROM exams WHERE exam_id = :eid"), {"eid": exam_id})
-            if not result.fetchone():
-                raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
-        
-        try:
-            with open(temp_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
-            
-            doc = fitz.open(temp_path)
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n\n"
-            doc.close()
-            
-            chunks = chunk_text(full_text, chunk_size=500, overlap=100)
-            topics_found = set()
-            chunks_stored = 0
-            
-            async with async_session() as sess:
-                for chunk in chunks:
-                    chunk_txt = chunk["text"]
-                    topic = chunk_txt.split('.')[0][:50] if '.' in chunk_txt else "General"
-                    topics_found.add(topic)
-                    embedding = get_embedding(chunk_txt)
-                    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-                    
-                    await sess.execute(
-                        text("""
-                            INSERT INTO rag_books (exam_id, topic, chunk_text, embedding, metadata, book_name, source_file)
-                            VALUES (:exam_id, :topic, :chunk_text, :embedding::vector, :metadata, :book_name, :source_file)
-                        """),
-                        {
-                            "exam_id": exam_id,
-                            "topic": topic,
-                            "chunk_text": chunk_txt,
-                            "embedding": embedding_str,
-                            "metadata": json.dumps({"chunk_num": chunk["chunk_num"]}),
-                            "book_name": book_name or file.filename,
-                            "source_file": file.filename
-                        }
-                    )
-                    chunks_stored += 1
-                await sess.commit()
-            
-            return RAGUploadResponse(exam_id=exam_id, chunks_stored=chunks_stored, topics_extracted=list(topics_found)[:10], success=True)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Books upload failed: {str(e)}")
-
-# =============================================
-# Vector Search
-# =============================================
-async def vector_search(table: str, exam_id: int, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
-    """Generic vector search for RAG tables"""
-    topic_embedding = get_embedding(topic)
-    embedding_str = "[" + ",".join(str(x) for x in topic_embedding) + "]"
-    
-    async with async_session() as sess:
-        result = await sess.execute(
-            text(f"""
-                SELECT chunk_text, topic, 1 - (embedding <=> :embedding::vector) as similarity
-                FROM {table}
-                WHERE exam_id = :eid AND LOWER(topic) LIKE LOWER(:topic_pattern)
-                ORDER BY embedding <=> :embedding::vector
-                LIMIT :limit
-            """),
-            {"eid": exam_id, "topic_pattern": f"%{topic}%", "embedding": embedding_str, "limit": limit}
-        )
-        rows = result.fetchall()
-        
-        if not rows:
-            result = await sess.execute(
-                text(f"""
-                    SELECT chunk_text, topic, 1 - (embedding <=> :embedding::vector) as similarity
-                    FROM {table}
-                    WHERE exam_id = :eid
-                    ORDER BY embedding <=> :embedding::vector
-                    LIMIT :limit
-                """),
-                {"eid": exam_id, "embedding": embedding_str, "limit": limit}
-            )
-            rows = result.fetchall()
-    
-    return [{"text": r[0], "topic": r[1], "similarity": float(r[2]) if r[2] else 0} for r in rows]
-
-# =============================================
-# Test Generation
-# =============================================
-@app.post("/tests/generate/mixed", response_model=GenerateTestResponse, tags=["Test Generation"])
-async def generate_test_mixed(
-    exam_id: int = Form(..., description="Exam ID"),
-    total_questions: int = Form(default=60, description="Total questions")
-):
-    """Generate mixed test (25% each source)"""
-    try:
-        # Get exam and pattern
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name, subject FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-        
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        exam_name, subject_name = exam_row[0], exam_row[1] or "General"
-        
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT pattern FROM patterns WHERE pattern_id = :pid"),
-                {"pid": exam_id}
-            )
-            pattern_row = result.fetchone()
-        
-        if not pattern_row:
-            raise HTTPException(status_code=404, detail=f"Pattern not found for {exam_id}. Run /patterns/generate first.")
-        
-        pattern = pattern_row[0] if isinstance(pattern_row[0], dict) else json.loads(pattern_row[0])
-        
-        # Build tasks from pattern
-        topic_dist = pattern.get("topic_distribution", {}) or {"General": 1.0}
-        type_dist = pattern.get("type_distribution", {}) or {"MCQ": 1.0}
-        diff_dist = pattern.get("difficulty_distribution", {}) or {"Medium": 1.0}
-        avg_marks = int(pattern.get("avg_marks", 2) or 2)
-        
-        def _weighted_choice(dist, default):
-            if not dist:
-                return default
-            items = list(dist.keys())
-            weights = [float(dist.get(k, 0)) for k in items]
-            total = sum(weights)
-            if total <= 0:
-                return random.choice(items) if items else default
-            weights = [w / total for w in weights]
-            return random.choices(items, weights=weights, k=1)[0]
-        
-        tasks = []
-        for _ in range(total_questions):
-            tasks.append({
-                "topic": _weighted_choice(topic_dist, "General"),
-                "type": _weighted_choice(type_dist, "MCQ"),
-                "difficulty": _weighted_choice(diff_dist, "Medium"),
-                "marks": avg_marks
-            })
-        
-        random.shuffle(tasks)
-        
-        # Split 25/25/25/25
-        prev_tasks, handbook_tasks, books_tasks, llm_tasks = [], [], [], []
-        for i, task in enumerate(tasks):
-            if i % 4 == 0:
-                prev_tasks.append(task)
-            elif i % 4 == 1:
-                handbook_tasks.append(task)
-            elif i % 4 == 2:
-                books_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-        
-        questions = []
-        source_distribution = {"previous_year": 0, "rag_handbook": 0, "rag_books": 0, "llm": 0}
-        
-        # Previous year questions
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT questions FROM previous_year_questions WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-        
-        all_prev = []
-        for r in rows:
-            qs = r[0] if isinstance(r[0], list) else json.loads(r[0])
-            all_prev.extend(qs)
-        
-        used_prev = set()
-        for task in prev_tasks:
-            matched = None
-            best_score = -1
-            best_id = None
-            for q in all_prev:
-                q_id = q.get("id") or q.get("text", "")[:80]
-                if q_id in used_prev:
-                    continue
-                score = 0
-                if task["topic"].lower() in str(q.get("topic", "")).lower():
-                    score += 3
-                if task["type"].lower() == str(q.get("type", "")).lower():
-                    score += 2
-                if task["difficulty"].lower() == str(q.get("difficulty", "")).lower():
-                    score += 1
-                if score > best_score:
-                    best_score = score
-                    matched = q.copy()
-                    best_id = q_id
-            
-            if matched and best_score >= 3:
-                matched["source"] = "previous_year"
-                used_prev.add(best_id)
-                questions.append(matched)
-                source_distribution["previous_year"] += 1
-            else:
-                llm_tasks.append(task)
-        
-        # RAG handbook
-        for task in handbook_tasks:
-            chunks = await vector_search("rag_handbook", exam_id, task["topic"], limit=3)
-            if chunks:
-                context = "\n".join(c["text"][:500] for c in chunks)
-                prompt = f"""Generate a {task['type']} question about {task['topic']} for {exam_name} {subject_name}.
-Difficulty: {task['difficulty']}
-Marks: {task['marks']}
-
-Context:
-{context}
-
-Return ONLY valid JSON:
-{{"text": "question text", "type": "{task['type']}", "topic": "{task['topic']}", "difficulty": "{task['difficulty']}", "marks": {task['marks']}, "options": ["A", "B", "C", "D"], "answer": "A"}}"""
-                q = _parse_json_response(call_gpt(prompt))
-                if q:
-                    q["source"] = "rag_handbook"
-                    questions.append(q)
-                    source_distribution["rag_handbook"] += 1
-                else:
-                    llm_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-        
-        # RAG books
-        for task in books_tasks:
-            chunks = await vector_search("rag_books", exam_id, task["topic"], limit=3)
-            if chunks:
-                context = "\n".join(c["text"][:500] for c in chunks)
-                prompt = f"""Generate a {task['type']} question about {task['topic']} for {exam_name} {subject_name}.
-Difficulty: {task['difficulty']}
-Marks: {task['marks']}
-
-Context:
-{context}
-
-Return ONLY valid JSON:
-{{"text": "question text", "type": "{task['type']}", "topic": "{task['topic']}", "difficulty": "{task['difficulty']}", "marks": {task['marks']}, "options": ["A", "B", "C", "D"], "answer": "A"}}"""
-                q = _parse_json_response(call_gpt(prompt))
-                if q:
-                    q["source"] = "rag_books"
-                    questions.append(q)
-                    source_distribution["rag_books"] += 1
-                else:
-                    llm_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-        
-        # LLM fallback
-        for task in llm_tasks:
-            prompt = f"""Generate a {task['type']} question for {exam_name} {subject_name}.
-Topic: {task['topic']}
-Difficulty: {task['difficulty']}
-Marks: {task['marks']}
-
-Return ONLY valid JSON:
-{{"text": "question text", "type": "{task['type']}", "topic": "{task['topic']}", "difficulty": "{task['difficulty']}", "marks": {task['marks']}, "options": ["A", "B", "C", "D"], "answer": "A"}}"""
-            q = _parse_json_response(call_gpt(prompt))
-            if not q:
-                q = {
-                    "text": f"Question about {task['topic']} ({task['type']})",
-                    "type": task["type"],
-                    "topic": task["topic"],
-                    "difficulty": task["difficulty"],
-                    "marks": task["marks"],
-                    "options": ["A", "B", "C", "D"],
-                    "answer": "A"
-                }
-            q["source"] = "llm"
-            questions.append(q)
-            source_distribution["llm"] += 1
-        
-        # Save test
-        mock_id = str(uuid.uuid4())
-        async with async_session() as sess:
-            await sess.execute(
-                text("""
-                    INSERT INTO tests (mock_id, exam_id, questions, total_questions, source_distribution, pattern_used)
-                    VALUES (:mock_id, :exam_id, :questions, :total_questions, :source_distribution, :pattern_used)
-                """),
-                {
-                    "mock_id": mock_id,
-                    "exam_id": exam_id,
-                    "questions": json.dumps(questions),
-                    "total_questions": len(questions),
-                    "source_distribution": json.dumps(source_distribution),
-                    "pattern_used": json.dumps(pattern)
-                }
-            )
-            await sess.commit()
-        
-        return GenerateTestResponse(
-            mock_id=mock_id,
-            exam_id=exam_id,
-            total_questions=len(questions),
-            source_distribution=source_distribution,
-            questions=questions
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Test generation failed: {str(e)}")
-
-# =============================================
-# Mock Endpoints
-# =============================================
-@app.get("/mocks/{exam_id}", tags=["Mocks"])
-async def get_mocks_by_exam_id(exam_id: int):
-    """Get all generated mocks for an exam"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("""
-                    SELECT mock_id, total_questions, source_distribution, generated_at
-                    FROM tests WHERE exam_id = :eid ORDER BY generated_at DESC
-                """),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-        
-        mocks = []
-        for r in rows:
-            mocks.append({
-                "mock_id": str(r[0]),
-                "total_questions": r[1],
-                "source_distribution": r[2] if isinstance(r[2], dict) else json.loads(r[2]) if r[2] else {},
-                "generated_at": str(r[3])
-            })
-        
-        return {"exam_id": exam_id, "total_mocks": len(mocks), "mocks": mocks}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Mocks fetch failed: {str(e)}")
-
-@app.get("/mocks/{exam_id}/{mock_id}", tags=["Mocks"])
-async def get_mock_by_id(exam_id: int, mock_id: str):
-    """Get specific mock test"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT mock_id, questions, total_questions, source_distribution, generated_at FROM tests WHERE mock_id = :mid"),
-                {"mid": mock_id}
-            )
-            row = result.fetchone()
-        
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Mock not found: {mock_id}")
-        
-        return {
-            "mock_id": str(row[0]),
-            "questions": row[1] if isinstance(row[1], list) else json.loads(row[1]),
-            "total_questions": row[2],
-            "source_distribution": row[3] if isinstance(row[3], dict) else json.loads(row[3]) if row[3] else {},
-            "generated_at": str(row[4])
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Mock fetch failed: {str(e)}")
-
-@app.get("/previous-year/{exam_id}", tags=["Previous Year"])
-async def get_previous_year_questions(exam_id: int):
-    """Get all previous year records for an exam"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT year, total_questions, created_at FROM previous_year_questions WHERE exam_id = :eid ORDER BY year DESC"),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-        
-        return {
-            "exam_id": exam_id,
-            "total_years": len(rows),
-            "years": [{"year": r[0], "total_questions": r[1], "created_at": str(r[2])} for r in rows]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Fetch failed: {str(e)}")
-
-# =============================================
-# Run
-# =============================================
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-v2
-
-  """
-Simple Exam Generation API
-- Uses pgvector for RAG
-- Stores patterns by exam_id (integer)
-- Generates mixed tests with 25/25/25/25 sources
-- Form-data file upload
-"""
-
-import json
-import uuid
-import random
-import re
-import os
-import tempfile
-import shutil
-from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from pydantic import BaseModel, Field
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy import text
-
-from sentence_transformers import SentenceTransformer
-
-from q import (
-    extract_text_and_images_from_pdf,
-    process_json,
-    jsons_to_question_bank,
-    detect_pattern,
-    call_gpt
-)
-
-# =========================
-# Embedding model (bge-small-en, 384)
-# =========================
-EMBEDDING_MODEL = None
-
-
-def get_embedding_model():
-    global EMBEDDING_MODEL
-    if EMBEDDING_MODEL is None:
-        EMBEDDING_MODEL = SentenceTransformer('BAAI/bge-small-en')
-    return EMBEDDING_MODEL
-
-
-def get_embedding(text: str) -> List[float]:
-    model = get_embedding_model()
-    embedding = model.encode(text, normalize_embeddings=True)
-    return embedding.tolist()
-
-
-# =========================
-# Database
-# =========================
-DATABASE_URL = "postgresql+asyncpg://postgres:1234@localhost:5432/post"
-engine = create_async_engine(DATABASE_URL, echo=False)
-async_session = async_sessionmaker(engine, expire_on_commit=False)
-
-
-# =========================
-# Helpers
-# =========================
-def extract_topic_from_chunk(chunk_text: str) -> str:
-    prompt = f"""Extract the single main topic from this text.
-Return ONLY the topic name (2-4 words max), nothing else.
-
-Text:
-{chunk_text[:1000]}
-
-Topic:"""
-    try:
-        topic = call_gpt(prompt).strip()
-        topic = topic.replace('"', '').replace("'", "").strip()
-        return topic[:50] if len(topic) > 50 else topic
-    except Exception:
-        return "General"
-
-
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[Dict[str, Any]]:
-    words = text.split()
-    chunks = []
-    i = 0
-    chunk_num = 0
-    while i < len(words):
-        chunk_words = words[i:i + chunk_size]
-        chunk_txt = ' '.join(chunk_words)
-        if len(chunk_txt.strip()) > 50:
-            chunks.append({
-                "chunk_num": chunk_num,
-                "text": chunk_txt,
-                "start_word": i,
-                "end_word": i + len(chunk_words)
-            })
-            chunk_num += 1
-        i += chunk_size - overlap
-    return chunks
-
-
-def _parse_json_response(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    t = text.strip()
-    if t.startswith("```"):
-        parts = t.split("```")
-        if len(parts) >= 2:
-            t = parts[1].strip()
-            if t.startswith("json"):
-                t = t[4:].strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        match = re.search(r"\{[\s\S]*\}", t)
-        if match:
-            try:
-                return json.loads(match.group(0))
-            except Exception:
-                return None
-    return None
-
-
-def _weighted_choice(dist: Dict[str, float], default: str) -> str:
-    if not dist:
-        return default
-    items = list(dist.keys())
-    weights = [float(dist.get(k, 0)) for k in items]
-    total = sum(weights)
-    if total <= 0:
-        return random.choice(items) if items else default
-    weights = [w / total for w in weights]
-    return random.choices(items, weights=weights, k=1)[0]
-
-
-def build_tasks(pattern: Dict[str, Any], total_questions: int) -> List[Dict[str, Any]]:
-    topic_dist = pattern.get("topic_distribution", {}) or {"General": 1.0}
-    type_dist = pattern.get("type_distribution", {}) or {"MCQ": 1.0}
-    diff_dist = pattern.get("difficulty_distribution", {}) or {"Medium": 1.0}
-    avg_marks = int(pattern.get("avg_marks", 2) or 2)
-
-    tasks = []
-    for _ in range(total_questions):
-        tasks.append({
-            "topic": _weighted_choice(topic_dist, "General"),
-            "type": _weighted_choice(type_dist, "MCQ"),
-            "difficulty": _weighted_choice(diff_dist, "Medium"),
-            "marks": avg_marks
-        })
-    return tasks
-
-
-def pick_previous_question(all_prev: List[Dict[str, Any]], task: Dict[str, Any], used_ids: set):
-    best = None
-    best_score = -1
-    best_id = None
-    for q in all_prev:
-        q_id = q.get("id") or q.get("text", "")[:80]
-        if q_id in used_ids:
-            continue
-        score = 0
-        if task["topic"].lower() in str(q.get("topic", "")).lower():
-            score += 3
-        if task["type"].lower() == str(q.get("type", "")).lower():
-            score += 2
-        if task["difficulty"].lower() == str(q.get("difficulty", "")).lower():
-            score += 1
-        if score > best_score:
-            best_score = score
-            best = q.copy()
-            best_id = q_id
-    if best and best_score >= 3:
-        return best, best_id
-    return None, None
-
-
-def build_prompt_from_context(context: str, task: Dict[str, Any], exam_name: str, subject_name: str) -> str:
-    return f"""You are an expert exam-writer for {exam_name} {subject_name}.
-Generate ONE {task['type']} question about {task['topic']}.
-Difficulty: {task['difficulty']}
-Marks: {task['marks']}
-
-Context:
-{context}
-
-Return ONLY valid JSON:
-{{"text": "question text", "type": "{task['type']}", "topic": "{task['topic']}", "difficulty": "{task['difficulty']}", "marks": {task['marks']}, "options": ["A", "B", "C", "D"], "answer": "A"}}
-"""
-
-
-def build_prompt_direct(task: Dict[str, Any], exam_name: str, subject_name: str) -> str:
-    return f"""You are an expert exam-writer for {exam_name} {subject_name}.
-Generate ONE {task['type']} question.
-Topic: {task['topic']}
-Difficulty: {task['difficulty']}
-Marks: {task['marks']}
-
-Return ONLY valid JSON:
-{{"text": "question text", "type": "{task['type']}", "topic": "{task['topic']}", "difficulty": "{task['difficulty']}", "marks": {task['marks']}, "options": ["A", "B", "C", "D"], "answer": "A"}}
-"""
-
-
-# =========================
-# API Models
-# =========================
-class ExamCreate(BaseModel):
-    exam_name: str = Field(..., example="JEE")
-    subject: str = Field(None, example="Math")
-    country: str = Field(None, example="India")
-    category: str = Field(None, example="engineering")
-
-
-class ExamResponse(BaseModel):
-    exam_id: int
-    exam_name: str
-    subject: Optional[str]
-    country: Optional[str]
-    category: Optional[str]
-
-
-class PDFUploadResponse(BaseModel):
-    exam_id: int
-    exam_name: str
-    year: int
-    questions_count: int
-    success: bool
-
-
-class PatternGenerateResponse(BaseModel):
-    exam_id: int
-    pattern: Dict[str, Any]
-    years_analyzed: List[int]
-    success: bool
-
-
-class RAGUploadResponse(BaseModel):
-    exam_id: int
-    chunks_stored: int
-    topics_extracted: List[str]
-    success: bool
-
-
-class GenerateTestResponse(BaseModel):
-    mock_id: str
-    exam_id: int
-    total_questions: int
-    source_distribution: Dict[str, int]
-    questions: List[Dict[str, Any]]
-
-
-# =========================
-# FastAPI App
-# =========================
-app = FastAPI(
-    title="Exam Generation API (Simple)",
-    description="Simple API with pgvector, int exam_id, and form-data upload",
-    version="1.0.0"
-)
-
-
-@app.on_event("startup")
-async def startup_event():
-    async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-
-        # Exams lookup table
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS exams (
-                exam_id SERIAL PRIMARY KEY,
-                exam_name TEXT NOT NULL,
-                subject TEXT,
-                country TEXT,
-                category TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS previous_year_questions (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                year INTEGER NOT NULL,
-                questions JSONB NOT NULL,
-                total_questions INTEGER,
-                source TEXT DEFAULT 'pdf',
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS patterns (
-                pattern_id INTEGER PRIMARY KEY REFERENCES exams(exam_id),
-                pattern JSONB NOT NULL,
-                as_of_year INTEGER,
-                lookback_years INTEGER,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS rag_handbook (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                topic TEXT,
-                chunk_text TEXT NOT NULL,
-                embedding vector(384),
-                metadata JSONB,
-                source_file TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS rag_books (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                topic TEXT,
-                chunk_text TEXT NOT NULL,
-                embedding vector(384),
-                metadata JSONB,
-                book_name TEXT,
-                source_file TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-        await conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS tests (
-                mock_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                exam_id INTEGER NOT NULL REFERENCES exams(exam_id),
-                questions JSONB NOT NULL,
-                total_questions INTEGER NOT NULL,
-                source_distribution JSONB,
-                pattern_used JSONB,
-                generated_at TIMESTAMP DEFAULT NOW()
-            )
-        """))
-
-    print("✅ Database initialized with pgvector and exams table")
-
-
-# =========================
-# Exam CRUD
-# =========================
-@app.post("/exams", response_model=ExamResponse, tags=["Exams"])
-async def create_exam(exam: ExamCreate):
-    """Register a new exam and get exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("""
-                    INSERT INTO exams (exam_name, subject, country, category)
-                    VALUES (:exam_name, :subject, :country, :category)
-                    RETURNING exam_id, exam_name, subject, country, category
-                """),
-                {
-                    "exam_name": exam.exam_name,
-                    "subject": exam.subject,
-                    "country": exam.country,
-                    "category": exam.category
-                }
-            )
-            row = result.fetchone()
-            await sess.commit()
-
-        return ExamResponse(exam_id=row[0], exam_name=row[1], subject=row[2], country=row[3], category=row[4])
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exam creation failed: {str(e)}")
-
-
-@app.get("/exams", tags=["Exams"])
-async def list_exams():
-    """List all registered exams"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id, exam_name, subject, country, category FROM exams ORDER BY exam_id"))
-            rows = result.fetchall()
-
-        return {
-            "total": len(rows),
-            "exams": [{"exam_id": r[0], "exam_name": r[1], "subject": r[2], "country": r[3], "category": r[4]} for r in rows]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exams fetch failed: {str(e)}")
-
-
-@app.get("/exams/{exam_id}", response_model=ExamResponse, tags=["Exams"])
-async def get_exam(exam_id: int):
-    """Get exam details by exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_id, exam_name, subject, country, category FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            row = result.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-
-        return ExamResponse(exam_id=row[0], exam_name=row[1], subject=row[2], country=row[3], category=row[4])
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Exam fetch failed: {str(e)}")
-
-
-# =========================
-# PDF Upload (Form Data)
-# =========================
-@app.post("/pdf/upload", response_model=PDFUploadResponse, tags=["PDF Upload"])
-async def upload_pdf_questions(
-    exam_id: int = Form(..., description="Exam ID (integer from /exams)"),
-    year: int = Form(..., description="Year of the exam"),
-    file: UploadFile = File(..., description="PDF file to upload")
-):
-    """Upload a PDF question paper using form data."""
-    try:
-        # Verify exam exists and get exam_name
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-        
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-        
-        exam_name = exam_row[0]
-        
-        # Save uploaded file temporarily
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-        
-        try:
-            # Extract and process
-            extracted_data = extract_text_and_images_from_pdf(pdf_path=tmp_path, exam=exam_name)
-            process_json(extracted_data, exam_name, year=year)
-            
-            json_filename = f"structured_question_paper_with_diagrams_{exam_name}_{year}.json"
-            try:
-                with open(json_filename, "r", encoding="utf-8") as f:
-                    json_data = json.load(f)
-            except Exception:
-                json_data = extracted_data
-            
-            df = jsons_to_question_bank([json_data])
-            questions = df.to_dict(orient='records') if not df.empty else []
-            
-            async with async_session() as sess:
-                await sess.execute(
-                    text("""
-                        INSERT INTO previous_year_questions (exam_id, year, questions, total_questions, source)
-                        VALUES (:exam_id, :year, :questions, :total_questions, 'pdf')
-                    """),
-                    {
-                        "exam_id": exam_id,
-                        "year": year,
-                        "questions": json.dumps(questions),
-                        "total_questions": len(questions)
-                    }
-                )
-                await sess.commit()
-            
-            return PDFUploadResponse(
-                exam_id=exam_id,
-                exam_name=exam_name,
-                year=year,
-                questions_count=len(questions),
-                success=True
-            )
-        finally:
-            os.unlink(tmp_path)  # Clean up temp file
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"PDF upload failed: {str(e)}")
-
-
-# =========================
-# Pattern Endpoints
-# =========================
-@app.post("/patterns/generate", response_model=PatternGenerateResponse, tags=["Patterns"])
-async def generate_pattern_for_exam(
-    exam_id: int = Form(..., description="Exam ID"),
-    lookback_years: int = Form(default=3, description="Years to analyze")
-):
-    """Generate pattern from previous year questions"""
-    try:
-        import pandas as pd
-
-        # Get exam info
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name, subject, country FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-
-        exam_name, subject, country = exam_row[0], exam_row[1] or "", exam_row[2] or ""
-
-        # Fetch questions
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT year, questions FROM previous_year_questions WHERE exam_id = :eid ORDER BY year DESC"),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-
-        if not rows:
-            raise HTTPException(status_code=404, detail=f"No questions found for exam_id: {exam_id}")
-
-        all_questions = []
-        years_found = []
-        for r in rows:
-            years_found.append(r[0])
-            qs = r[1] if isinstance(r[1], list) else json.loads(r[1])
-            for q in qs:
-                q['year'] = r[0]
-            all_questions.extend(qs)
-
-        years_to_use = sorted(years_found, reverse=True)[:lookback_years]
-        filtered_questions = [q for q in all_questions if q.get('year') in years_to_use]
-        df = pd.DataFrame(filtered_questions)
-
-        pattern = detect_pattern(df, country, exam_name, subject, lookback_years)
-
-        # Store pattern (upsert)
-        async with async_session() as sess:
-            await sess.execute(text("DELETE FROM patterns WHERE pattern_id = :pid"), {"pid": exam_id})
-            await sess.execute(
-                text("""
-                    INSERT INTO patterns (pattern_id, pattern, as_of_year, lookback_years)
-                    VALUES (:pattern_id, :pattern, :as_of_year, :lookback_years)
-                """),
-                {
-                    "pattern_id": exam_id,
-                    "pattern": json.dumps(pattern),
-                    "as_of_year": max(years_to_use) if years_to_use else None,
-                    "lookback_years": lookback_years
-                }
-            )
-            await sess.commit()
-
-        return PatternGenerateResponse(exam_id=exam_id, pattern=pattern, years_analyzed=years_to_use, success=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pattern generation failed: {str(e)}")
-
-
-@app.get("/patterns/{exam_id}", tags=["Patterns"])
-async def get_pattern_by_exam_id(exam_id: int):
-    """Get stored pattern for an exam_id"""
-    try:
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT pattern, as_of_year, lookback_years, created_at FROM patterns WHERE pattern_id = :pid"),
-                {"pid": exam_id}
-            )
-            row = result.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Pattern not found for exam_id: {exam_id}")
-
-        pattern = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-        return {"exam_id": exam_id, "pattern": pattern, "as_of_year": row[1], "lookback_years": row[2], "created_at": str(row[3])}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Pattern fetch failed: {str(e)}")
-
-
-# =========================
-# RAG Uploads
-# =========================
-@app.post("/rag/handbook/upload", response_model=RAGUploadResponse, tags=["RAG Content"])
-async def upload_rag_handbook(
-    file: UploadFile = File(..., description="Handbook PDF"),
-    exam_id: int = Form(..., description="Exam ID"),
-    source_name: str = Form(None, description="Source name")
-):
-    """Upload handbook for RAG with LLM topic extraction"""
-    try:
-        import fitz
-
-        # Verify exam exists
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id FROM exams WHERE exam_id = :eid"), {"eid": exam_id})
-            if not result.fetchone():
-                raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-
-        temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
-
-        try:
-            with open(temp_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
-
-            doc = fitz.open(temp_path)
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n\n"
-            doc.close()
-
-            chunks = chunk_text(full_text, chunk_size=500, overlap=100)
-            topics_found = set()
-            chunks_stored = 0
-
-            async with async_session() as sess:
-                for chunk in chunks:
-                    chunk_txt = chunk["text"]
-                    topic = extract_topic_from_chunk(chunk_txt)
-                    topics_found.add(topic)
-                    embedding = get_embedding(chunk_txt)
-                    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-                    await sess.execute(
-                        text("""
-                            INSERT INTO rag_handbook (exam_id, topic, chunk_text, embedding, metadata, source_file)
-                            VALUES (:exam_id, :topic, :chunk_text, :embedding::vector, :metadata, :source_file)
-                        """),
-                        {
-                            "exam_id": exam_id,
-                            "topic": topic,
-                            "chunk_text": chunk_txt,
-                            "embedding": embedding_str,
-                            "metadata": json.dumps({"chunk_num": chunk["chunk_num"]}),
-                            "source_file": source_name or file.filename
-                        }
-                    )
-                    chunks_stored += 1
-                await sess.commit()
-
-            return RAGUploadResponse(exam_id=exam_id, chunks_stored=chunks_stored, topics_extracted=list(topics_found), success=True)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Handbook upload failed: {str(e)}")
-
-
-@app.post("/rag/books/upload", response_model=RAGUploadResponse, tags=["RAG Content"])
-async def upload_rag_books(
-    file: UploadFile = File(..., description="Book PDF"),
-    exam_id: int = Form(..., description="Exam ID"),
-    book_name: str = Form(None, description="Book name")
-):
-    """Upload textbook for RAG"""
-    try:
-        import fitz
-
-        # Verify exam exists
-        async with async_session() as sess:
-            result = await sess.execute(text("SELECT exam_id FROM exams WHERE exam_id = :eid"), {"eid": exam_id})
-            if not result.fetchone():
-                raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-
-        temp_dir = tempfile.mkdtemp()
-        temp_path = os.path.join(temp_dir, file.filename)
-
-        try:
-            with open(temp_path, "wb") as f:
-                content = await file.read()
-                f.write(content)
-
-            doc = fitz.open(temp_path)
-            full_text = ""
-            for page in doc:
-                full_text += page.get_text() + "\n\n"
-            doc.close()
-
-            chunks = chunk_text(full_text, chunk_size=500, overlap=100)
-            topics_found = set()
-            chunks_stored = 0
-
-            async with async_session() as sess:
-                for chunk in chunks:
-                    chunk_txt = chunk["text"]
-                    topic = chunk_txt.split('.')[0][:50] if '.' in chunk_txt else "General"
-                    topics_found.add(topic)
-                    embedding = get_embedding(chunk_txt)
-                    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
-
-                    await sess.execute(
-                        text("""
-                            INSERT INTO rag_books (exam_id, topic, chunk_text, embedding, metadata, book_name, source_file)
-                            VALUES (:exam_id, :topic, :chunk_text, :embedding::vector, :metadata, :book_name, :source_file)
-                        """),
-                        {
-                            "exam_id": exam_id,
-                            "topic": topic,
-                            "chunk_text": chunk_txt,
-                            "embedding": embedding_str,
-                            "metadata": json.dumps({"chunk_num": chunk["chunk_num"]}),
-                            "book_name": book_name or file.filename,
-                            "source_file": file.filename
-                        }
-                    )
-                    chunks_stored += 1
-                await sess.commit()
-
-            return RAGUploadResponse(exam_id=exam_id, chunks_stored=chunks_stored, topics_extracted=list(topics_found)[:10], success=True)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Books upload failed: {str(e)}")
-
-
-# =========================
-# Vector Search (RAG)
-# =========================
-async def vector_search(table: str, exam_id: int, topic: str, limit: int = 3) -> List[Dict[str, Any]]:
-    topic_embedding = get_embedding(topic)
-    embedding_str = "[" + ",".join(str(x) for x in topic_embedding) + "]"
-
-    async with async_session() as sess:
-        result = await sess.execute(
-            text(f"""
-                SELECT chunk_text, topic
-                FROM {table}
-                WHERE exam_id = :eid AND LOWER(topic) LIKE LOWER(:topic_pattern)
-                ORDER BY embedding <=> :embedding::vector
-                LIMIT :limit
-            """),
-            {"eid": exam_id, "topic_pattern": f"%{topic}%", "embedding": embedding_str, "limit": limit}
-        )
-        rows = result.fetchall()
-
-        if not rows:
-            result = await sess.execute(
-                text(f"""
-                    SELECT chunk_text, topic
-                    FROM {table}
-                    WHERE exam_id = :eid
-                    ORDER BY embedding <=> :embedding::vector
-                    LIMIT :limit
-                """),
-                {"eid": exam_id, "embedding": embedding_str, "limit": limit}
-            )
-            rows = result.fetchall()
-
-    return [{"text": r[0], "topic": r[1]} for r in rows]
-
-
-# =========================
-# Mixed Test Generation
-# =========================
-@app.post("/tests/generate/mixed", response_model=GenerateTestResponse, tags=["Test Generation"])
-async def generate_test_mixed(
-    exam_id: int = Form(..., description="Exam ID"),
-    total_questions: int = Form(default=60, description="Total questions")
-):
-    """Generate mixed test (25% each source)"""
-    try:
-        # Get exam and pattern
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT exam_name, subject FROM exams WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            exam_row = result.fetchone()
-
-        if not exam_row:
-            raise HTTPException(status_code=404, detail=f"Exam not found: {exam_id}")
-
-        exam_name, subject_name = exam_row[0], exam_row[1] or "General"
-
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT pattern FROM patterns WHERE pattern_id = :pid"),
-                {"pid": exam_id}
-            )
-            row = result.fetchone()
-
-        if not row:
-            raise HTTPException(status_code=404, detail=f"Pattern not found for {exam_id}. Run /patterns/generate first.")
-
-        pattern = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-
-        tasks = build_tasks(pattern, total_questions)
-        random.shuffle(tasks)
-
-        prev_tasks, handbook_tasks, books_tasks, llm_tasks = [], [], [], []
-        for i, task in enumerate(tasks):
-            if i % 4 == 0:
-                prev_tasks.append(task)
-            elif i % 4 == 1:
-                handbook_tasks.append(task)
-            elif i % 4 == 2:
-                books_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-
-        questions = []
-        source_distribution = {"previous_year": 0, "rag_handbook": 0, "rag_books": 0, "llm": 0}
-
-        # Previous year questions
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("SELECT questions FROM previous_year_questions WHERE exam_id = :eid"),
-                {"eid": exam_id}
-            )
-            rows = result.fetchall()
-
-        all_prev = []
-        for r in rows:
-            qs = r[0] if isinstance(r[0], list) else json.loads(r[0])
-            all_prev.extend(qs)
-
-        used_prev = set()
-        for task in prev_tasks:
-            matched, matched_id = pick_previous_question(all_prev, task, used_prev)
-            if matched:
-                matched["source"] = "previous_year"
-                used_prev.add(matched_id)
-                questions.append(matched)
-                source_distribution["previous_year"] += 1
-            else:
-                llm_tasks.append(task)
-
-        # RAG handbook
-        for task in handbook_tasks:
-            chunks = await vector_search("rag_handbook", exam_id, task["topic"], limit=3)
-            if chunks:
-                context = "\n".join(c["text"][:500] for c in chunks)
-                prompt = build_prompt_from_context(context, task, exam_name, subject_name)
-                q = _parse_json_response(call_gpt(prompt))
-                if q:
-                    q["source"] = "rag_handbook"
-                    questions.append(q)
-                    source_distribution["rag_handbook"] += 1
-                else:
-                    llm_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-
-        # RAG books
-        for task in books_tasks:
-            chunks = await vector_search("rag_books", exam_id, task["topic"], limit=3)
-            if chunks:
-                context = "\n".join(c["text"][:500] for c in chunks)
-                prompt = build_prompt_from_context(context, task, exam_name, subject_name)
-                q = _parse_json_response(call_gpt(prompt))
-                if q:
-                    q["source"] = "rag_books"
-                    questions.append(q)
-                    source_distribution["rag_books"] += 1
-                else:
-                    llm_tasks.append(task)
-            else:
-                llm_tasks.append(task)
-
-        # LLM fallback
-        for task in llm_tasks:
-            prompt = build_prompt_direct(task, exam_name, subject_name)
-            q = _parse_json_response(call_gpt(prompt))
-            if not q:
-                q = {
-                    "text": f"Question about {task['topic']} ({task['type']})",
-                    "type": task["type"],
-                    "topic": task["topic"],
-                    "difficulty": task["difficulty"],
-                    "marks": task["marks"],
-                    "options": ["A", "B", "C", "D"],
-                    "answer": "A"
-                }
-            q["source"] = "llm"
-            questions.append(q)
-            source_distribution["llm"] += 1
-
-        mock_id = str(uuid.uuid4())
-        async with async_session() as sess:
-            await sess.execute(
-                text("""
-                    INSERT INTO tests (mock_id, exam_id, questions, total_questions, source_distribution, pattern_used)
-                    VALUES (:mock_id, :exam_id, :questions, :total_questions, :source_distribution, :pattern_used)
-                """),
-                {
-                    "mock_id": mock_id,
-                    "exam_id": exam_id,
-                    "questions": json.dumps(questions),
-                    "total_questions": len(questions),
-                    "source_distribution": json.dumps(source_distribution),
-                    "pattern_used": json.dumps(pattern)
-                }
-            )
-            await sess.commit()
-
-        return GenerateTestResponse(
-            mock_id=mock_id,
-            exam_id=exam_id,
-            total_questions=len(questions),
-            source_distribution=source_distribution,
-            questions=questions
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Mixed test generation failed: {str(e)}")
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
-
-import fitz
-import os
-import json
-import re
 import logging
+import os
+import re
+import shutil
+import tempfile
+from typing import Optional
+import uuid
+
+from fastapi import APIRouter, Form, File, UploadFile, HTTPException, Depends, Request
+from faster_whisper import WhisperModel
+from deep_translator import GoogleTranslator
+from openai import AzureOpenAI
+from pydub import AudioSegment
+from logger_setup import logger
+from utils.tts_utils import generate_tts_url
+from sqlalchemy import text
 import pandas as pd
-import glob
-import numpy as np
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-import random
+import io
 
-try:
-    from openai import AzureOpenAI
-except Exception:
-    AzureOpenAI = None
-
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO) 
-
+from models import User, chat_session_db as db, async_session
+from utils.agents_utils import load_language_mapping
+from utils.user_details import get_current_user
 logger = logging.getLogger(__name__)
 
-# === Azure GPT Client ===
+router = APIRouter()
+
+
+BOT_NAME = "Merry"
+
+
+WEIGHTS = {
+    "grammar": 0.10,
+    "vocabulary": 0.10,
+    "pronunciation": 0.10,
+    "fluency": 0.10,
+    "match": 0.60
+}
+ 
+
 llm_client = AzureOpenAI(
     api_key=AZURE_OPENAI_API_KEY,
     api_version=AZURE_OPENAI_VERSION,
     azure_endpoint=AZURE_OPENAI_ENDPOINT
 )
 
-# =========================
-# GPT CALL FUNCTION
-# =========================
-def call_gpt(prompt):
-    """
-    Calls Azure/OpenAI and returns plain text.
-    """
-    try:
-        response = llm_client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            max_tokens=10000,
-            temperature=0.7
-        )
-        text = response.choices[0].message.content.strip()
-        if not text:
-            raise ValueError("Empty response from Azure OpenAI")
-        return text  # ✅ return only the LLM text
-    except Exception as e:
-        logger.error(f"Azure OpenAI API error: {e}")
-        raise
+
+_whisper_model = WhisperModel("small", compute_type="int8")
 
 
-EXAM_EXAMPLES = {
-    "JEE": [
-        {
-            "Question Number": 2,
-            "Question Type": "Multiple Correct",
-            "Difficulty": "Advanced",
-            "Marks": 1,
-            "Classification": "Conic Sections / Geometry",
-            "Subquestions": [
-                "Let T1 and T2 be two distinct common tangents to the ellipse (x^2)/6 + (y^2)/3 = 1 and the parabola y^2 = 12x.",
-                "Suppose that the tangent T1 touches P and E at the points A1 and A2, respectively and the tangent T2 touches P and E at the points A4 and A3, respectively.",
-                "Then which of the following statements is(are) true?"
-            ],
-            "Options": [
-                {"A": "The area of the quadrilateral A1A2A3A4 is 35 sq units"},
-                {"B": "The area ... is 36 sq units"},
-                {"C": "The tangents meet x-axis at (-3,0)"},
-                {"D": "The tangents meet x-axis at (-6,0)"}
-            ]
-        }
-    ],
-
-    "NEET": [
-        {
-            "Question Type": "MCQ",
-            "Difficulty": "Moderate",
-            "Topic": "Human Physiology",
-            "Text": "Which hormone regulates water balance in the body?",
-            "Options": [
-                {"A": "Insulin"},
-                {"B": "ADH"},
-                {"C": "Thyroxine"},
-                {"D": "Oxytocin"}
-            ]
-        }
-    ],
-
-    "CAT": [
-        {
-            "Question Type": "DI-LR",
-            "Difficulty": "Advanced",
-            "Text": "A table shows sales of four companies over 5 years...",
-            "Task": "Which company saw the highest percentage growth?"
-        }
-    ],
-
-    # Add more exams as needed
-}
-
-
-# =========================
-# Extract Text + Diagrams
-# =========================
-def extract_text_and_images_from_pdf(pdf_path, exam, image_output_dir="diagrams"):
-    """
-    Extracts text and images from each page of the PDF.
-    Saves images to 'diagrams/' and returns dict of {Page: text, Diagrams: [paths]}.
-    """
-    os.makedirs(image_output_dir, exist_ok=True)
-    doc = fitz.open(pdf_path)
-
-    extracted_data = {}
-
-    for page_num, page in enumerate(doc, start=1):
-        page_text = page.get_text("text")
-        image_list = page.get_images(full=True)
-        diagram_files = []
-
-        for img_index, img in enumerate(image_list):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            image_bytes = base_image["image"]
-            image_ext = base_image["ext"]
-            image_filename = f"page{page_num}_img{img_index + 1}.{image_ext}"
-            image_path = os.path.join(image_output_dir, image_filename)
-            with open(image_path, "wb") as f:
-                f.write(image_bytes)
-            diagram_files.append(image_path)
-
-        extracted_data[f"Page {page_num}"] = {
-            "Text": page_text.strip(),
-            "Diagrams": diagram_files
-        }
-
-    page_count = len(doc)  # ✅ store before closing
-    doc.close()
-
-    with open(f"extracted_question_paper_with_diagrams_{exam}.json","w",encoding="utf-8") as f: json.dump(extracted_data, f, indent=4, ensure_ascii=False)
-
-    print(f"✅ Extracted text + diagrams saved. Total pages: {page_count}")
-
-    return extracted_data
+GRAMMAR_FIELDS = ["feedback", "filler_feedback", "errors", "word_suggestions", "corrected_sentence", "improved_sentence", "strengths"]
+VOCAB_FIELDS = ["feedback", "suggestions"]
+PRON_FIELDS = ["feedback", "words_to_practice"]
+FLUENCY_FIELDS = ["feedback"]
+MATCH_FIELDS = ["feedback", "strengths", "areas_to_improve"]
 
 
 
 
-# =========================
-# Call GPT (Azure or OpenAI) - Uses the call_gpt defined at line 42
-# The below function was removed as it duplicated the one above
-# =========================
-
-
-# =========================
-# Extract JSON Blocks
-# =========================
-def extract_json_blocks(text):
-    json_pattern = re.compile(r'```(?:json)?\s*([\s\S]*?)\s*```', re.DOTALL)
-    json_matches = json_pattern.findall(text)
-    json_objects = []
-    for match in json_matches:
-        try:
-            cleaned = match.replace("\n", " ").replace("\t", " ").strip()
-            json_objects.append(json.loads(cleaned))
-        except json.JSONDecodeError:
-            pass
-    if not json_objects:
-        try:
-            json_objects.append(json.loads(text))
-        except:
-            pass
-    return json_objects
-
-
-# =========================
-# Analyze Page Content
-# =========================
-def analyze_page_content(page_text, diagram_list, year=None):
-    """
-    Uses GPT to analyze the given page content and extract structured info,
-    including subquestions, options, and diagram references.
-    """
-    prompt = f"""
-    You are an expert in analyzing structured exam question papers (like JEE, NEET, CBSE, CAT etc.).
-    Your job is to extract **every question** and its components in structured JSON.
-    If there is text before the first numbered question that forms a reading comprehension paragraph,
-    extract it into the field "Passage".
-
-
-    --- TASK DETAILS ---
-    The page text may contain:
-    - Context paragraphs (like “Let f(x)=...”, “Given that...”)
-    - Questions without explicit numbering of subparts
-    - Mathematical formulas
-    - Optional choices (A), (B), (C), (D)
-    - References to diagrams or figures
-
-    --- EXTRACT AND RETURN ---
-    Return a single valid JSON object **only**, with the following structure:
-
-    {{
-      "Year": "{year if year else 'Unknown'}",
-      "Content": "<brief summary of what this page contains>",
-      "Notes": "<any notes if present, else None>",
-      "General Instructions": "<if any, else None>",
-      "Section": "<Section name if given, e.g., Section 1>",
-      "Passage": "<if a reading comprehension passage exists before the first question, extract and return it. Else null>",
-      "Questions": [
-        {{
-          "Question Number": 1,
-          "Question Type": "MCQ / Short Answer / Long Answer / Numerical / Multiple Correct",
-          "Classification": "<short topic or category like 'Functions', 'Probability'>",
-          "Subquestions": [
-              "Let ℝ denote the set of all real numbers...",
-              "Define the functions f(x), g(x), h(x)...",
-              "If f(x) ≠ g(x) for every x ∈ ℝ, then find coefficient of x³ in h(x)"
-          ],
-          "Options": [
-              {{"A": "8"}}, {{"B": "2"}}, {{"C": "-4"}}, {{"D": "-6"}}
-          ],
-          "Diagram": {str(bool(diagram_list)).lower()},
-          "DiagramPath": {json.dumps(diagram_list) if diagram_list else "[]"},
-          "Year": "{year if year else 'Unknown'}"
-        }},
-        {{
-          "Question Number": 2,
-          "Question Type": "MCQ",
-          "Classification": "Probability",
-          "Subquestions": [
-              "Three students S1, S2, and S3 are given a problem to solve...",
-              "Find P(T)."
-          ],
-          "Options": [
-              {{"A": "13/36"}}, {{"B": "1/3"}}, {{"C": "19/60"}}, {{"D": "1/4"}}
-          ],
-          "Diagram": {str(bool(diagram_list)).lower()},
-          "DiagramPath": {json.dumps(diagram_list) if diagram_list else "[]"},
-          "Year": "{year if year else 'Unknown'}"
-        }}
-      ]
-    }}
-
-    --- DETECTION RULES ---
-    
-    1. **Subquestions**:
-       - If a question has multiple logical parts (e.g., definitions, equations, or reasoning steps),
-         treat each as a subquestion *even if not labeled (i), (ii)*.
-       - Include them as a list of sentences or logical parts.
-    2. **Options**:
-       - Detect any text with (A), (B), (C), (D) or similar patterns.
-       - Include them as objects inside "Options" list.
-    3. **Diagrams**:
-       - If text includes “figure”, “diagram”, “shown below”, “see image”, etc., set `"Diagram": true`
-         else `"Diagram": false`.
-    4. **Formatting**:
-       - Always return a single valid JSON.
-       - Always include `"Subquestions"`, `"Options"`, and `"Diagram"` fields — even if empty.
-       
-    5. **PASSAGE DETECTION RULE**:
-        - If the page contains a reading comprehension paragraph before the first question number,
-            extract that entire text as "Passage".
-        - Do not break it into subquestions.
-        - It should appear only once per page, before the "Questions" list.
-
-
-    --- TEXT TO ANALYZE ---
-  
-
-    ### Page Content:
-    {page_text}
-
-    ### Diagrams on this page:
-    {diagram_list}
-    """
-
-    response_text = call_gpt(prompt)
-    print(f"\n🔍 Raw LLM output:\n{response_text[:1500]}...\n")  # print first 500 chars
-    json_data = extract_json_blocks(response_text)
-    
-    for page_json in json_data:
-        for q in page_json.get("Questions", []):
-            q["Year"] = year
-    if not json_data:
-        return [{
-            "Content": "Unable to analyze content",
-            "Section": "None",
-            "Questions": []
-        }]
-
-    return json_data
-
-
-# =========================
-# Process JSON
-# =========================
-def process_json(extracted_data, exam, year=None):
-    """
-    Process each page, analyze content + attach diagrams, and output structured question paper JSON.
-    """
-    analyzed_results = {}
-
-    for page, content in extracted_data.items():
-        print(f"\n📄 Analyzing {page} ...")
-        text = content["Text"]
-        diagrams = content["Diagrams"]
-        result = analyze_page_content(text, diagrams, year=year)
-        analyzed_results[page] = result
-        
-    year_part = f"_{year}" if year else ""
-    filename = f"structured_question_paper_with_diagrams_{exam}{year_part}.json"
-
-
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(analyzed_results, f, indent=4, ensure_ascii=False)
-    print("✅ Saved structured_question_paper_with_diagrams2.json")
-
-
-
-# =========================
-# JSON to Dataframe conversion
-# =========================
-
-# def jsons_to_question_bank(json_list):
-#     """
-#     Merge multiple JSON question data into a single DataFrame for pattern detection.
-#     Each row = one subquestion.
-#     """
-#     import pandas as pd
-#     rows = []
-
-#     for data in json_list:
-#         # Each data item may have multiple pages: "Page 1", "Page 2", etc.
-#         if isinstance(data, dict):
-#             for page_key, page_list in data.items():
-#                 if not isinstance(page_list, list):
-#                     continue
-#                 for page in page_list:
-#                     year = page.get("Year", None)
-#                     questions = page.get("Questions", [])
-#                     for q in questions:
-#                         question_text = " | ".join(q.get("Subquestions", []))
-#                         row = {
-#                             "topic": q.get("Classification", "Unknown"),
-#                             "type": q.get("Question Type", "MCQ"),
-#                             "difficulty": q.get("Difficulty", "Medium"),
-#                             "marks": q.get("Marks", 1),
-#                             "text": question_text,
-#                             "year": q.get("Year", year)
-#                         }
-#                         rows.append(row)
-#         elif isinstance(data, list):
-#             # Handle case where pages are directly in a list (less common)
-#             for page in data:
-#                 year = page.get("Year", None)
-#                 questions = page.get("Questions", [])
-#                 for q in questions:
-#                     question_text = " | ".join(q.get("Subquestions", []))
-#                     row = {
-#                         "topic": q.get("Classification", "Unknown"),
-#                         "type": q.get("Question Type", "MCQ"),
-#                         "difficulty": q.get("Difficulty", "Medium"),
-#                         "marks": q.get("Marks", 1),
-#                         "text": question_text,
-#                         "year": q.get("Year", year)
-#                     }
-#                     rows.append(row)
-
-#     df = pd.DataFrame(rows)
-#     print(f"✅ Loaded {len(df)} questions into the question bank.")
-#     return df
-
-def jsons_to_question_bank(json_list):
-    """
-    Merge multiple JSON question data into a single DataFrame for pattern detection.
-    Each row = one question/subquestion.
-    """
-    import pandas as pd
-
-    rows = []
-
-    for data in json_list:
-        if isinstance(data, dict):
-            for page_key, page_list in data.items():
-                if not isinstance(page_list, list):
-                    continue
-                for page in page_list:
-                    year = page.get("Year", None)
-                    passage = page.get("Passage", None)
-                    if passage:
-                        rows.append({
-                            "id": None,
-                            "topic": "Reading Comprehension",
-                            "type": "Passage",
-                            "difficulty": None,
-                            "marks": None,
-                            "text": passage,
-                            "options": None,
-                            "year": year,
-                            "has_diagram": False,
-                            "diagram_paths": [],
-                            "section": page.get("Section", ""),
-                            "instructions": page.get("General Instructions", ""),
-                            "page_content": page.get("Content", ""),
-                            "notes": page.get("Notes", "")
-                        })
-
-                    questions = page.get("Questions", [])
-                    for q in questions:
-                        question_text = " | ".join(q.get("Subquestions", []))
-                        row = {
-                            "id": q.get("Question Number"),
-                            "topic": q.get("Classification", "Unknown"),
-                            "type": q.get("Question Type", "MCQ"),
-                            "difficulty": q.get("Difficulty", "Medium"),
-                            "marks": q.get("Marks", 1),
-                            "text": question_text,
-                            "options": q.get("Options", []),
-                            "year": q.get("Year", year),
-                            "has_diagram": q.get("Diagram", False),
-                            "diagram_paths": q.get("DiagramPath", []),
-                            "section": page.get("Section", ""),
-                            "instructions": page.get("General Instructions", ""),
-                            "page_content": page.get("Content", ""),
-                            "notes": page.get("Notes", "")
-                        }
-                        if pd.notna(row["id"]) and str(row["id"]).strip() != "":
-                            rows.append(row)
-        elif isinstance(data, list):
-            for page in data:
-                year = page.get("Year", None)
-                passage = page.get("Passage", None)
-                if passage:
-                    rows.append({
-                        "id": None,
-                        "topic": "Reading Comprehension",
-                        "type": "Passage",
-                        "difficulty": None,
-                        "marks": None,
-                        "text": passage,
-                        "options": None,
-                        "year": year,
-                        "has_diagram": False,
-                        "diagram_paths": [],
-                        "section": page.get("Section", ""),
-                        "instructions": page.get("General Instructions", ""),
-                        "page_content": page.get("Content", ""),
-                        "notes": page.get("Notes", "")
-                    })
-
-                questions = page.get("Questions", [])
-                for q in questions:
-                    question_text = " | ".join(q.get("Subquestions", []))
-                    row = {
-                        "id": q.get("Question Number"),
-                        "topic": q.get("Classification", "Unknown"),
-                        "type": q.get("Question Type", "MCQ"),
-                        "difficulty": q.get("Difficulty", "Medium"),
-                        "marks": q.get("Marks", 1),
-                        "text": question_text,
-                        "options": q.get("Options", []),
-                        "year": q.get("Year", year),
-                        "has_diagram": q.get("Diagram", False),
-                        "diagram_paths": q.get("DiagramPath", []),
-                        "section": page.get("Section", ""),
-                        "instructions": page.get("General Instructions", ""),
-                        "page_content": page.get("Content", ""),
-                        "notes": page.get("Notes", "")
-                    }
-                    if pd.notna(row["id"]) and str(row["id"]).strip() != "":
-                        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    print(f"✅ Loaded {len(df)} questions into the question bank.")
-    return df
-# ---------------------------
-# Pattern detection
-# ---------------------------
-
-import pandas as pd
-from typing import Optional, Dict, Any
-
-def detect_pattern(question_bank_df: pd.DataFrame,
-                   country: str,
-                   exam_name: str,
-                   subject: str,
-                   lookback_years: int = 3,
-                   as_of_year: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Detect exam pattern using structured data, with hybrid fallback to LLM for missing columns.
-    Returns a fully JSON-serializable pattern dictionary.
-    """
-
-
-    # Empty DataFrame → fallback to LLM
-    if question_bank_df.empty:
-        print("⚠️ No historical data found, using LLM to predict the full pattern.")
-        return infer_pattern_from_llm(country, exam_name, subject)
-
-    # Determine years to consider
-    if "year" in question_bank_df.columns:
-        if as_of_year is None:
-            as_of_year = int(question_bank_df["year"].max()) + 1
-        years_available = sorted(question_bank_df["year"].dropna().astype(int).unique())
-        years_before = [y for y in years_available if y < as_of_year]
-        years_selected = years_before[-lookback_years:] if years_before else years_available
-        df = question_bank_df[question_bank_df["year"].astype(int).isin(years_selected)]
-    else:
-        df = question_bank_df.copy()
-        years_selected = []
-
-    # Required columns for statistical computation
-    required_cols = {"topic", "type", "difficulty", "marks"}
-    missing_cols = required_cols - set(df.columns)
-
-    # Base result with defaults
-    hybrid_result = {
-        "years_used": [int(y) for y in years_selected],
-        "avg_total_questions": int(round(float(df.shape[0]))),
-        "topic_distribution": {},
-        "type_distribution": {},
-        "difficulty_distribution": {},
-        "avg_marks": 0.0
+async def call_llm(prompt: str, mode: str = "chat", timeout: int = 30, model: str = "gpt") -> str:
+    """LLM call with timeout"""
+    system_prompts = {
+        "chat": f"You are {BOT_NAME}, a warm and helpful FAQ practice coach.",
+        "analysis": "You are an expert language and interview evaluator. Analyze objectively.",
+        "strict_json": "You are a structured evaluator. Respond ONLY in valid JSON. No extra text."
     }
-
-    # Compute available columns statistically
-    if "topic" in df.columns:
-        topic_counts = df["topic"].fillna("Unknown").astype(str).str.lower().value_counts()
-        total = float(topic_counts.sum())
-        hybrid_result["topic_distribution"] = {str(k): float(v / total) for k, v in topic_counts.items()}
-
-    if "type" in df.columns:
-        type_counts = df["type"].fillna("MCQ").astype(str).str.upper().value_counts()
-        total = float(type_counts.sum())
-        hybrid_result["type_distribution"] = {str(k): float(v / total) for k, v in type_counts.items()}
-
-    if "difficulty" in df.columns:
-        diff_counts = df["difficulty"].fillna("Medium").astype(str).value_counts()
-        total = float(diff_counts.sum())
-        hybrid_result["difficulty_distribution"] = {str(k): float(v / total) for k, v in diff_counts.items()}
-
-    if "marks" in df.columns:
-        hybrid_result["avg_marks"] = float(df["marks"].fillna(1).astype(float).mean())
-
-    # If some columns are missing → call LLM for only missing info
-    if missing_cols:
-        print(f"🤖 Missing columns {missing_cols} → using LLM for hybrid inference...")
-        combined_text = "\n".join(df.get("text", df.get("question", "")).astype(str).tolist())
-        llm_inferred = infer_pattern_from_llm(country, exam_name, subject, combined_text)
-
-        # Merge LLM result (ensure JSON-serializable)
-        try:
-            llm_data = json.loads(llm_inferred.get("inferred_pattern", "{}"))
-            for col in missing_cols:
-                key_map = {
-                    "topic": "topic_distribution",
-                    "type": "type_distribution",
-                    "difficulty": "difficulty_distribution",
-                    "marks": "avg_marks"
-                }
-                if key_map[col] in llm_data:
-                    value = llm_data[key_map[col]]
-                    # Convert numpy types to native Python types
-                    if isinstance(value, (np.int64, np.float64)):
-                        value = float(value)
-                    elif isinstance(value, dict):
-                        value = {str(k): float(v) for k, v in value.items()}
-                    hybrid_result[key_map[col]] = value
-        except Exception as e:
-            print(f"⚠️ LLM returned unparseable data, using fallback defaults. Error: {e}")
-
-    return hybrid_result
-
-from typing import Optional, Dict, Any
-from typing import Optional, Dict, Any
- 
-def infer_pattern_from_llm(country: str,
-                           exam_name: str,
-                           subject: str,
-                           question_text: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Use LLM to infer a fully structured exam pattern.
-    Returns a dict containing the parsed JSON.
-    """
- 
-    question_snippet = ""
-    if question_text:
-        truncated = question_text[:3000].replace("{", "").replace("}", "")
-        question_snippet = f"\nHere are sample past questions:\n{truncated}"
- 
-    pattern_prompt = f"""
-    You are an exam-pattern analysis AI.
- 
-    Analyze the historical question trends of **{exam_name}** in **{country}** for **{subject}**.
-
-    Return a **flat dictionary** for topic_distribution where keys are **granular topics only** (like 'Thermodynamics', 'Kinematics', 'Differentiation', 'Integration', 'Organic Chemistry'), 
-  and **do NOT include subjects like Physics, Chemistry, Math** as keys.
     
-    Infer the exam pattern using the step-by-step reasoning you know internally, but output ONLY the final JSON.
- 
-    ❗MANDATORY JSON SCHEMA (FOLLOW EXACTLY):
- 
-    {{
-      "years_used": [ list of integers ],
-      "avg_total_questions": number,
-      "topic_distribution": {{ "topic_name": probability_float }},
-      "type_distribution": {{
-          "MCQ": float,
-          "NUMERICAL": float,
-          "MULTIPLE CORRECT": float,
-          "SHORT ANSWER": float,
-          "MATCHING": float
-      }},
-      "difficulty_distribution": {{
-          "Easy": float,
-          "Medium": float,
-          "Advanced": float
-      }},
-      "avg_marks": float
-    }}
- 
-    Rules:
-    - All probability values must be decimals between 0 and 1.
-    - Sum of topic_distribution does NOT need to be exactly 1 (historical data varies), but values must be floats.
-    - No text explanation. No markdown. No extra keys.
-    - The output MUST be a single clean JSON object.
- 
-    {question_snippet}
-    """
- 
-    response = call_gpt(pattern_prompt)
- 
-    # Convert JSON string → dict safely
     try:
-        import json
-        parsed = json.loads(response)
-    except:
-        # fallback: extract JSON using simple regex
-        import re, json
-        json_match = re.search(r"\{[\s\S]*\}", response)
-        parsed = json.loads(json_match.group()) if json_match else {}
- 
-    return  parsed
- 
-
-
-# ---------------------------
-# Test paper generation
-# ---------------------------
-
-from datetime import datetime
-from typing import Dict, Any, List, Optional
-
-# def assemble_test(
-#     country: str,
-#     category: str,
-#     exam: str,
-#     subject: str,
-#     pattern: Dict[str, Any],
-#     total_questions: Optional[int] = None,
-#     languages: Optional[List[str]] = None
-# ) -> Dict[str, Any]:
-#     """
-#     Assemble a new test entirely using LLM (no existing question bank).
-#     Returns a test JSON object.
-#     """
-#     languages = languages or ['en']
-#     if total_questions is None:
-#         total_questions = pattern.get('avg_total_questions', 20)
-        
-#     # ✅ Ensure numeric type
-#     try:
-#         total_questions = int(float(total_questions))
-#     except Exception:
-#         logger.warning(f"Invalid total_questions: {total_questions}, defaulting to 20")
-#         total_questions = 20
-
-#     # Compute topic-wise quotas based on pattern
-#     topic_distribution = pattern.get('topic_distribution', {})
-#     quotas = {topic: int(round(total_questions * pct)) for topic, pct in topic_distribution.items()}
-
-#     selected_questions = []
-#     diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15})
-#     type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-#     # Generate questions
-#     for topic, qcount in quotas.items():
-#         for diff_name, diff_pct in diff_dist.items():
-#             needed = int(round(qcount * diff_pct))
-#             for _ in range(needed):
-#                 gen_type = type_order[0]  # always pick first type
-#                 gen_q = generate_question_via_llm(
-#                     country, category, exam, subject, topic, gen_type, diff_name,
-#                     int(pattern.get('avg_marks', 1)), languages
-#                 )
-#                 selected_questions.append(gen_q)
-
-#     # If rounding causes mismatch, add more questions from top topics
-#     while len(selected_questions) < total_questions:
-#         top_topic = max(topic_distribution, key=topic_distribution.get)
-#         gen_q = generate_question_via_llm(
-#             country, category, exam, subject, top_topic, type_order[0], 'Medium',
-#             int(pattern.get('avg_marks', 1)), languages
-#         )
-#         selected_questions.append(gen_q)
-
-#     # Estimate time per question
-#     def estimate_time(q):
-#         qtype = (q.get('type') or 'MCQ').upper()
-#         difficulty = (q.get('difficulty') or 'Medium').lower()
-#         base = 1.0
-#         if qtype == 'NVT':
-#             base = 3.0
-#         if difficulty == 'medium':
-#             base *= 1.5
-#         if difficulty == 'hard':
-#             base *= 2.5
-#         if q.get('has_diagram'):
-#             base += 0.5
-#         return float(base)
-
-#     for q in selected_questions:
-#         q['est_time_min'] = estimate_time(q)
-
-#     total_est_time = sum([q.get('est_time_min', 1.0) for q in selected_questions])
-
-#     test_json = {
-#         'country': country,
-#         'category': category,
-#         'exam': exam,
-#         'subject': subject,
-#         'generated_at': datetime.utcnow().isoformat() + 'Z',
-#         'questions': selected_questions,
-#         'total_questions': len(selected_questions),
-#         'estimated_duration_minutes': round(total_est_time, 1),
-#         'pattern_used': pattern
-#     }
-
-#     return test_json
-
-
-
-logger = logging.getLogger(__name__)
-
-def _safe_load_json_array(raw: str):
-    """Try multiple heuristics to extract a JSON array/list of objects from raw LLM text."""
-    raw = raw.strip()
-    # 1) direct load
-    try:
-        val = json.loads(raw)
-        if isinstance(val, list):
-            return val
-        if isinstance(val, dict) and "questions" in val and isinstance(val["questions"], list):
-            return val["questions"]
-        # if it's a single object, return list
-        return [val]
-    except Exception:
-        pass
-
-    # 2) find code fences labelled json or plain
-    code_matches = re.findall(r'```(?:json)?\s*([\s\S]*?)\s*```', raw, flags=re.I)
-    for block in code_matches:
-        try:
-            return json.loads(block)
-        except Exception:
-            # try escape backslashes
-            try:
-                return json.loads(block.replace('\\', '\\\\'))
-            except Exception:
-                continue
-
-    # 3) try to extract first JSON array substring
-    arr_match = re.search(r'(\[.*\])', raw, flags=re.S)
-    if arr_match:
-        candidate = arr_match.group(1)
-        try:
-            return json.loads(candidate)
-        except Exception:
-            try:
-                return json.loads(candidate.replace('\\', '\\\\'))
-            except Exception:
-                pass
-
-    # 4) try to extract several JSON objects and return list
-    objs = re.findall(r'\{[\s\S]*?\}', raw)
-    parsed = []
-    for o in objs:
-        try:
-            parsed.append(json.loads(o))
-        except Exception:
-            try:
-                parsed.append(json.loads(o.replace('\\', '\\\\')))
-            except Exception:
-                continue
-    if parsed:
-        return parsed
-    raise ValueError("No valid JSON array could be parsed from LLM response.")
-
-
-
-import glob
-import json
-
-def summarize_rules(all_rules: List[str]) -> str:
-    summary_prompt = f"""
-    Summarize the following exam question generation improvement rules 
-    into 10–20 concise, non-redundant rules:
-
-    {all_rules}
-
-    Return only bullet points.
-    """
-
-    return call_gpt(summary_prompt)
-
-def load_combined_feedback(exam: str) -> str:
-    feedback_rules = []
-    #files = glob.glob(f"analysis_{exam}_*.json")  
-    files = sorted(glob.glob(f"analysis_{exam}_*.json"))[-3:]  # only last 5 feedback files
-    for file in files:
-        with open(file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            feedback_rules.extend(data.get("rules", []))
-
-    unique_rules = list(set(feedback_rules))
-   
-    if len(unique_rules) > 30:
-        unique_rules = summarize_rules(unique_rules)  # compress using GPT
-
-    return "\n".join(f"- {rule}" for rule in unique_rules)
-
-
-
-from llama_index.core import QueryBundle
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.postgres import PGVectorStore
-from llama_index.core.retrievers import BaseRetriever
-from llama_index.core.vector_stores import VectorStoreQuery
-from llama_index.core.vector_stores.types import MetadataFilters, ExactMatchFilter
-from llama_index.core.schema import NodeWithScore
-import time
-import random
-
-embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en")
-vector_store = PGVectorStore.from_params(
-    database="competitive",
-    host="localhost",
-    user="postgres",
-    password="1234",
-    port=5432,
-    table_name="data_my_second_book",
-    embed_dim=384,                     # bge-small-en produces 384-dim vectors
-)
-class MetadataAwareRetriever(BaseRetriever):
-    def __init__(
-        self,
-        vector_store: PGVectorStore,
-        embed_model: Any,
-        similarity_top_k: int = 10,
-    ) -> None:
-        self._vector_store = vector_store
-        self._embed_model = embed_model
-        self._similarity_top_k = similarity_top_k
-        super().__init__()
-
-    def _retrieve(self, query_bundle: QueryBundle, metadata: Dict[str, Any] = None) -> List[NodeWithScore]:
-        """Retrieve nodes with metadata filtering, falling back if empty."""
-        query_embedding = self._embed_model.get_query_embedding(query_bundle.query_str)
-        
-        filters = []
-        if metadata:
-            for key, value in metadata.items():
-                if isinstance(value, str):
-                    # CAREFUL: Exact match requires the DB metadata to be identical
-                    filters.append(ExactMatchFilter(key=key, value=value.strip()))
-
-        # 1. Construct the filtered query
-        vector_store_query = VectorStoreQuery(
-            query_embedding=query_embedding,
-            similarity_top_k=self._similarity_top_k,
-            filters=MetadataFilters(filters=filters) if filters else None
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                llm_client.chat.completions.create,
+                model=AZURE_OPENAI_DEPLOYMENT,
+                messages=[
+                    {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=1500,
+                temperature=0.7 if mode == "chat" else 0.3
+            ),
+            timeout=timeout
         )
-        
-        # 2. Execute First Attempt
-        try:
-            query_result = self._vector_store.query(vector_store_query)
-        except Exception as e:
-            print(f"Query Error: {e}")
-            query_result = None
-
-        # 3. Check for Empty Results OR Errors -> Trigger Fallback
-        # If nodes are empty, it means the strict filter hid the relevant content
-        if query_result is None or not query_result.nodes:
-            if filters:
-                print(f"   [!] No content found with filters {metadata}. Retrying with Semantic Search only...")
-                
-                fallback_query = VectorStoreQuery(
-                    query_embedding=query_embedding,
-                    similarity_top_k=self._similarity_top_k,
-                    filters=None  # Remove filters
-                )
-                query_result = self._vector_store.query(fallback_query)
-            else:
-                print("   [!] No content found even without filters.")
-
-        # Handle case where fallback also fails/is empty
-        if not query_result or not query_result.nodes:
-            return []
-
-        return [
-            NodeWithScore(node=n, score=s) 
-            for n, s in zip(query_result.nodes, query_result.similarities or [])
-        ]
-retriever = MetadataAwareRetriever(vector_store, embed_model, similarity_top_k=5)
-from sqlalchemy import text
-
-def get_all_topics_for_exam(exam):
-    """
-    Read distinct metadata->>'topic' values directly from Postgres using SQLAlchemy.
-    Returns a list of lowercase topic strings.
-    """
-    exam_val = exam.upper()
-    table = vector_store.table_name  # uses the table you configured earlier
-
-    sql = text(f"""
-        SELECT DISTINCT metadata->>'topic' AS topic
-        FROM {table}
-        WHERE metadata->>'exam' = :exam
-          AND metadata->>'topic' IS NOT NULL
-    """)
-
-    try:
-        conn = vector_store.client   # SQLAlchemy Connection
+        return response.choices[0].message.content.strip()
+    except asyncio.TimeoutError:
+        logger.error(f"LLM call timed out after {timeout}s")
+        return ""
     except Exception as e:
-        print("Unable to access PGVector SQLAlchemy client:", e)
-        return []
-
-    try:
-        result = conn.execute(sql, {"exam": exam_val})
-    except Exception as e:
-        print("DB query error when fetching topics:", e)
-        return []
-
-    topics = set()
-    for row in result:
-        topic = row[0]
-        if topic:
-            topics.add(topic.strip().lower())
-
-    return sorted(list(topics))
-
-
-
-# from rapidfuzz import fuzz
-
-
-# def fuzzy_match_topic(input_topic, db_topics, threshold=60):
-#     """
-#     Return best matching db topic (lowercase) if score >= threshold, else None.
-#     """
-#     best = None
-#     best_score = 0
-#     inp = (input_topic or "").lower().strip()
-#     if not inp or not db_topics:
-#         return None
-
-#     for t in db_topics:
-#         score = fuzz.ratio(inp, t)
-#         if score > best_score:
-#             best_score = score
-#             best = t
-
-#     if best_score >= threshold:
-#         return best
-#     return None
-
-
-# def get_questions(exam, topic, top_k=5):
-#     """
-#     1) Get DB topics (from Postgres)
-#     2) Fuzzy-match user topic to closest DB topic
-#     3) Query vector store with ExactMatchFilter on exam+topic and a semantic query embedding
-#     """
-#     print("Requested topic:", topic)
-
-#     db_topics = get_all_topics_for_exam(exam)
-#     print("DB topics:", db_topics)
-
-#     matched_topic = fuzzy_match_topic(topic, db_topics, threshold=55)  # lower if needed
-#     print("Matched topic:", matched_topic)
-
-#     if not matched_topic:
-#         print("❌ No fuzzy topic match found")
-#         return []
-
-#     # build VectorStoreQuery with MetadataFilters (exact match on stored topic)
-#     query_embedding = embed_model.get_query_embedding(topic)
-
-#     filters = MetadataFilters(filters=[
-#         ExactMatchFilter(key="exam", value=exam.upper()),
-#         ExactMatchFilter(key="topic", value=matched_topic)
-#     ])
-
-#     vs_query = VectorStoreQuery(
-#         query_embedding=query_embedding,
-#         similarity_top_k=top_k,
-#         filters=filters
-#     )
-
-#     res = vector_store.query(vs_query)
-#     # res may be None or an object; safe guard:
-#     if not res or not getattr(res, "nodes", None):
-#         return []
-#     return res.nodes
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-
-
-class MetadataAwareRetriever_textbook(BaseRetriever):
-    def __init__(
-        self,
-        vector_store: PGVectorStore,
-        embed_model: Any,
-        similarity_top_k: int = 10,
-    ) -> None:
-        self._vector_store = vector_store
-        self._embed_model = embed_model
-        self._similarity_top_k = similarity_top_k
-        super().__init__()
-
-    def _retrieve(self, query_bundle: QueryBundle, metadata: Dict[str, Any] = None) -> List[NodeWithScore]:
-        """Retrieve nodes with metadata filtering, falling back if empty."""
-        query_embedding = self._embed_model.get_query_embedding(query_bundle.query_str)
-        
-        filters = []
-        if metadata:
-            
-            for key, value in metadata.items():
-                if isinstance(value, str):
-                    filters.append(ExactMatchFilter(key=key, value=value.strip()))
-                else:
-                    
-                    filters.append(ExactMatchFilter(key=key, value=str(value)))
-        
-        
-        vector_store_query = VectorStoreQuery(
-            query_embedding=query_embedding,
-            similarity_top_k=self._similarity_top_k,
-            filters=MetadataFilters(filters=filters) if filters else None
-        )
-        
-        
-        try:
-            query_result = self._vector_store.query(vector_store_query)
-        except Exception as e:
-            print(f"Query Error: {e}")
-            query_result = None
-
-        
-        if query_result is None or not query_result.nodes:
-            if filters:
-                print(f"   [!] No content found with filters {metadata}. Retrying with Semantic Search only...")
-                
-                fallback_query = VectorStoreQuery(
-                    query_embedding=query_embedding,
-                    similarity_top_k=self._similarity_top_k,
-                    filters=None  
-                )
-                query_result = self._vector_store.query(fallback_query)
-            else:
-                print("   [!] No content found even without filters.")
-
-        
-        if not query_result or not query_result.nodes:
-            return []
-
-        return [
-            NodeWithScore(node=n, score=s) 
-            for n, s in zip(query_result.nodes, query_result.similarities or [])
-        ]
-
-
-
-
-
-
-
-
-
-
-
-def convert_rag_to_question_seeds(text: str, exam: str):
-    return f"""
-From the following study material, extract:
-1. 3 hidden variables that are NOT explicitly stated
-2. 2 common student misconceptions
-3. 2 boundary/extreme cases
-4. 1 real-exam-style trap
-
-Material:
-{text}
-"""
-
-
-
-
-retriever = MetadataAwareRetriever_textbook(vector_store, embed_model, similarity_top_k=5)
-
-def generate_questions_batch_via_textbook(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    tasks: List[Dict[str, Any]],
-    languages: Optional[List[str]] = None,
-    max_retries: int = 1,
-    metadata: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-
-    languages = languages or ['en']
-    results = []
-
-    # --------------------------------------------------
-    # 1️⃣ Retrieve RAG content ONCE per task
-    # --------------------------------------------------
-    rag_map = {}
-
-    for task in tasks:
-        topic = task['topic']
-        query_metadata = metadata or {"topic": topic, "exam_name": exam}
-
-        retrieved_nodes = retriever._retrieve(
-            QueryBundle(query_str=topic),
-            metadata=query_metadata
-        )
-
-        rag_text = "\n".join(node.node.text for node in retrieved_nodes)
-        seed_prompt = convert_rag_to_question_seeds(rag_text, exam)
-        question_seed = call_gpt(seed_prompt)
-        #rag_text.append(question_seed)
-        rag_text = rag_text + "\n\nQUESTION SEEDS:\n" + question_seed
-
-
-        rag_map[topic] = rag_text
-
-    # --------------------------------------------------
-    # 2️⃣ Exam examples + feedback (batch-level)
-    # --------------------------------------------------
-    previous_feedback = load_combined_feedback(exam)
-
-    exam_examples = EXAM_EXAMPLES.get(exam, [])
-    example_section = ""
-
-    if exam_examples:
-        example_section = "\n\n".join(
-            f"Example {i+1}:\n{json.dumps(ex, indent=2)}"
-            for i, ex in enumerate(exam_examples)
-        )
-
-    # --------------------------------------------------
-    # 3️⃣ Shared batch context (NO generation instruction)
-    # --------------------------------------------------
-    batch_context = f"""
-=== EXAM STYLE GUIDELINES ===
-difficulty and quality of questions MUST be same as the previous papers of the given exam{exam}
-Use examples ONLY for structure, difficulty, reasoning.
-
-{example_section}
-
-=== PRIOR EVALUATION FEEDBACK ===
-{previous_feedback}
-""".strip()
-
-    # --------------------------------------------------
-    # 4️⃣ Generate questions (per-task LLM)
-    # --------------------------------------------------
-    for idx, task in enumerate(tasks, start=1):
-        topic = task['topic']
-        print(f"Generating question {idx}/{len(tasks)} | Topic: {topic}")
-
-        topic_context = f"""
-=== RAG CONTENT FOR TOPIC: {topic} ===
-{rag_map.get(topic, "")}
-"""
-
-        extra_prompt = batch_context + "\n\n" + topic_context
-
-        try:
-            q = generate_question_via_llm(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                topic=topic,
-                qtype=task.get('type', 'MCQ'),
-                difficulty=task.get('difficulty', 'Medium'),
-                marks=int(task.get('marks', 1)),
-                languages=languages,
-                metadata=metadata,
-                max_retries=max_retries,
-                extra_prompt=extra_prompt   # ✅ PASSED HERE
-            )
-        except Exception as e:
-            print(f"⚠ Failed for topic {topic}: {e}")
-            q = {
-                "id": f"GEN_FAIL_{random.randint(1000,9999)}",
-                "passage": None,
-                "text": f"Fallback placeholder question on {topic}",
-                "options": [],
-                "correct_answer": "",
-                "explanation": "Generation failed",
-                "explanations_multilingual": {lang: "Generation failed" for lang in languages},
-                "incorrect_options_explanations": {},
-                "type": task.get('type', 'MCQ'),
-                "difficulty": task.get('difficulty', 'Medium'),
-                "marks": int(task.get('marks', 1)),
-                "topic": topic,
-                "has_diagram": False,
-                "diagram_description": None
-            }
-
-        results.append(q)
-
-    return results
-
-
-
-# def generate_questions_batch_via_textbook(
-#     country: str,
-#     category: str,
-#     exam: str,
-#     subject: str,
-#     tasks: List[Dict[str, Any]],
-#     languages: Optional[List[str]] = None,
-#     max_retries: int = 1,
-#     metadata: Optional[Dict[str, Any]] = None
-# ) -> List[Dict[str, Any]]:
-#     """
-#     Generate multiple questions based on RAG content and print relevant information.
-#     """
-#     languages = languages or ['en']
-#     n = len(tasks)
-
-    
-#     rag_content = []
-#     print("==== Retrieving RAG Content ====")
-#     for task in tasks:
-        
-#         query_metadata = metadata or {"topic": task['topic'], "exam_name": exam}
-        
-#         print(f"Retrieving content for task {task['topic']}...")
-
-        
-#         retrieved_nodes = retriever._retrieve(QueryBundle(query_str=task['topic']), metadata=query_metadata)
-        
-        
-#         content = "\n".join([node.node.text for node in retrieved_nodes])
-        
-        
-#         print(f"Retrieved RAG content for topic '{task['topic']}':")
-#         print(content)
-#         print("-" * 50)
-        
-#         rag_content.append(content)
-
-    
-#     tasks_text = "\n".join(
-#         f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-#         for i, t in enumerate(tasks)
-#     )
-
-    
-#     previous_feedback = load_combined_feedback(exam)
-
-    
-    
-    
-#     example_section = ""
-
-#     exam_examples = EXAM_EXAMPLES.get(exam, [])
-
-#     if exam_examples:
-#         example_strings = []
-#         for idx, ex in enumerate(exam_examples, start=1):
-#             example_strings.append(
-#                 f"Example {idx}:\n{json.dumps(ex, indent=2)}"
-#             )
-        
-#         example_section = (
-#             "\n\n====================\n"
-#             "EXAM STYLE EXAMPLES\n"
-#             "====================\n"
-#             "Use these examples ONLY to match structure, difficulty, reasoning pattern.\n"
-#             + "\n\n".join(example_strings)
-#             + "\n====================\n"
-#         )
-#     else:
-#         example_section = "\n(No examples found for this exam.)\n"
-
-
-    
-#     prompt = f"""
-#     You are an expert exam-writer. Generate exactly {n} questions that match these numbered tasks.
-#     If a task's topic indicates Reading Comprehension (RC), first create a short passage (120–200 words) and base the question on it.
-
-#     The content for each task has been retrieved below (RAG content). Use it to generate the questions.
-
-#     ====================
-#     EXAM-SPECIFIC QUESTION QUALITY REQUIREMENTS
-#     ====================
-#     Here are {exam} example questions. STRICTLY imitate their reasoning depth, structure, tone, and difficulty.
-
-#     ====================
-#     FEW-SHOT EXAMPLES FOR {exam}
-#     ====================
-#     {example_section}
-#     ====================
-
-#     ⚠ Incorporate the following improvement rules from prior evaluations:
-#     ====================
-#     {previous_feedback}
-#     ====================
-
-#     The difficulty MUST exactly match the task difficulty provided:
-#     Easy → concept recall  
-#     Medium → multi-step reasoning  
-#     Hard → deep conceptual + tricky distractors  
-
-#     Here is the required JSON schema (DO NOT MODIFY KEYS OR STRUCTURE):
-
-#     {{"id": "<string>", "passage": "<text or null>", "text": "<full question text>", "options": [{{"A":"..."}}, {{"B":"..."}}, {{"C":"..."}}, {{"D":"..."}}] OR [], "correct_answer": "<A/B/C/... or numeric string>", "explanation": "<english step-by-step explanation>", "explanations_multilingual": {{"en": "...", "hi": "..."}}, "incorrect_options_explanations": {{"B":"..." , "C":"...", "D":"..."}}, "type": "<MCQ / NVT / Multiple Correct / Long Answer>", "difficulty": "<Easy/Medium/Hard>", "marks": <int>, "topic": "<topic>", "has_diagram": <true/false>", "diagram_description": "<short text or null>"}} 
-
-#     The questions must appear in the array in the same order as the tasks below.
-#     Do NOT include any text outside the JSON array. If you cannot produce one, return the best-effort JSON array only.
-
-#     Tasks:
-#     {tasks_text}
-
-#     RAG Content for each task:
-#     {rag_content}
-
-#     Languages for explanations: {languages}
-#     Ensure JSON validity, keep correct_answer consistent with options, and include passage only for RC topics.
-#     """
-
-    
-#     print("Generating questions using the LLM...")
-#     raw = call_gpt(prompt)
-
-    
-#     print("Raw output from LLM:")
-#     print(raw[:500])  
-
-    
-#     try:
-#         arr = _safe_load_json_array(raw)
-#         print("Questions successfully generated.")
-#     except Exception as e:
-#         print(f"Failed to parse JSON. Error: {e}")
-#         arr = []
-#         for t in tasks:
-#             q = generate_question_via_llm(
-#                 country, category, exam, subject,
-#                 t['topic'], t.get('type','MCQ'),
-#                 t.get('difficulty','Medium'),
-#                 int(t.get('marks',1)), languages
-#             )
-#             arr.append(q)
-#         return arr
-
-    
-#     result = []
-#     for i, item in enumerate(arr[:n]):
-#         print(f"Post-processing question {i+1}...")
-
-        
-#         item.setdefault('id', f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-#         item.setdefault('type', tasks[i].get('type','MCQ'))
-#         item.setdefault('passage', item.get('passage', None))
-        
-#         valid_difficulties = {"Easy", "Medium", "Hard"}
-#         raw_diff = str(item.get("difficulty", "")).strip().title()
-        
-#         if raw_diff not in valid_difficulties:
-#             item["difficulty"] = tasks[i].get("difficulty", "Medium")
-#         else:
-#             item["difficulty"] = raw_diff
-
-#         item.setdefault('marks', int(tasks[i].get('marks', 1)))
-#         item.setdefault('topic', tasks[i].get('topic'))
-#         item.setdefault('text', item.get('text', f"Placeholder question on {item['topic']}"))
-#         item.setdefault('options', item.get('options', []))
-#         item.setdefault('correct_answer', item.get('correct_answer', 'A' if item.get('options') else ""))
-
-#         item.setdefault('has_diagram', bool(item.get('diagram_description')))
-#         item.setdefault('explanations_multilingual', item.get('explanations_multilingual', {lang: "Placeholder explanation" for lang in languages}))
-#         item.setdefault('incorrect_options_explanations', item.get('incorrect_options_explanations', {}))
-
-        
-#         if isinstance(item['options'], list) and item['options'] and isinstance(item['options'][0], str):
-#             letters = ['A','B','C','D','E']
-#             opts = []
-#             for idx, opt in enumerate(item['options']):
-#                 if idx < len(letters):
-#                     opts.append({letters[idx]: opt})
-#             item['options'] = opts
-
-#         result.append(item)
-    
-    
-#     print(f"Generated {len(result)} questions.")
-#     for idx, q in enumerate(result):
-#         print(f"\nQuestion {idx + 1}:")
-#         print(f"Topic: {q['topic']}")
-#         print(f"Text: {q['text']}")
-#         print(f"Options: {q.get('options', 'No options')}")
-#         print(f"Correct Answer: {q['correct_answer']}")
-#         print("-" * 50)
-
-#     return result
-
-
-
-
-
-
-def assemble_test_via_textbook(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any], total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    bank_df: Optional[Any] = None,  
-    fallback_to_llm: bool = True,
-    batch_size: int = 8,
-    parallel: bool = True
-) -> Dict[str, Any]:
-
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get(
-        'difficulty_distribution', 
-        {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15}
-    )
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-    # ------------------------------------------------------------------
-    # 1️⃣ Build ALL tasks first (no DB picking)
-    # ------------------------------------------------------------------
-    tasks = []
-    quotas = {
-        topic: int(round(total_questions * float(pct)))
-        for topic, pct in topic_distribution.items()
-    }
-
-    for topic, qcount in quotas.items():
-        for diff_name, diff_pct in diff_dist.items():
-            needed = int(round(qcount * float(diff_pct)))
-            for _ in range(needed):
-                tasks.append({
-                    'topic': topic,
-                    'type': type_order,
-                    'difficulty': diff_name,
-                    'marks': int(pattern.get('avg_marks', 1))
-                })
-
-    while len(tasks) < total_questions:
-        top_topic = max(topic_distribution, key=topic_distribution.get)
-        tasks.append({
-            'topic': top_topic,
-            'type': type_order,
-            'difficulty': sample_difficulty(diff_dist),
-            'marks': int(pattern.get('avg_marks', 1))
-        })
-
-    tasks = tasks[:total_questions]
-
-    # ------------------------------------------------------------------
-    # 2️⃣ Batch generation ONLY
-    # ------------------------------------------------------------------
-    batches = [
-        tasks[i:i + batch_size]
-        for i in range(0, len(tasks), batch_size)
-    ]
-
-    generated_questions = []
-
-    if parallel:
-        with ThreadPoolExecutor(max_workers=min(6, len(batches))) as ex:
-            futures = [
-                ex.submit(
-                    generate_questions_batch_via_textbook,
-                    country, category, exam, subject, b, languages
-                )
-                for b in batches
-            ]
-            for f in futures:
-                generated_questions.extend(f.result())
-    else:
-        for b in batches:
-            generated_questions.extend(
-                generate_questions_batch_via_textbook(
-                    country, category, exam, subject, b, languages
-                )
-            )
-
-    # ------------------------------------------------------------------
-    # 3️⃣ Validate in bulk
-    # ------------------------------------------------------------------
-    validated_questions = [
-        validate_or_regenerate_question(
-            q, country, category, exam, subject, languages
-        )
-        for q in generated_questions
-    ]
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        'questions': validated_questions[:total_questions],
-        'total_questions': len(validated_questions[:total_questions]),
-        'pattern_used': pattern
-    }
-
-
-
-
-
-
-
-
-
-
-
-def interactive_run_textbook(country, category, exam, subject, year_for_question_gen):
-    print("=== Test Series Pipeline ===")
-    
-    
-    
-    
-    exam = exam.strip() 
-    all_jsons = []
-    for file_path in glob.glob(f"structured_question_paper_with_diagrams_{exam}*.json"):
-        print(file_path)
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            all_jsons.append(data)
-
-    
-    
-            
-    question_bank_df = jsons_to_question_bank(all_jsons)
-    print(question_bank_df.head())
-
-    print(f"✅ Loaded {len(question_bank_df)} questions into the question bank.")
-
-    excel_path = f"{country}_{exam}_{subject}_bank.xlsx"
-    question_bank_df.to_excel(excel_path, index=False)
-    print(f"📘 Excel version saved at: {excel_path}")
-
-    
-    print("🔍 Detecting exam pattern...")
-    pattern = detect_pattern(question_bank_df, country, exam, subject)
-    print(json.dumps(pattern, indent=2))
-
-    
-    print("🧩 Generating new test paper...")
-    test_json = assemble_test_via_textbook(
-    country=country,
-    category=category,
-    exam=exam,
-    subject=subject,
-    pattern=pattern
-)
-
-    output_file = f"generated_test_{exam}_{year_for_question_gen}.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(test_json, f, indent=2, ensure_ascii=False)
-    print(f"✅ Test paper saved to {output_file}")
-
-
-
-def get_questions(exam, topic, top_k=5):
-    print("topic",topic)
-    dummy_embedding = embed_model.get_query_embedding(topic)
-
-    filters = MetadataFilters(filters=[
-        ExactMatchFilter(key="exam", value=exam.upper()),
-        ExactMatchFilter(key="topic", value=topic.lower())  # <-- match stored key
-    ])
-
-    vs_query = VectorStoreQuery(
-        query_embedding=dummy_embedding,
-        similarity_top_k=top_k,
-        filters=filters
-    )
-
-    results = vector_store.query(vs_query)
-    return results.nodes
-
-
-import re
-
-def extract_only_question(raw_text):
-    """
-    Extracts only the question statement from a formatted PGVector text block.
-    """
-    if not raw_text:
+        logger.error(f"LLM call failed: {e}")
         return ""
 
-    # Normalize whitespace
-    text = raw_text.strip()
 
-    # Look for "Question:" section
-    match = re.search(r"Question:\s*(.*?)(?:Options:|Diagram:|$)", text, re.DOTALL)
-    if match:
-        q = match.group(1).strip()
-        return q
-
-    # Fallback → return entire text (rare)
-    return text
-
-
-
-# Modified generate_questions_batch function using RAG
-# def generate_questions_batch_with_rag(
-#     country: str,
-#     category: str,
-#     exam: str,
-#     subject: str,
-#     tasks: List[Dict[str, Any]],
-#     languages: Optional[List[str]] = None,
-#     max_retries: int = 1,
-#     bank_df: Optional[pd.DataFrame] = None  # Pass question bank DataFrame if needed
-# ) -> List[Dict[str, Any]]:
-#     """
-#     Generate multiple questions in one LLM call using Retrieval-Augmented Generation (RAG).
-#     This function uses a retriever to pull context for question generation.
-#     """
-#     languages = languages or ['en']
-#     n = len(tasks)
+async def translate_text(text: str, source: str, target: str) -> str:
+    """Translate text between languages - supports full language names"""
+    if not text or not isinstance(text, str):
+        return text if isinstance(text, str) else ""
     
-#     # Step 1: Retrieve relevant context for each task based on topic
-#     context_list = []
-#     for task in tasks:
-#         topic = task['topic']
-#         # Retrieve relevant context (documents) from the vector store using the topic
-#         query_bundle = QueryBundle(query_str=topic)  # Topic as the query
-#         retrieved_nodes = retriever._retrieve(query_bundle)
-        
-#         # Combine the top retrieved nodes' content into a single context string
-#         context = "\n".join([node.node.text for node in retrieved_nodes])  # Assuming `node.text` holds content
-#         context_list.append(context)
-
-#     # Step 2: Generate questions using the context
-#     tasks_text = "\n".join(
-#         f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-#         for i, t in enumerate(tasks)
-#     )
     
-#     # Step 3: Create prompt to send to the LLM
-#     prompt = f"""
-#     You are an expert exam-writer. For each task below, generate a question based on the provided context.
-
-#     ====================
-#     CONTEXT:
-#     ====================
-#     {chr(10).join(context_list)}
-
-#     ====================
-#     TASKS:
-#     ====================
-#     {tasks_text}
-
-#     Return only valid questions in JSON format with the following schema:
-
-#     {{
-#         "id": "<string>",
-#         "text": "<full question text>",
-#         "options": [{{"A":"..."}}, {{"B":"..."}}, {{"C":"..."}}, {{"D":"..."}}] OR [],
-#         "correct_answer": "<A/B/C/... or numeric string>",
-#         "explanation": "<explanation text>",
-#         "type": "<MCQ / NVT / Multiple Correct / Long Answer>",
-#         "difficulty": "<Easy/Medium/Hard>",
-#         "marks": <int>,
-#         "topic": "<topic>"
-#     }}
-#     """
+    source = source.lower().strip()
+    target = target.lower().strip()
     
-#     # Step 4: Generate the questions (Simulate LLM call here)
-#     raw = call_gpt(prompt)  # This would be your LLM API call
+    languages_data = load_language_mapping()
+    if source in languages_data:
+        source = languages_data.get(source, source)
+    if target in languages_data:
+        target = languages_data.get(target, target)
     
-#     try:
-#         arr = _safe_load_json_array(raw)  # Parse the response
-#     except Exception as e:
-#         print(f"Error parsing LLM response: {e}")
-#         arr = []
+    if source == target:
+        return text
     
-#     # Step 5: Post-process to ensure the question format is consistent
-#     result = []
-#     for i, item in enumerate(arr[:n]):
-#         item.setdefault('id', f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-#         item.setdefault('type', tasks[i].get('type','MCQ'))
-#         item.setdefault('difficulty', tasks[i].get('difficulty','Medium'))
-#         item.setdefault('marks', int(tasks[i].get('marks',1)))
-#         item.setdefault('topic', tasks[i].get('topic'))
-#         item.setdefault('text', item.get('text','Placeholder question on '+str(item['topic'])))
-#         result.append(item)
-    
-#     return result
-#
-# 
-def generate_questions_batch(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    tasks: List[Dict[str, Any]],
-    languages: Optional[List[str]] = None,
-    max_retries: int = 1,
-    metadata: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-
-    languages = languages or ["en"]
-    n = len(tasks)
-
-    # =========================================================
-    # STEP 1 — Retrieve RAG Content for Each Task
-    # =========================================================
-    rag_contents = []
-
-    for task in tasks:
-        topic = task["topic"]
-        query_metadata = metadata or {"topic": topic}
-
-        retrieved_nodes = retriever._retrieve(
-            QueryBundle(query_str=topic),
-            metadata=query_metadata
-        )
-
-        rag_text = "\n".join(
-            extract_only_question(node.node.text).strip()
-            for node in retrieved_nodes
-        ) if retrieved_nodes else ""
-
-        seed_prompt = convert_rag_to_question_seeds(rag_text, exam)
-        question_seed = call_gpt(seed_prompt)
-        #rag_text.append(question_seed)
-        rag_text = rag_text + "\n\nQUESTION SEEDS:\n" + question_seed
-
-
-        rag_contents.append(rag_text)
-        print(rag_contents)
-        print(rag_text)
-
-    # =========================================================
-    # STEP 2 — Load Exam Examples (Few-Shot)
-    # =========================================================
-    example_section = ""
-    exam_examples = EXAM_EXAMPLES.get(exam, [])
-
-    if exam_examples:
-        example_strings = []
-        for idx, ex in enumerate(exam_examples, start=1):
-            example_strings.append(f"Example {idx}:\n{json.dumps(ex, indent=2)}")
-
-        example_section = (
-            "\n\n--- EXAM STYLE EXAMPLES (Match structure, reasoning, difficulty) ---\n"
-            + "\n\n".join(example_strings)
-            + "\n--- END OF EXAMPLES ---\n"
-        )
-
-    # =========================================================
-    # STEP 3 — Prepare the Task List Summary
-    # =========================================================
-    tasks_summary = "\n".join(
-        f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; "
-        f"Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-        for i, t in enumerate(tasks)
-    )
-
-    # =========================================================
-    # STEP 4 — Prepare Prompt for Batch Generation
-    # =========================================================
-    prompt = f"""
-You are an expert exam-writer. Generate EXACTLY {n} questions following the tasks listed below.
-
-Each task contains:
-- topic  
-- type (MCQ/Numeric/Multiple Correct/etc.)  
-- difficulty  
-- marks  
-
-For each question:
-- Use the RAG content provided.
-- Use the exam examples to imitate style.
-- You may introduce NEW numerical values, constraints, or conditions
-as long as they are physically valid and exam-realistic.
-
-- Difficulty MUST match exactly.
-
-=====================
-FEW-SHOT EXAMPLES FOR {exam}
-=====================
-{example_section}
-
-=====================
-EXAMINER MODE
-=====================
-
-You are NOT teaching a concept.
-You are trying to differentiate:
-- top 1% students
-- from average students
-
-Design questions that punish shallow formula application.
-
-====================
-ANTI-DUPLICATION RULES
-====================
-
-- Do NOT repeat question structure, formula usage, or logic across tasks
-- Each question must use a DIFFERENT reasoning path
-- Even if topic is same, change:
-  - given variables
-  - constraints
-  - asked quantity
-  - elimination logic
-
-If two questions feel similar, rewrite the latter.
-
-=====================
-PRIOR FEEDBACK
-=====================
-{load_combined_feedback(exam)}
-
-=====================
-TASKS
-=====================
-{tasks_summary}
-
-=====================
-RAG CONTENT (IN ORDER)
-=====================
-{rag_contents}
-
-=====================
-OUTPUT SPEC
-=====================
-Return a JSON ARRAY of {n} objects.
-Each object MUST follow this structure:
-
-{{
-  "id": "string",
-  "passage": "<text or null>",
-  "text": "string",
-  "options": [{{"A":"..."}},{{"B":"..."}},{{"C":"..."}},{{"D":"..."}}] OR [],
-  "correct_answer": "A/B/C/D or numeric",
-  "explanation": "string",
-  "explanations_multilingual": {{}},
-  "incorrect_options_explanations": {{}},
-  "type": "<type>",
-  "difficulty": "<Difficulty>",
-  "marks": <int>,
-  "topic": "<topic>",
-  "has_diagram": false,
-  "diagram_description": null
-}}
-
-Return PURE JSON. No text before or after.
-Languages required: {languages}
-"""
-
-    # =========================================================
-    # STEP 5 — Call GPT
-    # =========================================================
-    raw = call_gpt(prompt).strip()
-
-    # =========================================================
-    # STEP 6 — Parse JSON
-    # =========================================================
     try:
-        arr = _safe_load_json_array(raw)
-    except Exception:
-        # fallback — call single-question generator
-        arr = []
-        for t in tasks:
-            arr.append(
-                generate_question_via_llm(
-                    country=country,
-                    category=category,
-                    exam=exam,
-                    subject=subject,
-                    topic=t["topic"],
-                    qtype=t.get("type","MCQ"),
-                    difficulty=t.get("difficulty","Medium"),
-                    marks=int(t.get("marks",1)),
-                    languages=languages
-                )
-            )
-        return arr
-
-    # =========================================================
-    # STEP 7 — Normalize & Post-Process
-    # =========================================================
-    final = []
-
-    for i, item in enumerate(arr[:n]):
-        task = tasks[i]
-
-        # Basic keys
-        item.setdefault("id", f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-        item.setdefault("topic", task["topic"])
-        item.setdefault("type", task.get("type", "MCQ"))
-        item.setdefault("difficulty", task.get("difficulty", "Medium"))
-        item.setdefault("marks", int(task.get("marks", 1)))
-        item.setdefault("passage", item.get("passage", None))
-        item.setdefault("has_diagram", False)
-        item.setdefault("diagram_description", None)
-
-        # Normalize options
-        if isinstance(item.get("options"), list):
-            opts = []
-            letters = ["A", "B", "C", "D", "E"]
-            for idx, opt in enumerate(item["options"]):
-                if isinstance(opt, str) and idx < len(letters):
-                    opts.append({letters[idx]: opt})
-                elif isinstance(opt, dict):
-                    opts.append(opt)
-            item["options"] = opts
-
-        # Explanation fallback
-        item.setdefault(
-            "explanations_multilingual",
-            {lang: item.get("explanation","") for lang in languages}
-        )
-        item.setdefault("incorrect_options_explanations", {})
-
-        final.append(item)
-
-    return final
-
-
-
-# def generate_questions_batch(
-#     country: str,
-#     category: str,
-#     exam: str,
-#     subject: str,
-#     tasks: List[Dict[str, Any]],
-#     languages: Optional[List[str]] = None,
-#     max_retries: int = 1
-# ) -> List[Dict[str, Any]]:
-#     """
-#     Generate multiple questions in one LLM call.
-#     tasks: list of dicts {topic, type, difficulty, marks, idx(optional)}
-#     Returns list of question objects in same order (best-effort).
-#     """
-#     languages = languages or ['en']
-#     n = len(tasks)
-#     # Build the instruction + numbered task list
-#     tasks_text = "\n".join(
-#         f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-#         for i, t in enumerate(tasks)
-#     )
-#     previous_feedback = load_combined_feedback(exam)
-
-#     prompt = f"""
-    
-
-#     You are an expert exam-writer.
-
-#     You are an expert exam-writer. Generate exactly {n} questions that match these numbered tasks.
-#     Return ONLY a single valid JSON array of {n} objects (no extra commentary). Each object must use double quotes and follow this schema:
-#     ⚠ Incorporate the following improvement rules from prior evaluations:
-    
-            
-    
-
-#     IMPORTANT: Review ALL the following improvement rules carefully and apply them STRICTLY when generating questions. Do not ignore any rule. If there is any conflict, resolve it logically to maintain exam quality.
-
-#     ====================
-#     {previous_feedback}
-#     ====================
-
-#     {{
-#     "id": "<string>",
-#     "text": "<full question text>",
-#     "options": [{{"A":"..."}}, {{"B":"..."}}, {{"C":"..."}}, {{"D":"..."}}] OR [],
-#     "correct_answer": "<A/B/C/... or numeric string>",
-#     "explanation": "<english step-by-step explanation>",
-#     "explanations_multilingual": {{"en": "...", "hi": "..."}}, 
-#     "incorrect_options_explanations": {{"B":"..." , "C":"...", "D":"..."}},
-#     "type": "<MCQ / NVT / Multiple Correct / Long Answer>",
-#     "difficulty": "<Easy/Medium/Hard>",
-#     "marks": <int>,
-#     "topic": "<topic>",
-#     "has_diagram": <true/false>,
-#     "diagram_description": "<short text or null>"
-#     }}
-
-#     The questions must appear in the array in the same order as the tasks below.
-#     Do NOT include any text outside the JSON array. If you cannot produce one, return the best-effort JSON array only.
-
-#     Tasks:
-#     {tasks_text}
-
-#     Languages for explanations: {languages}
-#     Use conservative language, keep correct_answer consistent with options, and ensure JSON is valid.
-#     """.format(n=n, tasks_text=tasks_text, languages=languages)
-
-
-#     raw = call_gpt(prompt)  # your wrapper
-#     # sanitize stray backslashes (do not over-escape; safe loaders below attempt multiple strategies)
-#     try:
-#         arr = _safe_load_json_array(raw)
-#     except Exception as e:
-#         logger.warning("Batch generation parse failed: %s. Falling back to single-item generation.", e)
-#         # fallback: generate one-by-one for all tasks
-#         arr = []
-#         for t in tasks:
-#             q = generate_question_via_llm(country, category, exam, subject, t['topic'], t.get('type','MCQ'),
-#                                          t.get('difficulty','Medium'), int(t.get('marks',1)), languages)
-#             arr.append(q)
-#         return arr
-
-#     # Post-process: ensure all expected fields, assign ids if missing, clamp length to n if needed
-#     result = []
-#     for i, item in enumerate(arr[:n]):
-#         if not isinstance(item, dict):
-#             logger.warning("Non-dict item at index %d in batch result, replacing with placeholder.", i)
-#             item = {}
-#         # ensure fields exist
-#         item.setdefault('id', f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-#         item.setdefault('type', tasks[i].get('type','MCQ'))
-#         item.setdefault('difficulty', tasks[i].get('difficulty','Medium'))
-#         item.setdefault('marks', int(tasks[i].get('marks',1)))
-#         item.setdefault('topic', tasks[i].get('topic'))
-#         item.setdefault('text', item.get('text','Placeholder question on '+str(item['topic'])))
-#         item.setdefault('options', item.get('options', []))
-#         item.setdefault('correct_answer', item.get('correct_answer', 'A' if item.get('options') else ""))
-#         item.setdefault('has_diagram', bool(item.get('diagram_description')))
-#         # normalize options format if necessary (accept either list of dicts or list of strings)
-#         if isinstance(item['options'], list) and item['options'] and isinstance(item['options'][0], str):
-#             # convert ["A text", "B text", ...] to [{"A":"..."},...]
-#             letters = ['A','B','C','D','E']
-#             opts = []
-#             for idx,opt in enumerate(item['options']):
-#                 if idx < len(letters):
-#                     opts.append({letters[idx]: opt})
-#             item['options'] = opts
-#         result.append(item)
-
-#     # If LLM returned fewer items than requested, generate the remainder singly
-#     if len(result) < n:
-#         missing = n - len(result)
-#         logger.warning("Batch returned %d items, expected %d → generating %d more individually.", len(result), n, missing)
-#         for t in tasks[len(result):]:
-#             q = generate_question_via_llm(country, category, exam, subject, t['topic'], t.get('type','MCQ'),
-#                                          t.get('difficulty','Medium'), int(t.get('marks',1)), languages)
-#             result.append(q)
-#     return result
-
-def sample_difficulty(dist):
-    items = list(dist.items())
-    labels = [k for k, v in items]
-    weights = [v for k, v in items]
-    return random.choices(labels, weights=weights)[0]
-from llama_index.core import QueryBundle
-from typing import Any, Dict, List
-from concurrent.futures import ThreadPoolExecutor
-import time
-import random
-
-# def assemble_test_with_rag(
-#     country: str, category: str, exam: str, subject: str,
-#     pattern: Dict[str, Any], total_questions: Optional[int] = None,
-#     languages: Optional[List[str]] = None,
-#     bank_df: Optional[Any] = None,  # ✅ Add question bank DataFrame
-#     fallback_to_llm: bool = True,
-#     batch_size: int = 8,
-#     parallel: bool = True,
-#     retriever: Optional[BaseRetriever] = None  # Add the retriever for RAG context
-# ) -> Dict[str, Any]:
-#     languages = languages or ['en']
-#     if total_questions is None:
-#         total_questions = int(float(pattern.get('avg_total_questions', 20)))
-
-#     # Build tasks based on pattern
-#     topic_distribution = pattern.get('topic_distribution', {})
-#     diff_dist = pattern.get('difficulty_distribution', {'Easy':0.4,'Medium':0.45,'Hard':0.15})
-#     type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-#     tasks = []
-#     quotas = {topic: int(round(total_questions * float(pct))) for topic, pct in topic_distribution.items()}
-#     for topic, qcount in quotas.items():
-#         for diff_name, diff_pct in diff_dist.items():
-#             needed = int(round(qcount * float(diff_pct)))
-#             for _ in range(needed):
-#                 tasks.append({'topic': topic, 'type': type_order[0], 'difficulty': diff_name, 'marks': int(pattern.get('avg_marks', 1))})
-
-#     while len(tasks) < total_questions:
-#         top_topic = max(topic_distribution, key=topic_distribution.get)
-#         tasks.append({'topic': top_topic, 'type': type_order[0], 'difficulty': sample_difficulty(diff_dist), 'marks': int(pattern.get('avg_marks', 1))})
-
-#     selected_questions = []
-#     used_ids = set()
-
-#     # ✅ Step 1: Try to pick from question bank
-#     if bank_df is not None and not bank_df.empty:
-#         for t in tasks:
-#             picks = select_existing_questions(bank_df, t['topic'], t['difficulty'], t['type'], 1, exclude_ids=used_ids)
-#             if picks:
-#                 for p in picks:
-#                     used_ids.add(p.get('id'))
-#                     selected_questions.append(p)
-
-#     # ✅ Step 2: Validate or regenerate bad questions
-#     validated_questions = []
-#     for q in selected_questions:
-#         validated_questions.append(validate_or_regenerate_question(q, country, category, exam, subject, languages))
-#     selected_questions = validated_questions
-
-#     # ✅ Step 3: If still short, generate via LLM with RAG context
-#     if len(selected_questions) < total_questions and fallback_to_llm:
-#         remaining_tasks = tasks[len(selected_questions):]
-#         batches = [remaining_tasks[i:i+batch_size] for i in range(0, len(remaining_tasks), batch_size)]
-
-#         if parallel:
-#             with ThreadPoolExecutor(max_workers=min(6, len(batches))) as ex:
-#                 futures = [ex.submit(generate_questions_batch_with_rag, country, category, exam, subject, b, languages, retriever) for b in batches]
-#                 for f in futures:
-#                     selected_questions.extend(f.result())
-#         else:
-#             for b in batches:
-#                 selected_questions.extend(generate_questions_batch_with_rag(country, category, exam, subject, b, languages, retriever))
-
-#     return {
-#         'country': country,
-#         'category': category,
-#         'exam': exam,
-#         'subject': subject,
-#         'generated_at': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-#         'questions': selected_questions[:total_questions],
-#         'total_questions': len(selected_questions[:total_questions]),
-#         'pattern_used': pattern
-#     }
-
-from datetime import datetime
-from typing import Dict, Any, List, Optional
-
-def assemble_test_RAG_question(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    pattern: Dict[str, Any],
-    total_questions: Optional[int] = None,
-    fallback_to_llm: bool = True
-) -> Dict[str, Any]:
-    """
-    Assemble a test using questions from PGVector DB (via get_questions),
-    falling back to LLM generation if needed.
-    """
-
-    total_questions = total_questions or int(float(pattern.get('avg_total_questions', 20)))
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15})
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-    # Calculate how many questions to pick per topic
-    quotas = {topic: int(round(total_questions * float(pct))) for topic, pct in topic_distribution.items()}
-
-    selected_questions = []
-    used_ids = set()
-
-    # -------------------------------
-    # Select questions from PGVector DB
-    # -------------------------------
-    for topic, qcount in quotas.items():
-        for diff_name, diff_pct in diff_dist.items():
-            needed = int(round(qcount * diff_pct))
-            if needed <= 0:
-                continue
-            
-            # pick questions from vector DB
-            db_questions = get_questions(exam, topic, top_k=needed)
-            print("db_questions",db_questions)
-
-            for q_node in db_questions:
-                q_meta = q_node.metadata
-                raw_text = q_node.text
-                
-                q_text = extract_only_question(raw_text)
-
-                q_entry = {
-                    'id': q_node.id_,
-                    'text': q_text,
-                    'topic': q_meta.get('topic', topic),
-                    'difficulty': diff_name,
-                    'type': q_meta.get('type', 'MCQ'),
-                    'options': q_meta.get('options', []),
-                    'has_diagram': q_meta.get('diagram', False),
-                    'diagram_paths': q_meta.get('diagram_paths', [])
-                }
-
-                # Avoid duplicates
-                if q_entry['id'] not in used_ids:
-                    selected_questions.append(q_entry)
-                    used_ids.add(q_entry['id'])
-
-            filled = len([s for s in selected_questions if s['topic'].lower() == topic.lower() and s['difficulty'].lower() == diff_name.lower()])
-            if filled >= needed:
-                break
-
-    # -------------------------------
-    # Fallback: use LLM if not enough questions
-    # -------------------------------
-    if len(selected_questions) < total_questions and fallback_to_llm:
-        topics_sorted = sorted(topic_distribution.items(), key=lambda kv: kv[1], reverse=True)
-        t_idx = 0
-        while len(selected_questions) < total_questions:
-            topic = topics_sorted[t_idx % len(topics_sorted)][0]
-            gen_q = generate_question_via_llm(
-                country, category, exam, subject, topic,
-                'MCQ', 'Medium', int(pattern.get('avg_marks', 1)), ['en']
-            )
-            selected_questions.append(gen_q)
-            t_idx += 1
-
-    # -------------------------------
-    # Estimate time per question
-    # -------------------------------
-    def estimate_time(q):
-        qtype = (q.get('type') or 'MCQ').upper()
-        difficulty = (q.get('difficulty') or 'Medium').lower()
-        base = 1.0
-        if qtype == 'NVT':
-            base = 3.0
-        if difficulty == 'medium':
-            base *= 1.5
-        if difficulty == 'hard':
-            base *= 2.5
-        if q.get('has_diagram'):
-            base += 0.5
-        return float(base)
-
-    for q in selected_questions:
-        q['est_time_min'] = estimate_time(q)
-
-    total_est_time = sum([q.get('est_time_min', 1.0) for q in selected_questions])
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
-        'questions': selected_questions,
-        'total_questions': len(selected_questions),
-        'estimated_duration_minutes': round(total_est_time, 1),
-        'pattern_used': pattern
-    }
-
-from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List, Optional
-import time
-
-# =========================================================
-# LLM-Only Question Generation (No RAG) - High Quality
-# =========================================================
-
-def get_exam_quality_guidelines(exam: str) -> str:
-    exam_upper = (exam or "").upper()
-    exam_quality_guidelines = {
-        "JEE": """
-EXAM QUALITY STANDARDS FOR JEE:
-- Questions MUST require multi-step reasoning (minimum 2-3 logical steps)
-- Include concept integration (combine 2+ physics/chemistry/math concepts)
-- Options should include:
-  * One correct answer
-  * One "partial calculation" trap (student stops midway)
-  * One "sign error" or "unit error" trap
-  * One "formula misapplication" trap
-- Numerical values must be realistic and calculable without a calculator
-- Avoid direct formula substitution questions - test deep understanding
-- Include questions that require graphical interpretation or limiting case analysis
-""",
-        "NEET": """
-EXAM QUALITY STANDARDS FOR NEET:
-- Questions should test conceptual clarity over memorization
-- Include clinical/practical application scenarios for Biology
-- Options should include:
-  * One correct answer
-  * One "similar sounding term" trap
-  * One "related but incorrect concept" trap
-  * One "opposite/inverse" trap
-- For Physics/Chemistry: focus on biological relevance
-- Test understanding of exceptions and special cases
-""",
-        "CAT": """
-EXAM QUALITY STANDARDS FOR CAT:
-- Quantitative questions must have elegant solutions (not brute force)
-- Verbal questions should test nuanced reading comprehension
-- Logical reasoning must have clear but non-obvious patterns
-- Options should be strategically placed to test systematic elimination
-- Time pressure consideration: solvable in 2-3 minutes max
-""",
-        "GATE": """
-EXAM QUALITY STANDARDS FOR GATE:
-- Questions should test engineering/scientific rigor
-- Include numerical answer type (NAT) questions with precise calculations
-- Multi-concept integration across related topics
-- Standard theoretical concepts with practical application twists
-- Options for MCQ should reflect common conceptual errors
-""",
-        "SSC": """
-EXAM QUALITY STANDARDS FOR SSC:
-- Clear, straightforward language
-- Test fundamental concepts thoroughly
-- Speed + accuracy balance (solvable in 30-60 seconds)
-- Options should be distinct but require careful reading
-- Include shortcut-friendly calculations
-""",
-        "UPSC": """
-EXAM QUALITY STANDARDS FOR UPSC:
-- Analytical and conceptual depth
-- Current affairs integration where applicable
-- Test understanding of cause-effect relationships
-- Options should reflect nuanced differences
-- Multidisciplinary perspective
-"""
-    }
-
-    return exam_quality_guidelines.get(exam_upper, f"""
-EXAM QUALITY STANDARDS FOR {exam}:
-- Questions should match the rigor and style of actual {exam} exams
-- Multi-step reasoning required for medium/hard difficulty
-- Options should include realistic distractors based on common student errors
-- Explanation should be detailed and educational
-- Match the exact difficulty level specified
-""")
-
-
-def _normalize_distribution(dist, fallback):
-    cleaned = {}
-    if isinstance(dist, dict):
-        for key, val in dist.items():
-            try:
-                fval = float(val)
-            except (TypeError, ValueError):
-                continue
-            if fval > 0:
-                cleaned[str(key)] = fval
-    if not cleaned:
-        cleaned = {str(k): float(v) for k, v in fallback.items()}
-    total = sum(cleaned.values())
-    if total <= 0:
-        return {k: 1.0 / max(len(cleaned), 1) for k in cleaned}
-    return {k: v / total for k, v in cleaned.items()}
-
-
-def _find_dist_key(dist, target):
-    for key in dist.keys():
-        if key.lower() == target.lower():
-            return key
-    return None
-
-
-def _adjust_difficulty_distribution(exam, dist):
-    exam_upper = (exam or "").upper()
-    max_easy = 0.2 if exam_upper in {"JEE", "GATE", "CAT", "UPSC"} else 0.3
-    easy_key = _find_dist_key(dist, "easy")
-    med_key = _find_dist_key(dist, "medium")
-    hard_key = _find_dist_key(dist, "hard")
-    if not easy_key:
-        return dist
-    easy_val = dist.get(easy_key, 0.0)
-    if easy_val <= max_easy:
-        return dist
-
-    extra = easy_val - max_easy
-    dist[easy_key] = max_easy
-    med_val = dist.get(med_key, 0.0)
-    hard_val = dist.get(hard_key, 0.0)
-    denom = med_val + hard_val
-    if denom <= 0:
-        if med_key:
-            dist[med_key] = dist.get(med_key, 0.0) + extra
-        elif hard_key:
-            dist[hard_key] = dist.get(hard_key, 0.0) + extra
-        else:
-            dist[easy_key] += extra
-        return dist
-
-    if med_key:
-        dist[med_key] = dist.get(med_key, 0.0) + extra * (med_val / denom)
-    if hard_key:
-        dist[hard_key] = dist.get(hard_key, 0.0) + extra * (hard_val / denom)
-    return dist
-
-
-def _build_tasks_from_pattern(pattern, total_questions, exam):
-    topic_dist = _normalize_distribution(
-        pattern.get("topic_distribution", {}),
-        {"General": 1.0}
-    )
-    diff_dist = _normalize_distribution(
-        pattern.get("difficulty_distribution", {}),
-        {"Easy": 0.35, "Medium": 0.45, "Hard": 0.2}
-    )
-    diff_dist = _normalize_distribution(
-        _adjust_difficulty_distribution(exam, diff_dist),
-        {"Medium": 1.0}
-    )
-    type_dist = _normalize_distribution(
-        pattern.get("type_distribution", {}),
-        {"MCQ": 1.0}
-    )
-
-    topics = list(topic_dist.keys())
-    topic_weights = list(topic_dist.values())
-    diff_labels = list(diff_dist.keys())
-    diff_weights = list(diff_dist.values())
-    type_labels = list(type_dist.keys())
-    type_weights = list(type_dist.values())
-    avg_marks = int(pattern.get("avg_marks", 1)) or 1
-
-    tasks = []
-    for _ in range(total_questions):
-        topic = random.choices(topics, weights=topic_weights, k=1)[0]
-        difficulty = random.choices(diff_labels, weights=diff_weights, k=1)[0]
-        qtype = random.choices(type_labels, weights=type_weights, k=1)[0]
-        tasks.append({
-            "topic": topic,
-            "type": qtype,
-            "difficulty": difficulty,
-            "marks": avg_marks
-        })
-    random.shuffle(tasks)
-    return tasks
-
-
-_STOPWORDS = {
-    "the", "and", "for", "with", "that", "this", "from", "into", "when",
-    "what", "which", "where", "while", "whose", "there", "their", "then",
-    "your", "about", "have", "has", "are", "was", "were", "will", "shall",
-    "can", "could", "should", "would", "may", "might", "must", "not",
-    "find", "given", "let", "if", "else", "true", "false"
-}
-
-
-def _question_signature(text):
-    if not text:
-        return set()
-    tokens = re.findall(r"[a-z0-9]+", text.lower())
-    return {t for t in tokens if t not in _STOPWORDS and len(t) > 2}
-
-
-def _is_similar_signature(sig, seen_sigs, threshold=0.7):
-    if not sig:
-        return False
-    for other in seen_sigs:
-        if not other:
-            continue
-        inter = len(sig & other)
-        union = len(sig | other)
-        if union and (inter / union) >= threshold:
-            return True
-    return False
-
-def generate_questions_batch_llm_only(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    tasks: List[Dict[str, Any]],
-    languages: Optional[List[str]] = None,
-    avoid_questions: Optional[List[str]] = None,
-    diversity_seed: Optional[int] = None,
-    exam_examples: Optional[List[Dict[str, Any]]] = None
-) -> List[Dict[str, Any]]:
-    """
-    Generate high-quality exam questions using LLM only (no RAG).
-    Focuses on exam-specific quality standards.
-    """
-    languages = languages or ["en"]
-    n = len(tasks)
-
-    # =========================================================
-    # STEP 1 — Build Exam-Specific Quality Guidelines
-    # =========================================================
-    exam_upper = exam.upper()
-    
-    exam_quality_guidelines = {
-        "JEE": """
-EXAM QUALITY STANDARDS FOR JEE:
-- Questions MUST require multi-step reasoning (minimum 2-3 logical steps)
-- Include concept integration (combine 2+ physics/chemistry/math concepts)
-- Options should include:
-  * One correct answer
-  * One "partial calculation" trap (student stops midway)
-  * One "sign error" or "unit error" trap
-  * One "formula misapplication" trap
-- Numerical values must be realistic and calculable without a calculator
-- Avoid direct formula substitution questions - test deep understanding
-- Include questions that require graphical interpretation or limiting case analysis
-""",
-        "NEET": """
-EXAM QUALITY STANDARDS FOR NEET:
-- Questions should test conceptual clarity over memorization
-- Include clinical/practical application scenarios for Biology
-- Options should include:
-  * One correct answer
-  * One "similar sounding term" trap
-  * One "related but incorrect concept" trap  
-  * One "opposite/inverse" trap
-- For Physics/Chemistry: focus on biological relevance
-- Test understanding of exceptions and special cases
-""",
-        "CAT": """
-EXAM QUALITY STANDARDS FOR CAT:
-- Quantitative questions must have elegant solutions (not brute force)
-- Verbal questions should test nuanced reading comprehension
-- Logical reasoning must have clear but non-obvious patterns
-- Options should be strategically placed to test systematic elimination
-- Time pressure consideration: solvable in 2-3 minutes max
-""",
-        "GATE": """
-EXAM QUALITY STANDARDS FOR GATE:
-- Questions should test engineering/scientific rigor
-- Include numerical answer type (NAT) questions with precise calculations
-- Multi-concept integration across related topics
-- Standard theoretical concepts with practical application twists
-- Options for MCQ should reflect common conceptual errors
-""",
-        "SSC": """
-EXAM QUALITY STANDARDS FOR SSC:
-- Clear, straightforward language
-- Test fundamental concepts thoroughly
-- Speed + accuracy balance (solvable in 30-60 seconds)
-- Options should be distinct but require careful reading
-- Include shortcut-friendly calculations
-""",
-        "UPSC": """
-EXAM QUALITY STANDARDS FOR UPSC:
-- Analytical and conceptual depth
-- Current affairs integration where applicable
-- Test understanding of cause-effect relationships
-- Options should reflect nuanced differences
-- Multidisciplinary perspective
-"""
-    }
-    
-    # Get exam-specific guidelines or use generic
-    quality_guidelines = exam_quality_guidelines.get(exam_upper, f"""
-EXAM QUALITY STANDARDS FOR {exam}:
-- Questions should match the rigor and style of actual {exam} exams
-- Multi-step reasoning required for medium/hard difficulty
-- Options should include realistic distractors based on common student errors
-- Explanation should be detailed and educational
-- Match the exact difficulty level specified
-""")
-
-    # =========================================================
-    # STEP 2 — Build Task Summary
-    # =========================================================
-    tasks_summary = "\n".join(
-        f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; "
-        f"Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-        for i, t in enumerate(tasks)
-    )
-
-    # =========================================================
-    # STEP 3 — Build High-Quality Prompt
-    # =========================================================
-    prompt = f"""You are an EXPERT EXAMINER for {exam} ({country}).
-
-Your task: Generate EXACTLY {n} high-quality questions that would appear in an actual {exam} examination.
-
-{quality_guidelines}
-
-=====================
-DIFFICULTY CALIBRATION
-=====================
-- EASY: Single-step, direct application. Solvable in <1 minute. Tests basic recall + one concept.
-- MEDIUM: 2-3 steps required. Requires connecting concepts. Solvable in 1-2 minutes. Common student errors should be trapped in options.
-- HARD: Multi-step with non-obvious approach. Requires deep understanding or creative problem-solving. Tricky edge cases. 2-3+ minutes.
-
-=====================
-OPTION DESIGN RULES
-=====================
-For MCQ questions, design options strategically:
-1. Correct answer (A, B, C, or D - vary the position)
-2. "Almost correct" - result of common calculation mistake
-3. "Partial solution" - what you get if you stop one step early
-4. "Conceptual trap" - what you get with wrong formula/approach
-
-Never have obviously wrong options. All options should be plausible to a student who hasn't mastered the concept.
-
-=====================
-TASKS TO GENERATE
-=====================
-{tasks_summary}
-
-=====================
-REQUIRED OUTPUT FORMAT
-=====================
-Return a JSON ARRAY of {n} question objects. Each object MUST have:
-
-{{
-  "id": "string (unique)",
-  "passage": "<text or null>",
-  "text": "string (the question)",
-  "options": [{{"A":"..."}},{{"B":"..."}},{{"C":"..."}},{{"D":"..."}}] OR [],
-  "correct_answer": "A/B/C/D or numeric string",
-  "explanation": "string (step-by-step solution)",
-  "explanations_multilingual": {{}},
-  "incorrect_options_explanations": {{"B": "why wrong", "C": "why wrong", "D": "why wrong"}},
-  "type": "<type from task>",
-  "difficulty": "<difficulty from task>",
-  "marks": <marks from task>,
-  "topic": "<topic from task>",
-  "has_diagram": false,
-  "diagram_description": null
-}}
-
-Metadata:
-- Country: {country}
-- Category: {category}
-- Exam: {exam}
-- Subject: {subject}
-- Languages: {languages}
-
-Return PURE JSON ARRAY. No text before or after.
-"""
-
-    # =========================================================
-    # STEP 4 — Call GPT
-    # =========================================================
-    raw = call_gpt(prompt).strip()
-
-    # =========================================================
-    # STEP 5 — Parse JSON
-    # =========================================================
-    try:
-        arr = _safe_load_json_array(raw)
+        translator = GoogleTranslator(source=source, target=target)
+        return await asyncio.to_thread(translator.translate, text)
     except Exception as e:
-        logger.warning(f"Failed to parse batch response: {e}")
-        # Fallback — generate one by one
-        arr = []
-        for t in tasks:
-            arr.append(
-                generate_question_via_llm(
-                    country=country,
-                    category=category,
-                    exam=exam,
-                    subject=subject,
-                    topic=t["topic"],
-                    qtype=t.get("type", "MCQ"),
-                    difficulty=t.get("difficulty", "Medium"),
-                    marks=int(t.get("marks", 1)),
-                    languages=languages
-                )
-            )
-        return arr
-
-    # =========================================================
-    # STEP 6 — Normalize & Post-Process (same structure)
-    # =========================================================
-    final = []
-
-    for i, item in enumerate(arr[:n]):
-        task = tasks[i]
-
-        # Basic keys
-        item.setdefault("id", f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-        item.setdefault("topic", task["topic"])
-        item.setdefault("type", task.get("type", "MCQ"))
-        item.setdefault("difficulty", task.get("difficulty", "Medium"))
-        item.setdefault("marks", int(task.get("marks", 1)))
-        item.setdefault("passage", item.get("passage", None))
-        item.setdefault("has_diagram", False)
-        item.setdefault("diagram_description", None)
-
-        # Normalize options
-        if isinstance(item.get("options"), list):
-            opts = []
-            letters = ["A", "B", "C", "D", "E"]
-            for idx, opt in enumerate(item["options"]):
-                if isinstance(opt, str) and idx < len(letters):
-                    opts.append({letters[idx]: opt})
-                elif isinstance(opt, dict):
-                    opts.append(opt)
-            item["options"] = opts
-
-        # Explanation fallback
-        item.setdefault(
-            "explanations_multilingual",
-            {lang: item.get("explanation", "") for lang in languages}
-        )
-        item.setdefault("incorrect_options_explanations", {})
-
-        final.append(item)
-
-    return final
-
-
-def generate_questions_batch_llm_only_v2(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    tasks: List[Dict[str, Any]],
-    languages: Optional[List[str]] = None,
-    avoid_questions: Optional[List[str]] = None,
-    diversity_seed: Optional[int] = None,
-    exam_examples: Optional[List[Dict[str, Any]]] = None
-) -> List[Dict[str, Any]]:
-    """
-    Generate high-quality exam questions using LLM only (no RAG).
-    Adds diversity guards and exam-style anchors.
-    """
-    languages = languages or ["en"]
-    n = len(tasks)
-
-    quality_guidelines = get_exam_quality_guidelines(exam)
-
-    tasks_summary = "\n".join(
-        f"{i+1}. Topic: {t['topic']}; Type: {t.get('type','MCQ')}; "
-        f"Difficulty: {t.get('difficulty','Medium')}; Marks: {t.get('marks',1)}"
-        for i, t in enumerate(tasks)
-    )
-
-    examples_block = ""
-    if exam_examples:
-        trimmed_examples = exam_examples[:2]
-        example_strings = [json.dumps(ex, indent=2) for ex in trimmed_examples]
-        examples_block = (
-            "\n=== EXAM STYLE EXAMPLES (use style only, do not copy) ===\n"
-            + "\n\n".join(example_strings)
-            + "\n=== END EXAMPLES ===\n"
-        )
-
-    avoid_block = ""
-    if avoid_questions:
-        avoid_list = [a for a in avoid_questions if isinstance(a, str) and a.strip()]
-        avoid_list = avoid_list[-8:]
-        if avoid_list:
-            avoid_lines = "\n".join(f"- {a}" for a in avoid_list)
-            avoid_block = (
-                "\n=== DO NOT REPEAT THESE IDEAS/STEMS ===\n"
-                + avoid_lines
-                + "\n=== END AVOID LIST ===\n"
-            )
-
-    diversity_block = ""
-    if diversity_seed is not None:
-        diversity_block = (
-            f"\nDIVERSITY SEED: {diversity_seed}\n"
-            "Use this seed to vary contexts, numbers, and phrasing.\n"
-        )
-
-    prompt = f"""You are an EXPERT EXAMINER for {exam} ({country}).
-
-Your task: Generate EXACTLY {n} high-quality questions that would appear in an actual {exam} examination.
-
-{quality_guidelines}
-{examples_block}
-{avoid_block}
-{diversity_block}
-
-=====================
-DIFFICULTY CALIBRATION
-=====================
-- EASY: Single-step, direct application. Solvable in <1 minute. Tests basic recall + one concept.
-- MEDIUM: 2-3 steps required. Requires connecting concepts. Solvable in 1-2 minutes. Common student errors should be trapped in options.
-- HARD: Multi-step with non-obvious approach. Requires deep understanding or creative problem-solving. Tricky edge cases. 2-3+ minutes.
-
-=====================
-DIVERSITY RULES
-=====================
-- Do NOT repeat the same question stem, scenario, or numeric values.
-- Use different contexts and data for each question in the batch.
-- Even EASY questions must be exam-standard (not trivial or school-level).
-
-=====================
-OPTION DESIGN RULES
-=====================
-For MCQ questions, design options strategically:
-1. Correct answer (A, B, C, or D - vary the position)
-2. "Almost correct" - result of common calculation mistake
-3. "Partial solution" - what you get if you stop one step early
-4. "Conceptual trap" - what you get with wrong formula/approach
-
-Never have obviously wrong options. All options should be plausible to a student who hasn't mastered the concept.
-
-=====================
-TASKS TO GENERATE
-=====================
-{tasks_summary}
-
-=====================
-REQUIRED OUTPUT FORMAT
-=====================
-Return a JSON ARRAY of {n} question objects. Each object MUST have:
-
-{{
-  "id": "string (unique)",
-  "passage": "<text or null>",
-  "text": "string (the question)",
-  "options": [{{"A":"..."}},{{"B":"..."}},{{"C":"..."}},{{"D":"..."}}] OR [],
-  "correct_answer": "A/B/C/D or numeric string",
-  "explanation": "string (step-by-step solution)",
-  "explanations_multilingual": {{}},
-  "incorrect_options_explanations": {{"B": "why wrong", "C": "why wrong", "D": "why wrong"}},
-  "type": "<type from task>",
-  "difficulty": "<difficulty from task>",
-  "marks": <marks from task>,
-  "topic": "<topic from task>",
-  "has_diagram": false,
-  "diagram_description": null
-}}
-
-Metadata:
-- Country: {country}
-- Category: {category}
-- Exam: {exam}
-- Subject: {subject}
-- Languages: {languages}
-
-Return PURE JSON ARRAY. No text before or after.
-"""
-
-    raw = call_gpt(prompt).strip()
-
-    try:
-        arr = _safe_load_json_array(raw)
-    except Exception as e:
-        logger.warning(f"Failed to parse batch response: {e}")
-        extra_context = quality_guidelines
-        if examples_block:
-            extra_context += "\n" + examples_block
-        if avoid_block:
-            extra_context += "\n" + avoid_block
-        if diversity_block:
-            extra_context += "\n" + diversity_block
-        extra_context += (
-            "\nDIVERSITY RULES:\n"
-            "- Do NOT repeat the same question stem, scenario, or numeric values.\n"
-            "- Use different contexts and data for each question.\n"
-            "- Even EASY questions must be exam-standard.\n"
-        )
-        arr = []
-        for t in tasks:
-            arr.append(
-                generate_question_via_llm(
-                    country=country,
-                    category=category,
-                    exam=exam,
-                    subject=subject,
-                    topic=t["topic"],
-                    qtype=t.get("type", "MCQ"),
-                    difficulty=t.get("difficulty", "Medium"),
-                    marks=int(t.get("marks", 1)),
-                    languages=languages,
-                    extra_prompt=extra_context
-                )
-            )
-        return arr
-
-    final = []
-    for i, item in enumerate(arr[:n]):
-        task = tasks[i]
-        item.setdefault("id", f"GEN_{int(time.time()*1000)}_{random.randint(1000,9999)}")
-        item.setdefault("topic", task["topic"])
-        item.setdefault("type", task.get("type", "MCQ"))
-        item.setdefault("difficulty", task.get("difficulty", "Medium"))
-        item.setdefault("marks", int(task.get("marks", 1)))
-        item.setdefault("passage", item.get("passage", None))
-        item.setdefault("has_diagram", False)
-        item.setdefault("diagram_description", None)
-
-        if isinstance(item.get("options"), list):
-            opts = []
-            letters = ["A", "B", "C", "D", "E"]
-            for idx, opt in enumerate(item["options"]):
-                if isinstance(opt, str) and idx < len(letters):
-                    opts.append({letters[idx]: opt})
-                elif isinstance(opt, dict):
-                    opts.append(opt)
-            item["options"] = opts
-
-        item.setdefault(
-            "explanations_multilingual",
-            {lang: item.get("explanation", "") for lang in languages}
-        )
-        item.setdefault("incorrect_options_explanations", {})
-
-        final.append(item)
-
-    return final
-
-
-def assemble_test_llm(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any], total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    bank_df: Optional[Any] = None,  # ✅ Add question bank DataFrame
-    fallback_to_llm: bool = True,
-    batch_size: int = 8,
-    parallel: bool = True
-) -> Dict[str, Any]:
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-
-    # Build tasks based on pattern
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15})
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-    tasks = []
-    quotas = {topic: int(round(total_questions * float(pct))) for topic, pct in topic_distribution.items()}
-    for topic, qcount in quotas.items():
-        for diff_name, diff_pct in diff_dist.items():
-            needed = int(round(qcount * float(diff_pct)))
-            for _ in range(needed):
-                tasks.append({'topic': topic, 'type': type_order, 'difficulty': diff_name, 'marks': int(pattern.get('avg_marks', 1))})
-
-    while len(tasks) < total_questions:
-        top_topic = max(topic_distribution, key=topic_distribution.get)
-        tasks.append({'topic': top_topic, 'type': type_order, 'difficulty': sample_difficulty(diff_dist), 'marks': int(pattern.get('avg_marks', 1))})
-
-    # ✅ Step 1: Only handle batches, no selection of questions
-    remaining_tasks = tasks
-    batches = [remaining_tasks[i:i + batch_size] for i in range(0, len(remaining_tasks), batch_size)]
-
-    # ✅ Step 2: Generate questions in batches using LLM-only (high quality)
-    generated_questions = []
-
-    if parallel:
-        with ThreadPoolExecutor(max_workers=min(6, len(batches))) as ex:
-            futures = [ex.submit(generate_questions_batch_llm_only, country, category, exam, subject, b, languages) for b in batches]
-            for f in futures:
-                generated_questions.extend(f.result())
-    else:
-        for b in batches:
-            generated_questions.extend(generate_questions_batch_llm_only(country, category, exam, subject, b, languages))
-
-    # Ensure we return only the required number of questions
-    generated_questions = generated_questions[:total_questions]
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        'questions': generated_questions,
-        'total_questions': len(generated_questions),
-        'pattern_used': pattern
-    }
-
-
-def assemble_test_llm_v2(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any], total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    bank_df: Optional[Any] = None,
-    fallback_to_llm: bool = True,
-    batch_size: int = 8,
-    parallel: bool = True
-) -> Dict[str, Any]:
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-    total_questions = max(int(total_questions), 1)
-
-    tasks = _build_tasks_from_pattern(pattern, total_questions, exam)
-    exam_upper = (exam or "").upper()
-    exam_examples = EXAM_EXAMPLES.get(exam_upper) or EXAM_EXAMPLES.get(exam) or []
-    if not isinstance(exam_examples, list):
-        exam_examples = []
-
-    avoid_texts = []
-    if bank_df is not None and hasattr(bank_df, "columns") and "text" in bank_df.columns:
-        try:
-            sample = bank_df["text"].dropna().astype(str).tolist()
-            random.shuffle(sample)
-            avoid_texts = sample[:10]
-        except Exception:
-            avoid_texts = []
-
-    batch_size = max(int(batch_size), 1)
-    batches = [tasks[i:i + batch_size] for i in range(0, len(tasks), batch_size)]
-
-    generated_questions = []
-    if parallel:
-        with ThreadPoolExecutor(max_workers=min(6, len(batches))) as ex:
-            futures = []
-            for b in batches:
-                seed = random.randint(100000, 999999)
-                futures.append(
-                    ex.submit(
-                        generate_questions_batch_llm_only_v2,
-                        country, category, exam, subject, b, languages,
-                        avoid_texts, seed, exam_examples
-                    )
-                )
-            for f in futures:
-                generated_questions.extend(f.result())
-    else:
-        rolling_avoid = list(avoid_texts)
-        for b in batches:
-            seed = random.randint(100000, 999999)
-            batch_questions = generate_questions_batch_llm_only_v2(
-                country, category, exam, subject, b, languages,
-                rolling_avoid, seed, exam_examples
-            )
-            generated_questions.extend(batch_questions)
-            for q in batch_questions:
-                q_text = f"{q.get('passage','')} {q.get('text','')}".strip()
-                if q_text:
-                    rolling_avoid.append(q_text)
-            rolling_avoid = rolling_avoid[-10:]
-
-    quality_guidelines = get_exam_quality_guidelines(exam)
-    final_questions = []
-    seen_sigs = []
-    rolling_avoid = list(avoid_texts)
-
-    for idx, task in enumerate(tasks):
-        if idx < len(generated_questions):
-            q = generated_questions[idx]
-        else:
-            q = generate_question_via_llm(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                topic=task["topic"],
-                qtype=task.get("type", "MCQ"),
-                difficulty=task.get("difficulty", "Medium"),
-                marks=int(task.get("marks", 1)),
-                languages=languages,
-                extra_prompt=quality_guidelines
-            )
-
-        q.setdefault("topic", task["topic"])
-        q.setdefault("type", task.get("type", "MCQ"))
-        q.setdefault("difficulty", task.get("difficulty", "Medium"))
-        q.setdefault("marks", int(task.get("marks", 1)))
-
-        q_text = f"{q.get('passage','')} {q.get('text','')}".strip()
-        sig = _question_signature(q_text)
-
-        if _is_similar_signature(sig, seen_sigs):
-            avoid_list = rolling_avoid[-8:]
-            avoid_lines = "\n".join(f"- {a}" for a in avoid_list if a)
-            extra_prompt = (
-                quality_guidelines
-                + "\nDIVERSITY RULES:\n"
-                + "- Do NOT repeat the same question stem, scenario, or numeric values.\n"
-                + "- Use different contexts and data for each question.\n"
-                + "- Even EASY questions must be exam-standard.\n"
-                + ("\nAvoid these stems:\n" + avoid_lines if avoid_lines else "")
-            )
-            q = generate_question_via_llm(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                topic=task["topic"],
-                qtype=task.get("type", "MCQ"),
-                difficulty=task.get("difficulty", "Medium"),
-                marks=int(task.get("marks", 1)),
-                languages=languages,
-                extra_prompt=extra_prompt
-            )
-            q_text = f"{q.get('passage','')} {q.get('text','')}".strip()
-            sig = _question_signature(q_text)
-
-        final_questions.append(q)
-        seen_sigs.append(sig)
-        if q_text:
-            rolling_avoid.append(q_text)
-            rolling_avoid = rolling_avoid[-10:]
-
-    final_questions = final_questions[:total_questions]
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        'questions': final_questions,
-        'total_questions': len(final_questions),
-        'pattern_used': pattern
-    }
-
-assemble_test_llm = assemble_test_llm_v2
-
-#     """
-#     languages = languages or ['en']
-    # prompt = f"""
-    #     You are an expert test-writer. Generate a single {qtype} question following the metadata below.
-    #     Return valid JSON only (single object) with fields: id, text, options (array or empty), correct_answer,
- #             "topic": topic,
-#             "has_diagram": False,
-#             "diagram_description": None
-#         }
-#         return placeholder
-
-
-def generate_question_via_llm(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    topic: str,
-    qtype: str,
-    difficulty: str,
-    marks: int,
-    languages: Optional[List[str]] = None,
-    metadata: Optional[Dict[str, Any]] = None,
-    max_retries: int = 1,
-    extra_prompt: Optional[str] = None   # ✅ BATCH CONTEXT
-) -> Dict[str, Any]:
-
-    languages = languages or ['en']
-
-    extra_context = (
-        f"\n\n=== ADDITIONAL BATCH CONTEXT ===\n{extra_prompt}\n==============================="
-        if extra_prompt else ""
-    )
-
-    is_rc = topic.lower() in ["reading comprehension", "rc", "comprehension"]
-
-    if is_rc:
-        prompt = f"""
-You are an expert exam-writer. Create ONE passage-based RC question.
-
-First create a short ORIGINAL passage (120–200 words).
-Then generate ONE question based on it.
-
-{extra_context}
-
-
-STRICT JSON OUTPUT ONLY:
-
-{{
-  "id": "string",
-  "passage": "string",
-  "text": "string",
-  "options": ["A", "B", "C", "D"],
-  "correct_answer": "A/B/C/D",
-  "explanation": "string",
-  "explanations_multilingual": {{}},
-  "incorrect_options_explanations": {{}},
-  "type": "{qtype}",
-  "difficulty": "{difficulty}",
-  "marks": {marks},
-  "topic": "{topic}",
-  "has_diagram": false,
-  "diagram_description": null
-}}
-"""
-    else:
-        prompt = f"""
-You are an expert exam-writer. Generate ONE {qtype} question.
-
-Difficulty must be EXACTLY: {difficulty}
-
-{extra_context}
-
-STRICT JSON OUTPUT ONLY:
-
-{{
-  "id": "string",
-  "passage": null,
-  "text": "string",
-  "options": ["A", "B", "C", "D"] OR [],
-  "correct_answer": "A/B/C/D or numeric",
-  "explanation": "string",
-  "explanations_multilingual": {{}},
-  "incorrect_options_explanations": {{}},
-  "type": "{qtype}",
-  "difficulty": "{difficulty}",
-  "marks": {marks},
-  "topic": "{topic}",
-  "has_diagram": false,
-  "diagram_description": null
-}}
-"""
-
-    raw = call_gpt(prompt)
-    raw = raw.strip().replace("\\n", " ").replace("\\", "")
-
-    try:
-        return json.loads(raw)
-    except Exception:
-        print("⚠ JSON parse failed. Returning placeholder.")
-        return {
-            "id": f"GEN_{random.randint(1000,9999)}",
-            "passage": None,
-            "text": f"Placeholder question on {topic}",
-            "options": ["A", "B", "C", "D"] if qtype == "MCQ" else [],
-            "correct_answer": "A",
-            "explanation": "Placeholder explanation",
-            "explanations_multilingual": {lang: "Placeholder explanation" for lang in languages},
-            "incorrect_options_explanations": {"B": "wrong", "C": "wrong", "D": "wrong"},
-            "type": qtype,
-            "difficulty": difficulty,
-            "marks": marks,
-            "topic": topic,
-            "has_diagram": False,
-            "diagram_description": None
-        }
-
-######### actual one #########
-# def generate_question_via_llm(
-#     country: str,
-#     category: str,
-#     exam: str,
-#     subject: str,
-#     topic: str,
-#     qtype: str,
-#     difficulty: str,
-#     marks: int,
-#     languages: Optional[List[str]] = None,
-#     metadata: Optional[Dict[str, Any]] = None,
-#     max_retries: int = 1
-# ) -> Dict[str, Any]:
-
-#     languages = languages or ['en']
-
-#     # ---------------------------
-#     # STEP 1 — RAG Retrieval
-#     # ---------------------------
-#     #print(f"\n==== Retrieving RAG Content for topic: {topic} ====")
-
-#     #query_metadata = metadata or {"topic": topic}
-
-#     # retrieved_nodes = retriever._retrieve(
-#     #     QueryBundle(query_str=topic),
-#     #     metadata=query_metadata
-#     # )
-
-#     # rag_text = "\n".join([node.node.text for node in retrieved_nodes]) if retrieved_nodes else ""
-#     # print("RAG content retrieved:\n", rag_text)
-#     # print("-" * 60)
-
-#     # ---------------------------
-#     # STEP 2 — Exam Example Extraction
-#     # ---------------------------
-#     example_section = ""
-#     exam_examples = EXAM_EXAMPLES.get(exam, [])
-
-#     if exam_examples:
-#         example_strings = []
-#         for idx, ex in enumerate(exam_examples, start=1):
-#             example_strings.append(f"Example {idx}:\n{json.dumps(ex, indent=2)}")
-
-#         example_section = (
-#             "\n\n--- EXAM STYLE EXAMPLES (Use style, structure, difficulty) ---\n"
-#             + "\n\n".join(example_strings)
-#             + "\n--- END OF EXAMPLES ---\n"
-#         )
-
-#     # Detect RC topic
-#     is_rc = topic.lower() in ["reading comprehension", "comprehension", "rc"]
-
-#     # ---------------------------
-#     # STEP 2 — Build Prompt
-#     # ---------------------------
-#     if is_rc:
-#         prompt = f"""
-# You are an expert test setter. Use the RAG content provided below to craft a 
-# passage-based Reading Comprehension question for a {exam} level exam.
-
-# First create a short ORIGINAL passage (120–200 words) relevant to the topic.
-# Do NOT copy RAG content verbatim. Use it only for knowledge/background inspiration.
-
-# Then generate ONE MCQ question based on the passage.
-
-# STRICT JSON OUTPUT ONLY:
-
-# {{
-#   "id": "string",
-#   "passage": "string",
-#   "text": "string",
-#   "options": ["A", "B", "C", "D"],
-#   "correct_answer": "A/B/C/D",
-#   "explanation": "string",
-#   "explanations_multilingual": {{}},
-#   "incorrect_options_explanations": {{}},
-#   "type": "{qtype}",
-#   "difficulty": "{difficulty}",
-#   "marks": {marks},
-#   "topic": "{topic}",
-#   "has_diagram": false,
-#   "diagram_description": null
-# }}
-
-# Metadata:
-# Country: {country}
-# Category: {category}
-# Exam: {exam}
-# Subject: {subject}
-# Languages: {languages}
-
-# Rules:
-# - Passage must be original but informed by the RAG text.
-# - Question MUST be based on the passage.
-# - Return ONLY JSON.
-# """
-#     else:
-#         prompt = f"""
-# You are an expert exam-writer. Generate ONE high-quality {qtype} question
-# strictly based on the RAG content provided below.
-
-# The question must reflect the exact difficulty level of {difficulty} for the exam: {exam}.
-
-# OUTPUT MUST BE STRICTLY THIS JSON (do not add or remove keys):
-
-# {{
-#   "id": "string",
-#   "passage": null,
-#   "text": "string",
-#   "options": ["A", "B", "C", "D"] OR [],
-#   "correct_answer": "A/B/C/D or numeric",
-#   "explanation": "string",
-#   "explanations_multilingual": {{}},
-#   "incorrect_options_explanations": {{}},
-#   "type": "{qtype}",
-#   "difficulty": "{difficulty}",
-#   "marks": {marks},
-#   "topic": "{topic}",
-#   "has_diagram": false,
-#   "diagram_description": null
-# }}
-
-# Metadata:
-# Country: {country}
-# Category: {category}
-# Exam: {exam}
-# Subject: {subject}
-# Difficulty: {difficulty}
-# Languages: {languages}
-
-
-# Requirements:
-# - Use RAG content for factual grounding.
-# - NO hallucinations.
-# - For MCQ → exactly 4 options A–D.
-# - For numeric → options = [] and numeric string answer.
-# - Explanations for every language in {languages}.
-# - Return pure JSON ONLY.
-# """
-
-#     # ---------------------------
-#     # STEP 3 — Call LLM
-#     # ---------------------------
-#     raw = call_gpt(prompt)
-
-#     raw = raw.strip().replace("\\n", " ").replace("\\", "")
-
-#     # ---------------------------
-#     # STEP 4 — JSON Parse
-#     # ---------------------------
-#     try:
-#         return json.loads(raw)
-#     except Exception:
-#         print("\n⚠ JSON parsing failed – using fallback placeholder.")
-
-#         return {
-#             "id": f"GEN_{random.randint(1000,9999)}",
-#             "passage": None,
-#             "text": f"Placeholder question on {topic}",
-#             "options": ["A", "B", "C", "D"],
-#             "correct_answer": "A",
-#             "explanation": "Placeholder explanation",
-#             "explanations_multilingual": {lang: "Placeholder explanation" for lang in languages},
-#             "incorrect_options_explanations": {"B": "wrong", "C": "wrong", "D": "wrong"},
-#             "type": qtype,
-#             "difficulty": difficulty,
-#             "marks": marks,
-#             "topic": topic,
-#             "has_diagram": False,
-#             "diagram_description": None
-#         }
-
-
-# ---------------------------
-# Question Generation from Question Bank
-# ---------------------------
-
-import json
-import re
-import time
-import random
-import logging
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-
-logger = logging.getLogger(__name__)
-
-# ---------------- Helper: Safe JSON loader ----------------
-def _safe_load_json_array(raw: str):
-    raw = raw.strip()
-    try:
-        val = json.loads(raw)
-        if isinstance(val, list):
-            return val
-        if isinstance(val, dict) and "questions" in val and isinstance(val["questions"], list):
-            return val["questions"]
-        return [val]
-    except Exception:
-        pass
-
-    code_matches = re.findall(r'```(?:json)?\s*([\s\S]*?)\s*```', raw, flags=re.I)
-    for block in code_matches:
-        try:
-            return json.loads(block)
-        except Exception:
-            continue
-
-    arr_match = re.search(r'(\[.*\])', raw, flags=re.S)
-    if arr_match:
-        candidate = arr_match.group(1)
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-
-    objs = re.findall(r'\{[\s\S]*?\}', raw)
-    parsed = []
-    for o in objs:
-        try:
-            parsed.append(json.loads(o))
-        except Exception:
-            continue
-    if parsed:
-        return parsed
-
-    raise ValueError("No valid JSON array could be parsed.")
-
-# ---------------- Select questions from bank ----------------
-def select_existing_questions(bank_df: Any, topic: str, difficulty: str, qtype: str, qty: int, exclude_ids: Optional[set] = None) -> List[Dict[str, Any]]:
-    exclude_ids = exclude_ids or set()
-    df = bank_df.copy()
-    topic_str = str(topic or '').lower().strip()
-    difficulty_str = str(difficulty or 'Medium').lower().strip()
-    qtype_str = str(qtype or 'MCQ').upper().strip()
-
-    mask = (
-        (df['topic'].fillna('unknown').str.lower().str.strip() == topic_str) &
-        (df['type'].fillna('MCQ').str.upper().str.strip() == qtype_str) &
-        (df['difficulty'].fillna('Medium').str.lower().str.strip() == difficulty_str)
-    )
-
-    df = df[mask]
-    if 'last_used' in df.columns:
-        df = df.sort_values(by='last_used')
-    df = df[~df['id'].isin(exclude_ids)] if 'id' in df.columns else df
-    n = min(len(df), qty)
-    if n <= 0:
-        return []
-    return df.sample(n=n, replace=False).to_dict(orient='records')
-
-# ---------------- Assemble test: bank-first ----------------
-def assemble_test_previous_year(
-    country: str,
-    category: str,
-    exam: str,
-    subject: str,
-    pattern: Dict[str, Any],
-    bank_df: Any,
-    total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    fallback_to_llm: bool = True
-) -> Dict[str, Any]:
-
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15})
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-    quotas = {topic: int(round(total_questions * float(pct))) for topic, pct in topic_distribution.items()}
-
-    selected_questions = []
-    used_ids = set()
-
-    # -------------------------------
-    # Select questions only from bank
-    # -------------------------------
-    for topic, qcount in quotas.items():
-        for diff_name, diff_pct in diff_dist.items():
-            needed = int(round(qcount * diff_pct))
-            if needed <= 0:
-                continue
-            filled = 0
-            for t in type_order:
-                picks = select_existing_questions(
-                    bank_df, topic, diff_name, t, needed - filled, exclude_ids=used_ids
-                )
-                for p in picks:
-                    selected_questions.append(p)
-                    used_ids.add(p.get('id'))
-                # filled = len([
-                #     s for s in selected_questions
-                #     if s.get('topic', '').lower() == topic.lower() and s.get('difficulty', '').lower() == diff_name.lower()
-                # ])
-                filled = len([
-                    s for s in selected_questions
-                    if str(s.get('topic', '') or '').lower() == topic.lower()
-                    and str(s.get('difficulty', '') or '').lower() == diff_name.lower()
-                ])
-
-                if filled >= needed:
-                    break
-
-    # -------------------------------
-    # Fallback: if not enough from bank
-    # -------------------------------
-    if len(selected_questions) < total_questions and fallback_to_llm:
-        topics_sorted = sorted(topic_distribution.items(), key=lambda kv: kv[1], reverse=True)
-        t_idx = 0
-        while len(selected_questions) < total_questions:
-            topic = topics_sorted[t_idx % len(topics_sorted)][0]
-            gen_q = generate_question_via_llm(
-                country, category, exam, subject, topic,
-                'MCQ', 'Medium', int(pattern.get('avg_marks', 1)), languages
-            )
-            selected_questions.append(gen_q)
-            t_idx += 1
-
-    # -------------------------------
-    # Use LLM to fill missing metadata
-    # -------------------------------
-    for q in selected_questions:
-        # Example: fill missing fields using LLM if they are None
-        if not q.get('correct_answer') or not q.get('explanation') or not q.get('wrong_answer_explanation'):
-            enriched = enrich_question_fields_via_llm(q, country, category, exam, subject)
-            q.update(enriched)  # Merge LLM completion results
-
-    # -------------------------------
-    # Estimate time
-    # -------------------------------
-    def estimate_time(q):
-        qtype = (q.get('type') or 'MCQ').upper()
-        difficulty = (q.get('difficulty') or 'Medium').lower()
-        base = 1.0
-        if qtype == 'NVT':
-            base = 3.0
-        if difficulty == 'medium':
-            base *= 1.5
-        if difficulty == 'hard':
-            base *= 2.5
-        if q.get('has_diagram'):
-            base += 0.5
-        return float(base)
-
-    for q in selected_questions:
-        q['est_time_min'] = estimate_time(q)
-
-    total_est_time = sum([q.get('est_time_min', 1.0) for q in selected_questions])
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
-        'questions': selected_questions,
-        'total_questions': len(selected_questions),
-        'estimated_duration_minutes': round(total_est_time, 1),
-        'pattern_used': pattern
-    }
-
-def enrich_question_fields_via_llm(question: Dict[str, Any], country: str, category: str, exam: str, subject: str) -> Dict[str, Any]:
-    """
-    Uses LLM to fill missing fields such as correct_answer, explanation, and wrong_answer_explanation.
-    Does NOT generate new questions.
-    """
-    prompt = f"""
-    The following is a {exam} {subject} question from the {category} category in {country}:
-    Question: {question.get('text')}
-    Options: {question.get('options', [])}
-
-    Please provide:
-    1. The correct answer option (e.g., "A" or "B").
-    2. A short explanation for the correct answer.
-    3. A short explanation for why other options are incorrect.
-
-    Return response as a JSON with fields:
-    {{
-        "correct_answer": "...",
-        "explanation": "...",
-        "wrong_answer_explanation": "..."
-    }}
-    """
-
-    try:
-        # Replace this with your actual LLM client call
-        response = call_gpt(prompt)  # e.g., using your OpenAI client
-        enriched = json.loads(response)
-        return enriched
-    except Exception as e:
-        print(f"⚠️ LLM enrichment failed: {e}")
-        return {}
-
-
-# ---------------------------
-# CLI / Interactive flow
-# ---------------------------
-
-def interactive_run(country, category, exam, subject, year_for_question_gen):
-    print("=== Test Series Pipeline ===")
-    exam = exam.strip() 
-    all_jsons = []
-    for file_path in glob.glob(f"structured_question_paper_with_diagrams_{exam}*.json"):
-        print(file_path)
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            all_jsons.append(data)
-    
-    # current_year = datetime.now().year
-    # earliest_year = current_year - 4  # last 4 years including current
-
-    # all_jsons = []
-    # for file_path in glob.glob("structured_question_paper_*.json"):
-    #     with open(file_path, "r", encoding="utf-8") as f:
-    #         data = json.load(f)
-    #         # Expecting each JSON has a 'year' field
-    #         year = data.get("year")
-    #         if year is not None and earliest_year <= int(year) <= current_year:
-    #             all_jsons.append(data)
-            
-    question_bank_df = jsons_to_question_bank(all_jsons)
-    print(question_bank_df.head())
-
-    print(f"✅ Loaded {len(question_bank_df)} questions into the question bank.")
-
-    excel_path = f"{country}_{exam}_{subject}_bank.xlsx"
-    question_bank_df.to_excel(excel_path, index=False)
-    print(f"📘 Excel version saved at: {excel_path}")
-
-    # ---- Pattern detection ----
-    print("🔍 Detecting exam pattern...")
-    pattern = detect_pattern(question_bank_df, country, exam, subject)
-    print(json.dumps(pattern, indent=2))
-
-    # ----  ----
-    print("🧩 Generating new test paper...")
-#     test_json = assemble_test_previous_year(
-#     country=country,
-#     category=category,
-#     exam=exam,
-#     subject=subject,
-#     pattern=pattern
-# )
-    # test_json = assemble_test_RAG_question(
-    # country=country,
-    # category=category,
-    # exam=exam,
-    # subject=subject,
-    # pattern=pattern
-    # )
-    
-    # test_json = assemble_test_via_textbook(
-    # country=country,
-    # category=category,
-    # exam=exam,
-    # subject=subject,
-    # pattern=pattern
-    # )
-    
-    # test_json = assemble_test_llm_v2(
-    # country=country,
-    # category=category,
-    # exam=exam,
-    # subject=subject,
-    # pattern=pattern,
-    # bank_df=question_bank_df
-    # )
-    
-    # NEW: Mixed assembly test - 25% LLM, 25% Excel, 25% RAG, 25% Textbook
-    test_json = assemble_test_mixed(
-        country=country,
-        category=category,
-        exam=exam,
-        subject=subject,
-        pattern=pattern,
-        bank_df=question_bank_df
-    )
-    output_file = f"generated_test_{exam}_{year_for_question_gen}.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(test_json, f, indent=2, ensure_ascii=False)
-    print(f"✅ Test paper saved to {output_file}")
-
-
-    # # Backtest
-    # do_backtest = input("Run rolling backtest on historical data? (y/N): ").strip().lower()
-    # if do_backtest == 'y':
-    #     bt = backtest_question_generation_per_topic(question_bank_df, test_json, lookback=5)
-    #     with open('backtest_results.json', 'w', encoding='utf-8') as f:
-    #         json.dump(bt, f, indent=2, ensure_ascii=False)
-    #     print("Backtest completed and saved to backtest_results.json")
-    
-
-# =========================
-# Question Formatting
-# =========================
-
-
-
-def convert_batch_to_format(batch_json_path, output_json_path):
-    """
-    Converts any LLM-generated batch JSON into the DOCX-ready formatted JSON.
-    Handles:
-    - List of dicts
-    - List of stringified JSON objects
-    - Top-level stringified JSON array
-    - Top-level dict containing a list of questions
-    """
-
-    import json
-
-    # Load file
-    with open(batch_json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Case 1: Top-level string containing JSON array or object
-    if isinstance(data, str):
-        try:
-            data = json.loads(data)
-            print("✅ Parsed top-level string into JSON.")
-        except Exception as e:
-            raise ValueError(f"Cannot parse top-level string: {e}")
-
-    # Case 2: Top-level dict with key containing questions
-    if isinstance(data, dict):
-        for key in ["questions", "Questions", "question_list", "data"]:
-            if key in data and isinstance(data[key], list):
-                data = data[key]
-                print(f"✅ Extracted list of questions from key '{key}'.")
-                break
-        else:
-            print("⚠️ Top-level dict does not contain a list. Wrapping as single question.")
-            data = [data]
-
-    # Case 3: List of stringified JSON objects
-    if isinstance(data, list):
-        parsed_questions = []
-        for i, item in enumerate(data):
-            if isinstance(item, str):
-                try:
-                    parsed_questions.append(json.loads(item))
-                    print(f"✅ Parsed stringified question at index {i}.")
-                except Exception:
-                    print(f"⚠️ Could not parse question at index {i}, using placeholder.")
-                    parsed_questions.append({"text": f"Placeholder question {i+1}", "type": "MCQ"})
-            elif isinstance(item, dict):
-                parsed_questions.append(item)
-            else:
-                print(f"⚠️ Invalid question at index {i}, using placeholder.")
-                parsed_questions.append({"text": f"Placeholder question {i+1}", "type": "MCQ"})
-        data = parsed_questions
-
-    # Final check
-    if not isinstance(data, list):
-        raise ValueError("❌ Could not convert input into a list of questions.")
-
-    questions = data
-
-    # --- Build formatted data for DOCX ---
-    formatted_data = {
-        "Page 1": [
-            {
-                "Section": "SECTION A",
-                "General Instructions": ["Answer all questions."],
-                "Questions": []
-            }
-        ]
-    }
-
-    for i, q in enumerate(questions, start=1):
-        formatted_question = {
-            "Question Number": str(i),
-            "Type": q.get("type", "MCQ"),
-            "Question": format_question_text(q),
-        }
-        formatted_data["Page 1"][0]["Questions"].append(formatted_question)
-
-    # # Save
-    # with open(output_json_path, "w", encoding="utf-8") as f:
-    #     json.dump(formatted_data, f, indent=4, ensure_ascii=False)
-
-    # print(f"✅ Converted and formatted JSON saved to: {output_json_path}")
-    return formatted_data
-
-
-def format_question_text(q):
-    """Formats a single question object into text with options."""
-    text = q.get("text", "").strip()
-    options = q.get("options", [])
-    formatted_options = ""
-
-    if options:
-        formatted_options = "\nOptions:\n"
-        for opt in options:
-            if isinstance(opt, dict):
-                for k, v in opt.items():
-                    formatted_options += f"{k}. {v}\n"
-            elif isinstance(opt, str):
-                # fallback for string options list
-                formatted_options += f"- {opt}\n"
-
-    return f"{text}\n{formatted_options}"
-
-
- 
-
-
-import json
-from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-
-def generate_question_paper_docx(batch_json_path=None, batch_data=None, output_docx_path="Formatted_Exam_Paper.docx", include_answers=False):
-    """
-    Generates a Word document from JSON, including all question fields.
-    """
-    # --- Load data ---
-    if batch_data is None:
-        if batch_json_path is None:
-            raise ValueError("Provide batch_json_path or batch_data.")
-        with open(batch_json_path, "r", encoding="utf-8") as f:
-            batch_data = json.load(f)
-
-    if isinstance(batch_data, str):
-        batch_data = json.loads(batch_data)
-
-    if isinstance(batch_data, dict):
-        for key in ["questions", "Questions", "question_list", "data"]:
-            if key in batch_data and isinstance(batch_data[key], list):
-                batch_data = batch_data[key]
-                break
-        else:
-            batch_data = [batch_data]
-
-    # --- Normalize ---
-    normalized_questions = []
-    for i, q in enumerate(batch_data):
-        if isinstance(q, str):
-            normalized_questions.append({"text": q})
-        elif isinstance(q, dict):
-            normalized_questions.append(q)
-        else:
-            normalized_questions.append({"text": f"Placeholder question {i+1}"})
-    batch_data = normalized_questions
-
-    # --- Create DOCX ---
-    doc = Document()
-
-    def add_footer(text="P.T.O."):
-        section = doc.sections[-1]
-        footer = section.footer
-        for para in footer.paragraphs:
-            p = para._element
-            p.getparent().remove(p)
-        paragraph = footer.add_paragraph()
-        paragraph.alignment = WD_PARAGRAPH_ALIGNMENT.RIGHT
-        run = paragraph.add_run(text)
-        run.bold = True
-        run.font.size = Pt(10)
-
-    def add_title(text, font_size=14, bold=True, alignment=WD_PARAGRAPH_ALIGNMENT.CENTER):
-        if text:
-            para = doc.add_paragraph()
-            run = para.add_run(text)
-            run.bold = bold
-            run.font.size = Pt(font_size)
-            para.alignment = alignment
-
-    def add_text(text, font_size=12, bold=False):
-        if text:
-            para = doc.add_paragraph()
-            run = para.add_run(text)
-            run.bold = bold
-            run.font.size = Pt(font_size)
-
-    # --- Format question ---
-    def format_question(q, number=None):
-        if isinstance(q, str):
-            text = q
-        else:
-            text = q.get("text", "Placeholder question").strip()
-
-            # Diagram
-            if q.get("has_diagram"):
-                desc = q.get("diagram_description")
-                text += "\n[Insert diagram here]"
-                if desc:
-                    text += f" ({desc})"
-
-            # Options
-            options = q.get("options", [])
-            if options:
-                text += "\nOptions:\n"
-                for opt in options:
-                    if isinstance(opt, dict):
-                        for k, v in opt.items():
-                            text += f"{k}. {v}\n"
-                    elif isinstance(opt, str):
-                        text += f"- {opt}\n"
-
-            # Subquestions
-            subquestions = q.get("subquestions", [])
-            for idx, sq in enumerate(subquestions):
-                prefix = f"{chr(97+idx)}) "
-                text += f"\n{prefix}{sq}"
-
-            # OR question
-            or_q = q.get("or_question")
-            if or_q:
-                text += f"\n\nOR\n\n{or_q}"
-                
-            # Correct answer & explanation
-            if include_answers:
-                ans = q.get("correct_answer")
-                expl = q.get("explanation")
-                if ans:
-                    text += f"\nCorrect Answer: {ans}"
-                if expl:
-                    text += f"\nExplanation: {expl}"
-
-            # Nicely format remaining fields (skip id)
-            if 'explanations_multilingual' in q:
-                text += "\nExplanations (Multilingual):"
-                for lang, val in q['explanations_multilingual'].items():
-                    text += f"\n  {lang}: {val}"
-
-            if 'incorrect_options_explanations' in q:
-                text += "\nIncorrect Options Explanations:"
-                for opt, val in q['incorrect_options_explanations'].items():
-                    text += f"\n  {opt}: {val}"
-
-            # Include other simple metadata fields
-            for key in ['type', 'difficulty', 'marks', 'topic', 'country', 'category', 'exam', 'subject', 'generated_at']:
-                if key in q:
-                    text += f"\n{key.capitalize()}: {q[key]}"
-
-
-        # Numbering
-        if number is not None:
-            text = f"{number}. {text}"
-
+        logger.debug(f"Translation failed: {e}")
         return text
 
 
-    # --- Write DOCX ---
-    add_text("General Instructions:", bold=True)
-    add_text("Answer all questions.\n")
+async def make_bilingual(value, source: str, target: str):
+    """Convert value to {target, native} structure"""
+    if source == target:
+        return value
+    if isinstance(value, str):
+        if not value.strip():
+            return {"target": value, "native": value}
+        native = await translate_text(value, source, target)
+        return {"target": value, "native": native}
+    elif isinstance(value, list):
+        return await asyncio.gather(*[make_bilingual(item, source, target) for item in value])
+    elif isinstance(value, dict):
+        keys = list(value.keys())
+        translated_values = await asyncio.gather(*[make_bilingual(value[k], source, target) for k in keys])
+        return dict(zip(keys, translated_values))
+    return value
 
-    for idx, q in enumerate(batch_data, start=1):
-        q_text = format_question(q, number=idx)
-        add_text(q_text)
 
-    add_footer("P.T.O.")
-    doc.save(output_docx_path)
-    print(f"✅ Word file created successfully: {output_docx_path}")
+async def translate_analysis(analysis: dict, source: str, target: str, fields_to_translate: list) -> dict:
+    """Translate specified fields in analysis dict"""
+    if source == target:
+        return analysis
+    result = {}
+    for k, v in analysis.items():
+        if k in fields_to_translate:
+            result[k] = await make_bilingual(v, source, target)
+        else:
+            result[k] = v
+    return result
+
+
+async def transcribe_audio_file(audio_path: str, target_lang: str = "en") -> str:
+    """Transcribe audio using Whisper - supports full language names"""
+    try:
+        
+        target_lang = target_lang.lower().strip()
+        languages_data = load_language_mapping()
+        if target_lang in languages_data:
+            target_lang = languages_data.get(target_lang, "en")
+        
+        segments, _ = await asyncio.to_thread(_whisper_model.transcribe, audio_path, language=target_lang)
+        return " ".join([seg.text for seg in segments]).strip()
+    except Exception as e:
+        logger.error(f"Transcription error: {e}")
+        return ""
+
+
+
+
+async def analyze_grammar_llm(user_text: str, model: str = "gpt") -> dict:
+    """Grammar analysis with LLM"""
+    prompt = f"""Analyze grammar in this SPOKEN text: "{user_text}"
+
+CRITICAL: This is transcribed speech. COMPLETELY IGNORE:
+- Punctuation errors, Capitalization errors, Spelling/typo errors
+
+CHECK ONLY FOR THESE GRAMMAR ERRORS:
+1. Filler words (um, uh, like, you know, I mean, basically, actually)
+2. Wrong prepositions (e.g., "good in" → "good at")
+3. Wrong verb tense (e.g., "I goed" → "I went")
+4. Subject-verb agreement (e.g., "He don't" → "He doesn't")
+5. Missing/wrong articles (e.g., "I am engineer" → "I am an engineer")
+6. Word order issues (e.g., "Always I work" → "I always work")
+
+CRITICAL FORMATTING - MUST USE # MARKERS:
+- you_said: Copy EXACT sentence, mark WRONG PART with #word#
+- should_be: Same sentence with corrections, mark CORRECTED with #word#
+- Example: "I #goed# to store" → "I #went# to the store"
+
+Return STRICTLY valid JSON:
+{{
+  "score": 0-100,
+  "filler_words": ["um", "like"],
+  "filler_count": 0,
+  "filler_feedback": "advice on fillers",
+  "errors": [
+    {{
+      "type": "verb_tense",
+      "you_said": "I #goed# to store",
+      "should_be": "I #went# to the store",
+      "wrong_word": "goed",
+      "correct_word": "went",
+      "explanation": "Go is irregular - past tense is went"
+    }}
+  ],
+  "word_suggestions": [{{"you_used": "good", "use_instead": "excellent", "original_sentence": "It was #good#", "improved_sentence": "It was #excellent#"}}],
+  "corrected_sentence": "sentence with grammar fixed",
+  "improved_sentence": "polished version",
+  "strengths": ["what they did well"],
+  "feedback": "2-3 sentences of feedback"
+}}
+
+RULES:
+- ALWAYS use # on both sides of wrong/correct words
+- Empty arrays [] if no issues
+"""
+    try:
+        raw = await call_llm(prompt, mode="strict_json", model=model)
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            data = json.loads(match.group())
+            data.setdefault("score", 75)
+            data.setdefault("filler_words", [])
+            data.setdefault("filler_count", len(data.get("filler_words", [])))
+            data.setdefault("errors", [])
+            data.setdefault("word_suggestions", [])
+            data.setdefault("strengths", [])
+            return data
+    except:
+        pass
+    return {"score": 75, "filler_words": [], "filler_count": 0, "errors": [], "word_suggestions": [], "strengths": [], "feedback": "Grammar analyzed."}
+
+
+async def analyze_vocab_llm(user_text: str, model: str = "gpt") -> dict:
+    """Vocabulary analysis with LLM"""
+    prompt = f"""Analyze vocabulary in this spoken text: "{user_text}"
+
+Evaluate CEFR level distribution (A1=basic, A2=elementary, B1=intermediate, B2=upper-intermediate, C1=advanced, C2=proficient).
+
+IDENTIFY WEAK/BASIC WORDS TO REPLACE:
+- Look for: good, bad, nice, thing, get, make, very, really, a lot, stuff
+- Suggest professional/interview-appropriate alternatives
+
+CRITICAL FORMATTING - MUST USE # MARKERS:
+- original_sentence: Copy EXACT sentence containing weak word, mark with #word#
+- improved_sentence: Same sentence with better word, mark with #better_word#
+
+Return STRICTLY valid JSON:
+{{
+  "score": 0-100,
+  "overall_level": "A1/A2/B1/B2/C1/C2",
+  "total_words": <word count>,
+  "cefr_distribution": {{
+    "A1": {{"percentage": 20, "words": ["I", "is"]}},
+    "A2": {{"percentage": 30, "words": ["good", "nice"]}},
+    "B1": {{"percentage": 40, "words": ["actually", "however"]}},
+    "B2": {{"percentage": 10, "words": ["sophisticated"]}},
+    "C1": {{"percentage": 0, "words": []}},
+    "C2": {{"percentage": 0, "words": []}}
+  }},
+  "professional_words_used": ["excellent", "demonstrate"],
+  "suggestions": [
+    {{
+      "word": "good",
+      "current_level": "A2",
+      "better_word": "excellent",
+      "suggested_level": "B1",
+      "original_sentence": "I had a #good# experience",
+      "improved_sentence": "I had an #excellent# experience"
+    }}
+  ],
+  "feedback": "2-3 sentences about vocabulary range"
+}}
+
+RULES:
+- ALWAYS mark words with #word# (single hash on both sides)
+- suggestions array MUST NOT be empty if weak words exist
+"""
+    try:
+        raw = await call_llm(prompt, mode="strict_json", model=model)
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            data = json.loads(match.group())
+            data.setdefault("score", 75)
+            data.setdefault("suggestions", [])
+            data.setdefault("professional_words_used", [])
+            return data
+    except:
+        pass
+    return {"score": 75, "total_words": len(user_text.split()), "suggestions": [], "professional_words_used": [], "feedback": "Vocabulary analyzed."}
+
+
+async def analyze_pronunciation_llm(audio_path: str, target_lang: str = "en", model: str = "gpt") -> dict:
+    """Pronunciation analysis using Whisper confidence + LLM for detailed feedback - matches Fluent API"""
+    try:
+        # Language mapping
+        lang_code = target_lang.lower().strip()
+        languages_data = load_language_mapping()
+        if lang_code in languages_data:
+            lang_code = languages_data.get(lang_code, "en")
+        
+        segments, _ = await asyncio.to_thread(_whisper_model.transcribe, audio_path, word_timestamps=True, language=lang_code)
+        words_data = []
+        transcription = ""
+        for seg in segments:
+            transcription += seg.text + " "
+            if seg.words:
+                for w in seg.words:
+                    words_data.append({"word": w.word.strip().lower(), "confidence": w.probability})
+        
+        transcription = transcription.strip()
+        
+        if not words_data:
+            return {"score": 0, "transcription": "", "feedback": "No speech detected", "word_analysis": [], "words_to_practice": []}
+        
+        accuracy = int((sum(w["confidence"] for w in words_data) / len(words_data)) * 100)
+        
+        # Build per-word pronunciation data
+        CONFIDENCE_THRESHOLD = 0.70
+        mispronounced_words = []
+        well_pronounced = []
+        all_words_pronunciation = []
+        
+        for wd in words_data:
+            word = wd["word"].strip(".,!?")
+            if len(word) < 2:
+                continue
+            
+            pronunciation_percentage = round(wd["confidence"] * 100, 1)
+            
+            if pronunciation_percentage >= 90:
+                status = "excellent"
+            elif pronunciation_percentage >= 70:
+                status = "good"
+            elif pronunciation_percentage >= 50:
+                status = "needs_improvement"
+            else:
+                status = "poor"
+            
+            all_words_pronunciation.append({
+                "word": word,
+                "pronunciation_percentage": pronunciation_percentage,
+                "status": status
+            })
+            
+            if wd["confidence"] < CONFIDENCE_THRESHOLD:
+                mispronounced_words.append({
+                    "word": word,
+                    "confidence": round(wd["confidence"] * 100, 1),
+                    "issue": "unclear pronunciation" if wd["confidence"] < 0.5 else "slight pronunciation issue"
+                })
+            else:
+                well_pronounced.append(word)
+        
+        # LLM enhancement for detailed feedback with phonetic guides
+        llm_prompt = f"""You are a pronunciation coach.
+
+TRANSCRIPTION: "{transcription}"
+
+PER-WORD PRONUNCIATION SCORES (confidence-based):
+{all_words_pronunciation}
+
+MISPRONOUNCED WORDS (low confidence):
+{mispronounced_words if mispronounced_words else "None - all words were clear!"}
+
+WELL PRONOUNCED WORDS: {well_pronounced[:10]}
+
+OVERALL ACCURACY: {accuracy}%
+
+For each word, provide pronunciation guidance with phonetic/syllable guides.
+
+Return STRICTLY valid JSON:
+{{
+    "word_analysis": [
+        {{
+            "word": "the word",
+            "pronunciation_match": 85.5,
+            "rating": "excellent/good/needs_improvement/poor",
+            "phonetic_guide": "how to pronounce: ex-AM-ple",
+            "improvement_tip": "specific tip if needed, or null if pronunciation is good"
+        }}
+    ],
+    "words_to_practice": [
+        {{
+            "word": "the word",
+            "how_to_say": "syllable breakdown with stress: ex-AM-ple",
+            "tip": "specific tip to pronounce this word better"
+        }}
+    ],
+    "well_pronounced_words": ["list", "of", "good", "words"],
+    "overall_feedback": "2-3 sentences about pronunciation quality",
+    "top_improvement_tip": "one key tip to improve pronunciation"
+}}"""
+        
+        try:
+            raw = await call_llm(llm_prompt, mode="strict_json", model=model, timeout=20)
+            match = re.search(r'\{[\s\S]*\}', raw)
+            if match:
+                llm_data = json.loads(match.group())
+            else:
+                raise ValueError("No JSON")
+        except:
+            # Fallback if LLM fails
+            llm_data = {
+                "word_analysis": all_words_pronunciation,
+                "words_to_practice": [{"word": w["word"], "how_to_say": w["word"].upper(), "tip": "Speak slowly and clearly"} for w in mispronounced_words[:5]],
+                "well_pronounced_words": well_pronounced[:10],
+                "overall_feedback": f"Pronunciation accuracy: {accuracy}%",
+                "top_improvement_tip": "Focus on clarity and speak at a steady pace"
+            }
+        
+        return {
+            "score": accuracy,
+            "transcription": transcription,
+            "word_pronunciation_scores": [{
+                "word": w["word"],
+                "score": round(w["confidence"] * 100, 1),
+                "status": "good" if w["confidence"] >= 0.7 else "needs_improvement"
+            } for w in words_data],
+            "word_analysis": llm_data.get("word_analysis", all_words_pronunciation),
+            "words_to_practice": llm_data.get("words_to_practice", [{"word": w["word"], "how_to_say": w["word"], "tip": "Focus on clarity"} for w in mispronounced_words[:5]]),
+            "well_pronounced_words": llm_data.get("well_pronounced_words", well_pronounced[:10]),
+            "feedback": llm_data.get("overall_feedback", f"Pronunciation accuracy: {accuracy}%."),
+            "top_improvement_tip": llm_data.get("top_improvement_tip", "Focus on clarity"),
+            "mispronounced_count": len(mispronounced_words)
+        }
+    except Exception as e:
+        logger.error(f"Pronunciation analysis error: {e}")
+        return {"score": 70, "transcription": "", "feedback": "Pronunciation analyzed.", "word_analysis": [], "words_to_practice": []}
+
+
+def analyze_fluency(user_text: str, duration: float) -> dict:
+    """Fluency analysis based on WPM"""
+    word_count = len(re.findall(r"\b\w+\b", user_text or ""))
+    wpm = int((word_count / duration) * 60) if duration > 0 else 100
     
-
-
-
-# -----------------------
-# Final PDF Generation
-# -----------------------
-
-import json
-from pdf2docx import Converter
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_PARAGRAPH_ALIGNMENT
-from docx2pdf import convert as docx2pdf_convert
-import os
-
-
-def update_exam_from_pdf(
-    pdf_path,
-    json_path,
-    intermediate_docx_path="intermediate.docx",
-    updated_docx_path="updated_exam.docx",
-    final_pdf_path="final_exam.pdf"
-):
-    """
-    Improved full pipeline:
-    1. Convert PDF → DOCX (to extract structure)
-    2. Build new formatted DOCX using JSON question data
-    3. Preserve headers/footers and exam info
-    4. Convert updated DOCX → PDF
-    """
-
-    # ----------------------
-    # Step 1: PDF → DOCX (Reference only)
-    # ----------------------
-    print("📄 Converting PDF to DOCX (reference extraction)...")
-    cv = Converter(pdf_path)
-    cv.convert(intermediate_docx_path, start=0, end=None)
-    cv.close()
-    print(f"✅ Converted PDF saved as {intermediate_docx_path}")
-
-    # ----------------------
-    # Step 2: Load JSON data
-    # ----------------------
-    with open(json_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    # Normalize question list
-    questions_json = []
-    if isinstance(data, dict) and "questions" in data:
-        questions_json = data["questions"]
-    elif isinstance(data, dict):
-        for page_data in data.values():
-            if isinstance(page_data, dict) and "Questions" in page_data:
-                questions_json.extend(page_data["Questions"])
-            elif isinstance(page_data, list):
-                for p in page_data:
-                    if isinstance(p, dict) and "Questions" in p:
-                        questions_json.extend(p["Questions"])
-    if not questions_json:
-        raise ValueError("❌ No questions found in JSON file.")
-
-    # ----------------------
-    # Step 3: Build clean DOCX
-    # ----------------------
-    print("🧱 Building new formatted DOCX...")
-    ref_doc = Document(intermediate_docx_path)  # to copy styles
-    doc = Document()
-
-    # Copy header/footer from reference DOCX
-    if ref_doc.sections and ref_doc.sections[0].header.paragraphs:
-        header_text = "\n".join(p.text for p in ref_doc.sections[0].header.paragraphs if p.text.strip())
-        header = doc.sections[0].header
-        for p in header.paragraphs:
-            p.clear()
-        header_para = header.add_paragraph(header_text)
-        header_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-
-    if ref_doc.sections and ref_doc.sections[0].footer.paragraphs:
-        footer_text = "\n".join(p.text for p in ref_doc.sections[0].footer.paragraphs if p.text.strip())
-        footer = doc.sections[0].footer
-        for p in footer.paragraphs:
-            p.clear()
-        footer_para = footer.add_paragraph(footer_text)
-        footer_para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-
-    # Margins and spacing
-    for section in doc.sections:
-        section.top_margin = Inches(1)
-        section.bottom_margin = Inches(1)
-        section.left_margin = Inches(1)
-        section.right_margin = Inches(1)
-
-    # ----------------------
-    # Step 4: Add exam metadata (title block)
-    # ----------------------
-    def add_title(text, size=14, bold=True):
-        para = doc.add_paragraph()
-        para.alignment = WD_PARAGRAPH_ALIGNMENT.CENTER
-        run = para.add_run(text)
-        run.bold = bold
-        run.font.size = Pt(size)
-
-    add_title(data.get("exam", "EXAM PAPER"))
-    add_title(f"Subject: {data.get('subject', 'Unknown')}")
-    add_title(f"Category: {data.get('category', 'N/A')} | Country: {data.get('country', 'N/A')}")
-    add_title(f"Generated At: {data.get('generated_at', '')}")
-    doc.add_paragraph()
-
-    # ----------------------
-    # Step 5: Add Questions
-    # ----------------------
-    for i, q in enumerate(questions_json, start=1):
-        para = doc.add_paragraph()
-        para.alignment = WD_PARAGRAPH_ALIGNMENT.LEFT
-        q_run = para.add_run(f"{i}. {q.get('text', 'No question text available')}")
-        q_run.bold = True
-        q_run.font.size = Pt(12)
-
-        # Diagram placeholder
-        if q.get("has_diagram"):
-            desc = q.get("diagram_description") or ""
-            doc.add_paragraph(f"[Insert diagram here] {desc}", style="List Bullet")
-
-        # Options
-        options = q.get("options", [])
-        if options:
-            doc.add_paragraph("Options:")
-            for opt in options:
-                if isinstance(opt, dict):
-                    for k, v in opt.items():
-                        doc.add_paragraph(f"{k}. {v}", style="List Bullet")
-
-        # # Explanation (optional)
-        # if "explanation" in q:
-        #     exp_para = doc.add_paragraph()
-        #     exp_para.add_run(f"Explanation: {q['explanation']}").italic = True
-
-        # Add small spacing
-        doc.add_paragraph()
-
-    # Save formatted DOCX
-    doc.save(updated_docx_path)
-    print(f"✅ Clean formatted DOCX created: {updated_docx_path}")
-
-    # ----------------------
-    # Step 6: DOCX → PDF
-    # ----------------------
-    print("🖨 Converting DOCX → PDF...")
-    docx2pdf_convert(updated_docx_path, final_pdf_path)
-    print(f"✅ Final PDF saved as {final_pdf_path}")
-
-    # Clean up intermediate file if not needed
-    if os.path.exists(intermediate_docx_path):
-        os.remove(intermediate_docx_path)
-
-
-def assemble_test_mixed(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any],
-    bank_df: Any,
-    total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    source_distribution: Optional[Dict[str, float]] = None,
-    batch_size: int = 8,
-    parallel: bool = True
-) -> Dict[str, Any]:
-    """
-    Assemble a test mixing questions from 4 sources:
-    - LLM (25%)
-    - Previous Year/Excel Bank (25%)
-    - RAG Questions from DB (25%)
-    - RAG Textbook (25%)
+    if wpm < 80:
+        score = max(40, 60 - (80 - wpm))
+        status = "too_slow"
+    elif wpm < 110:
+        score = 70 + (wpm - 80)
+        status = "slow"
+    elif wpm <= 160:
+        score = 90 + min(10, (wpm - 110) // 5)
+        status = "normal"
+    elif wpm <= 180:
+        score = 85
+        status = "fast"
+    else:
+        score = max(60, 85 - (wpm - 180) // 2)
+        status = "too_fast"
     
-    Args:
-        source_distribution: Optional dict with keys 'llm', 'excel', 'rag', 'textbook' 
-                             and float values (percentages). Default is 25% each.
-    """
-    languages = languages or ['en']
+    return {
+        "score": min(100, score),
+        "wpm": wpm,
+        "speed_status": status,
+        "duration_seconds": round(duration, 1),
+        "feedback": f"Speaking speed: {status.replace('_', ' ')} ({wpm} WPM)."
+    }
+
+
+async def analyze_match_llm(question: str, user_answer: str, sample_answer: str, model: str = "gpt") -> dict:
+    """Match analysis - evaluate answer quality (sample answer is internal reference only)"""
     
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-    total_questions = max(int(total_questions), 1)
+    reference = f"\nReference for evaluation (internal): {sample_answer[:200]}" if sample_answer else ""
     
-    # Default distribution: 25% each
-    if source_distribution is None:
-        source_distribution = {
-            'llm': 0.25,
-            'excel': 0.25,
-            'rag': 0.25,
-            'textbook': 0.25
+    prompt = f"""Evaluate this answer quality:
+
+Question: {question}
+User's Answer: {user_answer}
+{reference}
+
+Analyze: relevance, clarity, structure, completeness.
+Generate an IMPROVED version based on the USER'S ANSWER (enhance their style, don't replace).
+
+Return STRICTLY valid JSON:
+{{
+  "score": 0-100,
+  "is_relevant": true/false,
+  "strengths": ["what user did well"],
+  "areas_to_improve": ["specific improvements needed"],
+  "feedback": "constructive feedback on answer quality",
+  "improved_answer": "enhanced version of user's answer maintaining their style"
+}}"""
+    
+    try:
+        raw = await call_llm(prompt, mode="strict_json", model=model, timeout=40)
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return json.loads(match.group())
+    except:
+        pass
+    return {"score": 70, "feedback": "Answer evaluated.", "is_relevant": True, "improved_answer": user_answer}
+
+
+async def compare_attempts(prev: dict, current: dict, question: str, model: str = "gpt") -> dict:
+    """Compare two attempts with detailed LLM analysis"""
+    prev_score = prev.get("overall_score", 0) or 0
+    current_score = current.get("overall_score", 0) or 0
+    diff = round(current_score - prev_score, 2)
+    
+    
+    prev_scores = prev.get("scores", {})
+    current_scores = current.get("scores", {})
+    
+    
+    field_diffs = {}
+    for field in ["grammar", "vocabulary", "pronunciation", "fluency", "match"]:
+        p = prev_scores.get(field, 0) or 0
+        c = current_scores.get(field, 0) or 0
+        field_diffs[field] = {"prev": p, "current": c, "diff": round(c - p, 1)}
+    
+    if diff > 10:
+        trend = "significantly_improved"
+    elif diff > 0:
+        trend = "improved"
+    elif diff < -10:
+        trend = "declined"
+    elif diff < 0:
+        trend = "slightly_declined"
+    else:
+        trend = "no_change"
+    
+    prompt = f"""Compare these two attempts at the same question with DETAILED per-field analysis:
+
+QUESTION: {question}
+
+PREVIOUS ATTEMPT:
+- Overall Score: {prev_score}%
+- Grammar: {field_diffs['grammar']['prev']}%
+- Vocabulary: {field_diffs['vocabulary']['prev']}%
+- Pronunciation: {field_diffs['pronunciation']['prev']}%
+- Fluency: {field_diffs['fluency']['prev']}%
+- Match: {field_diffs['match']['prev']}%
+- Answer: "{prev.get('transcription', '')[:150]}"
+
+CURRENT ATTEMPT:
+- Overall Score: {current_score}% ({'+' if diff > 0 else ''}{diff}%)
+- Grammar: {field_diffs['grammar']['current']}% ({'+' if field_diffs['grammar']['diff'] > 0 else ''}{field_diffs['grammar']['diff']}%)
+- Vocabulary: {field_diffs['vocabulary']['current']}% ({'+' if field_diffs['vocabulary']['diff'] > 0 else ''}{field_diffs['vocabulary']['diff']}%)
+- Pronunciation: {field_diffs['pronunciation']['current']}% ({'+' if field_diffs['pronunciation']['diff'] > 0 else ''}{field_diffs['pronunciation']['diff']}%)
+- Fluency: {field_diffs['fluency']['current']}% ({'+' if field_diffs['fluency']['diff'] > 0 else ''}{field_diffs['fluency']['diff']}%)
+- Match: {field_diffs['match']['current']}% ({'+' if field_diffs['match']['diff'] > 0 else ''}{field_diffs['match']['diff']}%)
+- Answer: "{current.get('transcription', '')[:150]}"
+
+Provide detailed per-category analysis.
+
+Return STRICTLY valid JSON:
+{{
+    "overall_summary": "3-4 sentences comparing the attempts",
+    "grammar_analysis": {{"improved": true/false, "feedback": "specific grammar feedback"}},
+    "vocabulary_analysis": {{"improved": true/false, "feedback": "specific vocabulary feedback"}},
+    "pronunciation_analysis": {{"improved": true/false, "feedback": "specific pronunciation feedback"}},
+    "fluency_analysis": {{"improved": true/false, "feedback": "specific fluency feedback"}},
+    "match_analysis": {{"improved": true/false, "feedback": "specific answer match feedback"}},
+    "biggest_improvement": "most improved area",
+    "focus_area": "area needing most work",
+    "encouragement": "motivational message",
+    "next_tip": "one specific tip"
+}}"""
+    
+    try:
+        raw = await call_llm(prompt, mode="strict_json", model=model, timeout=30)
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            llm_data = json.loads(match.group())
+        else:
+            raise ValueError("No JSON")
+    except:
+        llm_data = {
+            "overall_summary": f"Score changed from {prev_score}% to {current_score}%.",
+            "grammar_analysis": {"improved": field_diffs['grammar']['diff'] > 0, "feedback": "Grammar comparison unavailable."},
+            "vocabulary_analysis": {"improved": field_diffs['vocabulary']['diff'] > 0, "feedback": "Vocabulary comparison unavailable."},
+            "pronunciation_analysis": {"improved": field_diffs['pronunciation']['diff'] > 0, "feedback": "Pronunciation comparison unavailable."},
+            "fluency_analysis": {"improved": field_diffs['fluency']['diff'] > 0, "feedback": "Fluency comparison unavailable."},
+            "match_analysis": {"improved": field_diffs['match']['diff'] > 0, "feedback": "Match comparison unavailable."},
+            "encouragement": "Keep practicing!"
         }
     
-    # Calculate questions per source
-    llm_count = int(round(total_questions * source_distribution.get('llm', 0.25)))
-    excel_count = int(round(total_questions * source_distribution.get('excel', 0.25)))
-    rag_count = int(round(total_questions * source_distribution.get('rag', 0.25)))
-    textbook_count = int(round(total_questions * source_distribution.get('textbook', 0.25)))
+    return {
+        "previous_score": prev_score,
+        "current_score": current_score,
+        "score_change": diff,
+        "trend": trend,
+        "per_field_comparison": field_diffs,
+        **llm_data
+    }
+
+
+async def generate_session_summary(session_data: dict, model: str = "gpt") -> dict:
+    """Generate comprehensive session summary with all attempts"""
+    attempts = session_data.get("attempts", [])
+    question = session_data.get("question", {})
+    user_name = session_data.get("name", "Learner")
     
-    # Adjust to ensure we get exactly total_questions
-    total_assigned = llm_count + excel_count + rag_count + textbook_count
-    if total_assigned < total_questions:
-        llm_count += (total_questions - total_assigned)
-    elif total_assigned > total_questions:
-        llm_count -= (total_assigned - total_questions)
+    if not attempts:
+        return {"message": "No attempts to summarize."}
     
-    print(f"📊 Mixed Test Distribution: LLM={llm_count}, Excel={excel_count}, RAG={rag_count}, Textbook={textbook_count}")
     
-    # Build ALL tasks from pattern - these will be SPLIT between sources (no overlap)
-    all_tasks = _build_tasks_from_pattern(pattern, total_questions, exam)
-    random.shuffle(all_tasks)  # Shuffle to get variety
+    scores = [a.get("overall_score", 0) for a in attempts]
+    best_score = max(scores)
+    latest_score = scores[-1]
     
-    # SPLIT tasks into 4 SEPARATE groups - each source gets unique tasks
-    # This prevents topic overlap between sources
-    excel_tasks = all_tasks[0:excel_count]
-    rag_tasks = all_tasks[excel_count:excel_count + rag_count]
-    textbook_tasks = all_tasks[excel_count + rag_count:excel_count + rag_count + textbook_count]
-    llm_tasks = all_tasks[excel_count + rag_count + textbook_count:excel_count + rag_count + textbook_count + llm_count]
+    attempt_summaries = []
+    for i, a in enumerate(attempts, 1):
+        attempt_summaries.append(f"Attempt {i}: {a.get('overall_score', 0)}%")
     
-    print(f"📋 Task Split: Excel={len(excel_tasks)}, RAG={len(rag_tasks)}, Textbook={len(textbook_tasks)}, LLM={len(llm_tasks)}")
+    prompt = f"""Generate a session summary:
+
+User: {user_name}
+Question: {question.get('question', '')[:100]}
+Attempts: {len(attempts)}
+Score progression: {' -> '.join(map(str, scores))}
+Best score: {best_score}%
+
+Return STRICTLY valid JSON:
+{{
+    "overall_assessment": "3-4 sentences summarizing the session",
+    "score_progression": {json.dumps(scores)},
+    "best_score": {best_score},
+    "total_attempts": {len(attempts)},
+    "strengths": ["top 3 strengths"],
+    "improvement_areas": ["top 3 areas to work on"],
+    "recommendations": ["2-3 actionable next steps"],
+    "encouragement": "motivational closing"
+}}"""
     
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.35, 'Medium': 0.45, 'Hard': 0.2})
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
+    try:
+        raw = await call_llm(prompt, mode="strict_json", model=model, timeout=30)
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            return json.loads(match.group())
+    except:
+        pass
     
-    all_questions = []
-    used_ids = set()
+    return {
+        "overall_assessment": f"{user_name}, you completed {len(attempts)} attempt(s) with a best score of {best_score}%.",
+        "score_progression": scores,
+        "best_score": best_score,
+        "total_attempts": len(attempts),
+        "strengths": [],
+        "improvement_areas": [],
+        "recommendations": ["Keep practicing", "Focus on clarity"],
+        "encouragement": "Great effort!"
+    }
+
+
+
+
+@router.post("/practice_faq")
+async def practice_faq(
+    request: Request,
+    name: str = Form(default="Learner"),
+    target_lang: str = Form(default="en"),
+    native_lang: str = Form(default="hi"),
+    question_id: Optional[int] = Form(default=None),
+    session_id: Optional[str] = Form(default=None),
+    audio_file: Optional[UploadFile] = File(default=None),
+    text_input: Optional[str] = Form(default=None),
+    action: Optional[str] = Form(default=None),
+    model: Optional[str] = Form(default="gpt"),
+    current_user: User = Depends(get_current_user),
+):
     
-    # =========================================================
-    # SOURCE 1: Previous Year / Excel Bank (25%)
-    # Uses its OWN subset of tasks (excel_tasks)
-    # =========================================================
-    print(f"📘 Fetching {len(excel_tasks)} questions from Excel/Bank...")
-    excel_questions = []
-    
-    if bank_df is not None and not bank_df.empty:
-        for task in excel_tasks:
-            if len(excel_questions) >= excel_count:
-                break
-            topic = task['topic']
-            diff_name = task.get('difficulty', 'Medium')
-            qtype = task.get('type', 'MCQ')
-            if isinstance(qtype, list):
-                qtype = qtype[0] if qtype else 'MCQ'
+    native = native_lang
+    user_id = current_user.id
+    if action == "end":
+        
+        if session_id:
+            session_data = await db.get_user_session(session_id)
+            if not session_data:
+                raise HTTPException(status_code=404, detail="Session not found")
+        elif user_id and question_id:
             
-            picks = select_existing_questions(
-                bank_df, topic, diff_name, qtype, 1, exclude_ids=used_ids
-            )
-            for p in picks:
-                p['source'] = 'excel'
-                p['assigned_topic'] = topic  # Track which topic was assigned
-                excel_questions.append(p)
-                used_ids.add(p.get('id'))
-    
-    all_questions.extend(excel_questions[:excel_count])
-    print(f"   ✅ Got {len(excel_questions[:excel_count])} from Excel")
-    
-    # =========================================================
-    # SOURCE 2: RAG Questions from DB (25%)
-    # Uses its OWN subset of tasks (rag_tasks)
-    # =========================================================
-    print(f"🔍 Fetching {len(rag_tasks)} questions from RAG DB...")
-    rag_questions = []
-    
-    for task in rag_tasks:
-        if len(rag_questions) >= rag_count:
-            break
-        topic = task['topic']
-        try:
-            db_questions = get_questions(exam, topic, top_k=2)
-            for q_node in db_questions:
-                if len(rag_questions) >= rag_count:
+            user_sessions = await db.get_sessions_by_user_id(user_id, session_type="faq")
+            session_data = None
+            for s in user_sessions:
+                if s.get("question_id") == question_id:
+                    session_id = s["session_id"]
+                    session_data = await db.get_user_session(session_id)
                     break
-                q_meta = q_node.metadata
-                raw_text = q_node.text
-                q_text = extract_only_question(raw_text)
-                
-                q_entry = {
-                    'id': q_node.id_,
-                    'text': q_text,
-                    'topic': q_meta.get('topic', topic),
-                    'assigned_topic': topic,
-                    'difficulty': task.get('difficulty', 'Medium'),
-                    'type': q_meta.get('type', 'MCQ'),
-                    'options': q_meta.get('options', []),
-                    'has_diagram': q_meta.get('diagram', False),
-                    'diagram_paths': q_meta.get('diagram_paths', []),
-                    'source': 'rag'
-                }
-                
-                if q_entry['id'] not in used_ids:
-                    rag_questions.append(q_entry)
-                    used_ids.add(q_entry['id'])
-                    break  # Only 1 question per task
-        except Exception as e:
-            print(f"   ⚠ RAG fetch error for topic {topic}: {e}")
-    
-    all_questions.extend(rag_questions[:rag_count])
-    print(f"   ✅ Got {len(rag_questions[:rag_count])} from RAG DB")
-    
-    # =========================================================
-    # SOURCE 3: RAG Textbook (25%)
-    # Uses its OWN subset of tasks (textbook_tasks)
-    # =========================================================
-    print(f"📚 Generating {len(textbook_tasks)} questions from RAG Textbook...")
-
-    
-    try:
-        textbook_questions = generate_questions_batch_via_textbook(
-            country=country,
-            category=category,
-            exam=exam,
-            subject=subject,
-            tasks=textbook_tasks,
-            languages=languages
-        )
-        for q in textbook_questions:
-            q['source'] = 'textbook'
-    except Exception as e:
-        print(f"   ⚠ Textbook generation error: {e}")
-        textbook_questions = []
-    
-    all_questions.extend(textbook_questions[:textbook_count])
-    print(f"   ✅ Got {len(textbook_questions[:textbook_count])} from Textbook RAG")
-    
-    # =========================================================
-    # SOURCE 4: Pure LLM (25%)
-    # =========================================================
-    print(f"🤖 Generating {len(llm_tasks)} questions via LLM...")
-    # llm_tasks already defined from all_tasks split above - using that directly
-    
-    exam_upper = (exam or "").upper()
-    exam_examples = EXAM_EXAMPLES.get(exam_upper) or EXAM_EXAMPLES.get(exam) or []
-    if not isinstance(exam_examples, list):
-        exam_examples = []
-    
-    try:
-        llm_questions = generate_questions_batch_llm_only_v2(
-            country=country,
-            category=category,
-            exam=exam,
-            subject=subject,
-            tasks=llm_tasks,
-            languages=languages,
-            avoid_questions=[],
-            diversity_seed=random.randint(100000, 999999),
-            exam_examples=exam_examples
-        )
-        for q in llm_questions:
-            q['source'] = 'llm'
-    except Exception as e:
-        print(f"   ⚠ LLM generation error: {e}")
-        llm_questions = []
-    
-    all_questions.extend(llm_questions[:llm_count])
-    print(f"   ✅ Got {len(llm_questions[:llm_count])} from LLM")
-    
-    # =========================================================
-    # FALLBACK: Fill remaining with LLM if needed
-    # =========================================================
-    remaining = total_questions - len(all_questions)
-    if remaining > 0:
-        print(f"⚡ Generating {remaining} fallback questions via LLM...")
-        fallback_tasks = tasks[:remaining]
-        for t in fallback_tasks:
-            try:
-                q = generate_question_via_llm(
-                    country=country,
-                    category=category,
-                    exam=exam,
-                    subject=subject,
-                    topic=t['topic'],
-                    qtype=t.get('type', 'MCQ'),
-                    difficulty=t.get('difficulty', 'Medium'),
-                    marks=int(t.get('marks', 1)),
-                    languages=languages
-                )
-                q['source'] = 'llm_fallback'
-                all_questions.append(q)
-            except Exception as e:
-                print(f"   ⚠ Fallback generation error: {e}")
-    
-    # =========================================================
-    # SHUFFLE and VALIDATE
-    # =========================================================
-    random.shuffle(all_questions)
-    
-    validated_questions = [
-        validate_or_regenerate_question(q, country, category, exam, subject, languages)
-        for q in all_questions[:total_questions]
-    ]
-    
-    # Add estimated time
-    def estimate_time(q):
-        qtype = (q.get('type') or 'MCQ').upper()
-        difficulty = (q.get('difficulty') or 'Medium').lower()
-        base = 1.0
-        if qtype == 'NVT':
-            base = 3.0
-        if difficulty == 'medium':
-            base *= 1.5
-        if difficulty == 'hard':
-            base *= 2.5
-        if q.get('has_diagram'):
-            base += 0.5
-        return float(base)
-    
-    for q in validated_questions:
-        q['est_time_min'] = estimate_time(q)
-    
-    total_est_time = sum([q.get('est_time_min', 1.0) for q in validated_questions])
-    
-    # Count sources for summary
-    source_counts = {}
-    for q in validated_questions:
-        src = q.get('source', 'unknown')
-        source_counts[src] = source_counts.get(src, 0) + 1
-    
-    print(f"\n📊 Final Question Distribution by Source: {source_counts}")
-    
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
-        'questions': validated_questions,
-        'total_questions': len(validated_questions),
-        'estimated_duration_minutes': round(total_est_time, 1),
-        'pattern_used': pattern,
-        'source_distribution': source_counts
-    }
-
-
-def assemble_test_mixed_v2(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any],
-    bank_df: Optional[Any] = None,
-    total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    source_distribution: Optional[Dict[str, float]] = None,
-    batch_size: int = 8,
-    parallel: bool = True
-) -> Dict[str, Any]:
-    """
-    Assemble a test mixing questions from 4 sources:
-    - LLM (25%)
-    - Previous Year/Excel Bank (25%)
-    - RAG Questions from DB (25%)
-    - RAG Textbook (25%)
-
-    Args:
-        source_distribution: Optional dict with keys 'llm', 'excel', 'rag', 'textbook'
-                             and float values (percentages). Default is 25% each.
-    """
-    import math
-
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-    total_questions = max(int(total_questions), 1)
-
-    default_dist = {'llm': 0.25, 'excel': 0.25, 'rag': 0.25, 'textbook': 0.25}
-    requested_dist = dict(default_dist)
-    if source_distribution:
-        for key in default_dist:
-            if key in source_distribution:
-                requested_dist[key] = source_distribution[key]
-
-    normalized_dist = _normalize_distribution(requested_dist, default_dist)
-
-    def _split_counts(total, weights, order):
-        raw = {k: total * float(weights.get(k, 0.0)) for k in order}
-        counts = {k: int(math.floor(raw[k])) for k in order}
-        remainder = total - sum(counts.values())
-        if remainder > 0:
-            frac_order = sorted(order, key=lambda k: (raw[k] - counts[k]), reverse=True)
-            for i in range(remainder):
-                counts[frac_order[i % len(frac_order)]] += 1
-        return counts
-
-    order = ['llm', 'excel', 'rag', 'textbook']
-    counts = _split_counts(total_questions, normalized_dist, order)
-
-    llm_count = counts['llm']
-    excel_count = counts['excel']
-    rag_count = counts['rag']
-    textbook_count = counts['textbook']
-
-    print(
-        "Mixed Test Distribution: "
-        f"LLM={llm_count}, Excel={excel_count}, RAG={rag_count}, Textbook={textbook_count}"
-    )
-
-    def _apply_task_defaults(q, task):
-        if q is None:
-            return None
-        q.setdefault("topic", task.get("topic"))
-        q.setdefault("type", task.get("type", "MCQ"))
-        q.setdefault("difficulty", task.get("difficulty", "Medium"))
-        q.setdefault("marks", int(task.get("marks", 1)))
-        return q
-
-    all_questions = []
-    missing_tasks = []
-    used_ids = set()
-
-    tasks_excel = _build_tasks_from_pattern(pattern, excel_count, exam) if excel_count else []
-    tasks_rag = _build_tasks_from_pattern(pattern, rag_count, exam) if rag_count else []
-    tasks_textbook = _build_tasks_from_pattern(pattern, textbook_count, exam) if textbook_count else []
-    tasks_llm = _build_tasks_from_pattern(pattern, llm_count, exam) if llm_count else []
-
-    # =========================================================
-    # SOURCE 1: Previous Year / Excel Bank
-    # =========================================================
-    if excel_count:
-        print(f"Fetching {excel_count} questions from Excel/Bank...")
-        if bank_df is None or (hasattr(bank_df, "empty") and bank_df.empty):
-            missing_tasks.extend(tasks_excel)
+            if not session_data:
+                raise HTTPException(status_code=404, detail=f"No session found for user {user_id} and question {question_id}")
         else:
-            for task in tasks_excel:
-                picks = select_existing_questions(
-                    bank_df,
-                    task.get("topic"),
-                    task.get("difficulty"),
-                    task.get("type"),
-                    1,
-                    exclude_ids=used_ids
-                )
-                if not picks:
-                    missing_tasks.append(task)
-                    continue
-                q = picks[0]
-                q["source"] = "excel"
-                _apply_task_defaults(q, task)
-                all_questions.append(q)
-                if q.get("id"):
-                    used_ids.add(q.get("id"))
-        print(f"Got {len([q for q in all_questions if q.get('source') == 'excel'])} from Excel")
+            raise HTTPException(status_code=400, detail="Provide session_id or user_id+question_id to end session")
+        
+        native = session_data.get("native_lang", native_lang)
+        
+        
+        summary = await generate_session_summary(session_data, model=model)
+        summary_bilingual = await make_bilingual(summary, "en", native)
+        
+        
+        attempts = session_data.get("attempts", [])
+        all_attempts_bilingual = []
+        
+        for i, attempt in enumerate(attempts, 1):
+            all_attempts_bilingual.append({
+                "attempt_number": i,
+                "score": attempt.get("overall_score", 0),
+                "transcription": attempt.get("transcription", ""),
+                "analysis": attempt.get("analysis", {}),
+                "improved_answer": attempt.get("improved_answer", {}),
+                "comparison": attempt.get("comparison")  
+            })
+        
+        
+        session_data["status"] = "paused"
+        session_data["final_feedback"] = summary_bilingual  
+        await db.update_session(session_id, session_data, overall_score=summary.get("best_score"))
+        
+        return {
+            "action": "session_paused",
+            "session_id": session_id,
+            "target_lang": target_lang,
+            "native_lang": native,
+            "session_summary": summary_bilingual,
+            "all_attempts": all_attempts_bilingual
+        }
+    
+    
+    if not question_id and not session_id:
+        raise HTTPException(status_code=400, detail="Provide question_id for new session or session_id for existing")
+    
+    if not audio_file and not text_input:
+        raise HTTPException(status_code=400, detail="Provide audio_file or text_input")
+    
+    
+    if session_id:
+        session_data = await db.get_user_session(session_id)
+        if not session_data:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        cur_q = session_data["question"]
+        native = session_data.get("native_lang", native_lang)
+    else:
+        
+        # No session_id provided - always create new session for this question
+        async with async_session() as sess:
+            result = await sess.execute(
+                text("SELECT id, category, question, sample_answer FROM faq_questions WHERE id = :qid"),
+                {"qid": question_id}
+            )
+            row = result.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Question ID {question_id} not found")
+        
+        cur_q = {"id": row[0], "category": row[1], "question": row[2], "sample_answer": row[3]}
+        session_id = str(uuid.uuid4())
+        session_data = {
+            "name": name,
+            "question": cur_q,
+            "target_lang": target_lang,
+            "native_lang": native_lang,
+            "attempts": [],
+            "status": "active"
+        }
+        await db.create_session(session_id, "faq", session_data, user_id=user_id, user_name=name)
+    
+    
+    temp_path = None
+    duration = 0
+    is_audio = audio_file is not None
+    target_lang = session_data.get("target_lang", "en")
+    
+    if audio_file:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            shutil.copyfileobj(audio_file.file, tmp)
+            temp_path = tmp.name
+        
+        try:
+            audio = await asyncio.to_thread(AudioSegment.from_file, temp_path)
+            duration = len(audio) / 1000.0
+            user_text = await transcribe_audio_file(temp_path, target_lang)
+        except Exception as e:
+            if temp_path and os.path.exists(temp_path):
+                os.unlink(temp_path)
+            return {"action": "error", "message": f"Audio processing failed: {str(e)}"}
+    else:
+        user_text = text_input.strip() if text_input else ""
+        duration = len(user_text.split()) / 2.0
+    
+    if not user_text:
+        if temp_path and os.path.exists(temp_path):
+            os.unlink(temp_path)
+        return {"action": "error", "message": "No input detected"}
+    
+    
+    grammar_task = analyze_grammar_llm(user_text, model=model)
+    vocab_task = analyze_vocab_llm(user_text, model=model)
+    match_task = analyze_match_llm(cur_q["question"], user_text, cur_q.get("sample_answer"), model=model)
+    
+    if is_audio:
+        pron_task = analyze_pronunciation_llm(temp_path, target_lang, model=model)
+        grammar_data, vocab_data, match_data, pron_data = await asyncio.gather(
+            grammar_task, vocab_task, match_task, pron_task
+        )
+        fluency_data = analyze_fluency(user_text, duration)
+    else:
+        grammar_data, vocab_data, match_data = await asyncio.gather(
+            grammar_task, vocab_task, match_task
+        )
+        pron_data = {"score": 0, "feedback": "N/A for text input"}
+        fluency_data = {"score": 0, "wpm": 0, "feedback": "N/A for text input"}
+    
+    
+    if temp_path and os.path.exists(temp_path):
+        os.unlink(temp_path)
+    
+    
+    scores = {
+        "grammar": grammar_data.get("score", 75),
+        "vocabulary": vocab_data.get("score", 75),
+        "pronunciation": pron_data.get("score", 0) if is_audio else 0,
+        "fluency": fluency_data.get("score", 0) if is_audio else 0,
+        "match": match_data.get("score", 70)
+    }
+    
+    
+    final_score = int(
+        scores["grammar"] * WEIGHTS["grammar"] +
+        scores["vocabulary"] * WEIGHTS["vocabulary"] +
+        scores["pronunciation"] * WEIGHTS["pronunciation"] +
+        scores["fluency"] * WEIGHTS["fluency"] +
+        scores["match"] * WEIGHTS["match"]
+    )
+    
+    
+    
+    text_na_msg = await make_bilingual("N/A for text input", "en", native) if not is_audio else None
+    
+    analysis = {
+        "grammar": await translate_analysis(grammar_data, "en", native, GRAMMAR_FIELDS),
+        "vocabulary": await translate_analysis(vocab_data, "en", native, VOCAB_FIELDS),
+        "pronunciation": await translate_analysis(pron_data, "en", native, PRON_FIELDS) if is_audio else {"score": 0, "feedback": text_na_msg},
+        "fluency": await translate_analysis(fluency_data, "en", native, FLUENCY_FIELDS) if is_audio else {"score": 0, "feedback": text_na_msg},
+        "match": await translate_analysis(match_data, "en", native, MATCH_FIELDS)
+    }
+    
+    
+    improved_answer = await make_bilingual(match_data.get("improved_answer", user_text), "en", native)
+    
+    
+    attempt_entry = {
+        "transcription": user_text,
+        "duration": duration,
+        "is_audio": is_audio,
+        "overall_score": final_score,
+        "scores": scores,
+        "analysis": analysis,
+        "improved_answer": improved_answer,
+        "filler_count": grammar_data.get("filler_count", 0)
+    }
+    
+    
+    attempts = session_data.get("attempts", [])
+    prev_attempt = attempts[-1] if attempts else None
+    
+    
+    comparison = None
+    if prev_attempt:
+        comparison_raw = await compare_attempts(prev_attempt, attempt_entry, cur_q["question"], model=model)
+        comparison = await make_bilingual(comparison_raw, "en", native)
+        
+        attempt_entry["comparison"] = comparison
+    
+    
+    attempts.append(attempt_entry)
+    session_data["attempts"] = attempts
+    session_data["status"] = "active"
+    
+    
+    await db.update_session(session_id, session_data, overall_score=final_score)
+    
+    # Generate TTS audio URL for the question (uses Indian English voice for FAQ)
+    question_audio_url = await generate_tts_url(request, cur_q["question"], target_lang, api_type="faq")
+    
+    response = {
+        "action": "answer_evaluated",
+        "session_id": session_id,
+        "target_lang": target_lang,
+        "native_lang": native,
+        "question_id": cur_q["id"],
+        "question": await make_bilingual(cur_q["question"], "en", native),
+        "attempt_number": len(attempts),
+        "transcription": user_text,
+        "overall_score": final_score,
+        "scores": scores,
+        "analysis": analysis,
+        "improved_answer": improved_answer,
+        "audio_url": question_audio_url
+    }
+    
+    if comparison:
+        response["comparison"] = comparison
+    
+    return response
 
-    # =========================================================
-    # SOURCE 2: RAG Questions from DB
-    # =========================================================
-    if rag_count:
-        print(f"Fetching {rag_count} questions from RAG DB...")
-        for task in tasks_rag:
-            try:
-                db_questions = get_questions(exam, task.get("topic"), top_k=5)
-            except Exception as e:
-                logger.warning("RAG fetch error for topic %s: %s", task.get("topic"), e)
-                missing_tasks.append(task)
-                continue
 
-            chosen = None
-            for q_node in db_questions:
-                if q_node.id_ in used_ids:
-                    continue
-                chosen = q_node
+@router.get("/faq_questions")
+async def get_faq_questions(
+    category: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Get FAQ questions. If user_id provided, includes attempt counts for that user."""
+    async with async_session() as sess:
+        query = "SELECT id, category, question, min_time, max_time, sample_answer FROM faq_questions"
+        if category:
+            result = await sess.execute(
+                text(query + " WHERE LOWER(category) LIKE :cat ORDER BY category, id"),
+                {"cat": f"%{category.lower()}%"}
+            )
+        else:
+            result = await sess.execute(text(query + " ORDER BY category, id"))
+        rows = result.fetchall()
+
+    questions = []
+
+    user_id = current_user.id if current_user else None
+    user_sessions_data = None
+    if user_id:
+        user_sessions_data = await db.get_sessions_by_user_id(user_id, session_type="faq")
+
+    for r in rows:
+        q = {
+            "id": r[0],
+            "category": r[1],
+            "question": r[2],
+            "min_time": r[3],
+            "max_time": r[4],
+            "sample_answer": r[5],
+            "attempt_count": 0,  
+            "sessions": []       
+        }
+
+
+        if user_id and user_sessions_data:
+
+            question_sessions = [
+                {"session_id": s["session_id"], "attempt_count": s["attempt_count"]}
+                for s in user_sessions_data if s.get("question_id") == r[0]
+            ]
+            q["sessions"] = question_sessions
+
+            q["attempt_count"] = sum(s["attempt_count"] for s in question_sessions)
+
+        questions.append(q)
+
+    return {"total": len(questions), "questions": questions}
+
+
+@router.get("/faq_sessions")
+async def get_faq_sessions(current_user: User = Depends(get_current_user)):
+    """Get all FAQ sessions for a user"""
+    user_id = current_user.id
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="faq")
+    return {
+        "user_id": user_id,
+        "total_sessions": len(sessions),
+        "sessions": sessions
+    }
+
+
+@router.get("/faq_topics")
+async def get_faq_topics():
+    """Get available FAQ categories"""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("SELECT DISTINCT category, COUNT(*) FROM faq_questions GROUP BY category")
+        )
+        return {"topics": [{"name": r[0], "count": r[1]} for r in result.fetchall()]}
+
+
+@router.get("/faq_feedback")
+async def get_faq_feedback(
+    session_id: Optional[str] = None,
+    question_id: Optional[int] = None,
+    attempt: Optional[int] = None,  # NEW: Get feedback for specific attempt (1-indexed)
+    current_user: User = Depends(get_current_user)
+):
+    """Get structured feedback for a FAQ session (all attempts + overall feedback).
+    Can use either session_id OR user_id+question_id.
+    Optional: provide 'attempt' param (1-indexed) to get feedback for specific attempt only."""
+    
+    user_id = current_user.id if current_user else None
+    if not session_id and user_id and question_id:
+        user_sessions = await db.get_sessions_by_user_id(user_id, session_type="faq")
+        for s in user_sessions:
+            if s.get("question_id") == question_id:
+                session_id = s["session_id"]
                 break
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Provide session_id or user_id+question_id")
+    
+    feedback = await db.get_session_feedback(session_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # If specific attempt requested, return just that attempt's feedback
+    if attempt is not None:
+        turn_feedback = feedback.get("turn_feedback", [])
+        if attempt < 1 or attempt > len(turn_feedback):
+            raise HTTPException(status_code=400, detail=f"Attempt {attempt} not found. Total attempts: {len(turn_feedback)}")
+        
+        specific_attempt = turn_feedback[attempt - 1]  # Convert to 0-indexed
+        return {
+            "session_id": session_id,
+            "attempt_number": attempt,
+            "total_attempts": len(turn_feedback),
+            **specific_attempt
+        }
+    
+    grammar_errors = []
+    vocabulary_suggestions = []
+    pronunciation_issues = []
+    
+    turn_feedback = feedback.get("turn_feedback", [])
+    
+    for turn in turn_feedback:
+        # Grammar errors
+        grammar = turn.get("grammar") or {}
+        for err in grammar.get("errors", []):
+            if isinstance(err, dict):
+                grammar_errors.append({
+                    "wrong": err.get("you_said", err.get("wrong_word", "")),
+                    "correct": err.get("should_be", err.get("correct_word", ""))
+                })
+        
+        # Vocabulary suggestions
+        vocab = turn.get("vocabulary") or {}
+        for sug in vocab.get("suggestions", []):
+            if isinstance(sug, dict):
+                vocabulary_suggestions.append({
+                    "weak_word": sug.get("word", sug.get("weak_word", "")),
+                    "better_options": sug.get("better_options", sug.get("better_word", []))
+                })
+        
+        # Pronunciation issues
+        pron = turn.get("pronunciation") or {}
+        if isinstance(pron, dict):
+            for word in pron.get("words_to_practice", []):
+                if isinstance(word, dict):
+                    pronunciation_issues.append({"word": word.get("word", ""), "issue": word.get("issue", "needs practice")})
+                elif isinstance(word, str):
+                    pronunciation_issues.append({"word": word, "issue": "needs practice"})
+    
+    # Remove duplicates - convert dicts to strings for hashability (bilingual values are dicts)
+    def make_hashable(val):
+        if isinstance(val, dict):
+            target = val.get("target")
+            if isinstance(target, dict):
+                target = target.get("target")
+            if isinstance(target, (str, int, float)):
+                return str(target)
+            word = val.get("word")
+            if isinstance(word, (str, int, float)):
+                return str(word)
+            try:
+                return json.dumps(val, sort_keys=True)
+            except Exception:
+                return str(val)
+        if isinstance(val, list):
+            return tuple(make_hashable(v) for v in val)
+        return val
+    
+    seen = set()
+    unique_grammar = []
+    for g in grammar_errors:
+        wrong_val = make_hashable(g.get("wrong"))
+        correct_val = make_hashable(g.get("correct"))
+        if wrong_val and (wrong_val, correct_val) not in seen:
+            seen.add((wrong_val, correct_val))
+            unique_grammar.append(g)
+    
+    seen = set()
+    unique_vocab = []
+    for v in vocabulary_suggestions:
+        weak_word = make_hashable(v.get("weak_word"))
+        if weak_word and weak_word not in seen:
+            seen.add(weak_word)
+            unique_vocab.append(v)
+    
+    seen = set()
+    unique_pron = []
+    for p in pronunciation_issues:
+        word = make_hashable(p.get("word"))
+        if word and word not in seen:
+            seen.add(word)
+            unique_pron.append(p)
+    
+    # Add summary to feedback response
+    feedback["summary"] = {
+        "grammar": {"total_errors": len(unique_grammar), "errors": unique_grammar},
+        "vocabulary": {"total_suggestions": len(unique_vocab), "suggestions": unique_vocab},
+        "pronunciation": {"total_issues": len(unique_pron), "issues": unique_pron}
+    }
+    
+    # Aggregate vocab CEFR words and WPM per turn
+    wpm_per_turn = []
+    vocab_overall = {
+        "A1": {"count": 0, "words": []},
+        "A2": {"count": 0, "words": []},
+        "B1": {"count": 0, "words": []},
+        "B2": {"count": 0, "words": []},
+        "C1": {"count": 0, "words": []},
+        "C2": {"count": 0, "words": []}
+    }
+    
+    for i, turn in enumerate(turn_feedback, 1):
+        # Track WPM per turn
+        fluency_data = turn.get("fluency") or {}
+        turn_wpm = fluency_data.get("wpm", 0) if fluency_data else 0
+        wpm_per_turn.append({"turn": i, "wpm": turn_wpm})
+        
+        # Aggregate CEFR vocabulary words
+        vocab_data = turn.get("vocabulary") or {}
+        cefr_dist = vocab_data.get("cefr_distribution", {}) if vocab_data else {}
+        for level in ["A1", "A2", "B1", "B2", "C1", "C2"]:
+            level_data = cefr_dist.get(level, {})
+            if isinstance(level_data, dict):
+                words = level_data.get("words", [])
+                if isinstance(words, list):
+                    vocab_overall[level]["words"].extend(words)
+                    # Count will be calculated after deduplication below
+    
+    # Deduplicate vocab words and calculate percentages
+    # Helper to get string from word (handles dict {"target": ..., "native": ...} or plain string)
+    def word_to_str(w):
+        if isinstance(w, dict):
+            return w.get("target", str(w))
+        return str(w) if w else ""
+    
+    # Deduplicate using string representation
+    for level in vocab_overall:
+        seen_words = set()
+        unique_words = []
+        for w in vocab_overall[level]["words"]:
+            w_str = word_to_str(w)
+            if w_str and w_str not in seen_words:
+                seen_words.add(w_str)
+                unique_words.append(w)
+        vocab_overall[level]["words"] = unique_words
+        vocab_overall[level]["count"] = len(unique_words)
+    
+    total_vocab_words = sum(vocab_overall[level]["count"] for level in vocab_overall)
+    for level in vocab_overall:
+        vocab_overall[level]["percentage"] = round((vocab_overall[level]["count"] / total_vocab_words * 100), 1) if total_vocab_words > 0 else 0
+    
+    feedback["wpm_per_turn"] = wpm_per_turn
+    feedback["vocab_overall"] = vocab_overall
+    
+    return feedback
 
-            if not chosen:
-                missing_tasks.append(task)
-                continue
 
-            q_meta = chosen.metadata or {}
-            raw_text = chosen.text
-            q_text = extract_only_question(raw_text)
-
-            q_entry = {
-                "id": chosen.id_,
-                "text": q_text,
-                "topic": task.get("topic", q_meta.get("topic")),
-                "difficulty": task.get("difficulty", "Medium"),
-                "type": task.get("type", q_meta.get("type", "MCQ")),
-                "marks": int(task.get("marks", 1)),
-                "options": q_meta.get("options", []),
-                "has_diagram": q_meta.get("diagram", False),
-                "diagram_paths": q_meta.get("diagram_paths", []),
-                "source": "rag"
-            }
-
-            _apply_task_defaults(q_entry, task)
-            all_questions.append(q_entry)
-            if q_entry.get("id"):
-                used_ids.add(q_entry.get("id"))
-
-        print(f"Got {len([q for q in all_questions if q.get('source') == 'rag'])} from RAG DB")
-
-    # =========================================================
-    # SOURCE 3: RAG Textbook
-    # =========================================================
-    if textbook_count:
-        print(f"Generating {textbook_count} questions from RAG Textbook...")
-        try:
-            textbook_questions = generate_questions_batch_via_textbook(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                tasks=tasks_textbook,
-                languages=languages
-            )
-        except Exception as e:
-            logger.warning("Textbook generation error: %s", e)
-            textbook_questions = []
-
-        for idx, task in enumerate(tasks_textbook):
-            if idx < len(textbook_questions):
-                q = textbook_questions[idx]
-                q["source"] = "textbook"
-                _apply_task_defaults(q, task)
-                all_questions.append(q)
-            else:
-                missing_tasks.append(task)
-        print(f"Got {len([q for q in all_questions if q.get('source') == 'textbook'])} from Textbook RAG")
-
-    # =========================================================
-    # SOURCE 4: Pure LLM
-    # =========================================================
-    if llm_count:
-        print(f"Generating {llm_count} questions via LLM...")
-        exam_upper = (exam or "").upper()
-        exam_examples = EXAM_EXAMPLES.get(exam_upper) or EXAM_EXAMPLES.get(exam) or []
-        if not isinstance(exam_examples, list):
-            exam_examples = []
-
-        try:
-            llm_questions = generate_questions_batch_llm_only_v2(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                tasks=tasks_llm,
-                languages=languages,
-                avoid_questions=[],
-                diversity_seed=random.randint(100000, 999999),
-                exam_examples=exam_examples
-            )
-        except Exception as e:
-            logger.warning("LLM generation error: %s", e)
-            llm_questions = []
-
-        for idx, task in enumerate(tasks_llm):
-            if idx < len(llm_questions):
-                q = llm_questions[idx]
-                q["source"] = "llm"
-                _apply_task_defaults(q, task)
-                all_questions.append(q)
-            else:
-                missing_tasks.append(task)
-        print(f"Got {len([q for q in all_questions if q.get('source') == 'llm'])} from LLM")
-
-    # =========================================================
-    # FALLBACK: Fill missing tasks via LLM
-    # =========================================================
-    if missing_tasks:
-        print(f"Generating {len(missing_tasks)} fallback questions via LLM...")
-        exam_upper = (exam or "").upper()
-        exam_examples = EXAM_EXAMPLES.get(exam_upper) or EXAM_EXAMPLES.get(exam) or []
-        if not isinstance(exam_examples, list):
-            exam_examples = []
-
-        try:
-            fallback_batch = generate_questions_batch_llm_only_v2(
-                country=country,
-                category=category,
-                exam=exam,
-                subject=subject,
-                tasks=missing_tasks,
-                languages=languages,
-                avoid_questions=[],
-                diversity_seed=random.randint(100000, 999999),
-                exam_examples=exam_examples
-            )
-        except Exception as e:
-            logger.warning("Fallback batch generation error: %s", e)
-            fallback_batch = []
-
-        for idx, task in enumerate(missing_tasks):
-            if idx < len(fallback_batch):
-                q = fallback_batch[idx]
-            else:
-                q = generate_question_via_llm(
-                    country=country,
-                    category=category,
-                    exam=exam,
-                    subject=subject,
-                    topic=task.get("topic"),
-                    qtype=task.get("type", "MCQ"),
-                    difficulty=task.get("difficulty", "Medium"),
-                    marks=int(task.get("marks", 1)),
-                    languages=languages
+@router.post("/faq/upload")
+async def upload_faq_excel(
+    file: UploadFile = File(...),
+    replace_all: bool = Form(default=False)
+):
+    """Upload FAQ questions from Excel/CSV"""
+    
+    content = await file.read()
+    try:
+        if file.filename.endswith('.xlsx') or file.filename.endswith('.xls'):
+            df = pd.read_excel(io.BytesIO(content))
+        elif file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            return {"status": "error", "message": "Unsupported format"}
+        
+        df.columns = df.columns.str.strip().str.lower()
+        if len(df.columns) >= 3:
+            df.rename(columns={df.columns[2]: 'sample_answer'}, inplace=True)
+        
+        required = ['category', 'question']
+        if not all(col in df.columns for col in required):
+            return {"status": "error", "message": f"Missing columns: {required}"}
+        
+        faq_items = []
+        for _, row in df.iterrows():
+            faq_items.append({
+                "category": str(row['category']).strip(),
+                "question": str(row['question']).strip(),
+                "sample_answer": str(row.get('sample_answer', '')).strip() if pd.notna(row.get('sample_answer')) else None,
+                "min_time": int(row.get('min_time', 30)) if pd.notna(row.get('min_time')) else 30,
+                "max_time": int(row.get('max_time', 90)) if pd.notna(row.get('max_time')) else 90
+            })
+        
+        async with async_session() as sess:
+            if replace_all:
+                await sess.execute(text("DELETE FROM faq_questions"))
+            
+            for item in faq_items:
+                await sess.execute(
+                    text("INSERT INTO faq_questions (category, question, sample_answer, min_time, max_time) VALUES (:c, :q, :s, :mi, :ma)"),
+                    {"c": item['category'], "q": item['question'], "s": item['sample_answer'], "mi": item['min_time'], "ma": item['max_time']}
                 )
-            q["source"] = "llm_fallback"
-            _apply_task_defaults(q, task)
-            all_questions.append(q)
+            await sess.commit()
+        
+        return {"status": "success", "count": len(faq_items)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+@router.get("/faq_question_sessinons/{question_id}")
 
-    # =========================================================
-    # SHUFFLE and VALIDATE
-    # =========================================================
-    random.shuffle(all_questions)
-    all_questions = all_questions[:total_questions]
-
-    validated_questions = [
-        validate_or_regenerate_question(q, country, category, exam, subject, languages)
-        for q in all_questions
-    ]
-
-    def estimate_time(q):
-        qtype = (q.get('type') or 'MCQ').upper()
-        difficulty = (q.get('difficulty') or 'Medium').lower()
-        base = 1.0
-        if qtype == 'NVT':
-            base = 3.0
-        if difficulty == 'medium':
-            base *= 1.5
-        if difficulty == 'hard':
-            base *= 2.5
-        if q.get('has_diagram'):
-            base += 0.5
-        return float(base)
-
-    for q in validated_questions:
-        q['est_time_min'] = estimate_time(q)
-
-    total_est_time = sum([q.get('est_time_min', 1.0) for q in validated_questions])
-
-    source_counts = {}
-    for q in validated_questions:
-        src = q.get('source', 'unknown')
-        source_counts[src] = source_counts.get(src, 0) + 1
-
-    print(f"Final Question Distribution by Source: {source_counts}")
-
+async def get_faq_question_sessions(
+    question_id: int,
+    current_user: User = Depends(get_current_user)
+):  
+    """
+    Get all session IDs and details for a specific FAQ question for the current user.
+    Returns session history to use with /faq_feedback endpoint.
+    """
+    user_id = current_user.id
+    
+    # Get all user's FAQ sessions
+    all_sessions = await db.get_sessions_by_user_id(user_id, session_type="faq")
+    
+    # Filter for this specific question
+    question_sessions = []
+    for session in all_sessions:
+        if session.get("question_id") == question_id:
+            question_sessions.append({
+                "session_id": session["session_id"],
+                "attempt_count": session.get("attempt_count", 0),
+                "overall_score": session.get("overall_score"),
+                "status": session.get("status", "unknown"),
+                "created_at": session.get("created_at"),
+                "updated_at": session.get("updated_at")
+            })
+    
+    if not question_sessions:
+        # Get question details even if no sessions exist
+        async with async_session() as sess:
+            result = await sess.execute(
+                text("SELECT id, category, question FROM faq_questions WHERE id = :qid"),
+                {"qid": question_id}
+            )
+            row = result.fetchone()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Question ID {question_id} not found")
+        
+        return {
+            "user_id": user_id,
+            "question_id": question_id,
+            "question": row[2],
+            "category": row[1],
+            "total_sessions": 0,
+            "sessions": [],
+            "message": "No practice sessions found for this question yet"
+        }
+    
+    # Get question details
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("SELECT id, category, question FROM faq_questions WHERE id = :qid"),
+            {"qid": question_id}
+        )
+        row = result.fetchone()
+    
     return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': datetime.utcnow().isoformat() + 'Z',
-        'questions': validated_questions,
-        'total_questions': len(validated_questions),
-        'estimated_duration_minutes': round(total_est_time, 1),
-        'pattern_used': pattern,
-        'source_distribution': source_counts
+        "user_id": user_id,
+        "question_id": question_id,
+        "question": row[2] if row else None,
+        "category": row[1] if row else None,
+        "total_sessions": len(question_sessions),
+        "sessions": sorted(question_sessions, key=lambda x: x.get("created_at", ""), reverse=True)
     }
 
-# Backward-compatible alias to use the improved mixer by default
-assemble_test_mixed = assemble_test_mixed_v2
 
-def validate_or_regenerate_question(q, country, category, exam, subject, languages):
-    if not q.get("text") or q.get("text").strip() == "" or q.get("topic") in [None, "", "Unknown"]:
-        topic = q.get("topic") if q.get("topic") not in [None, "", "Unknown"] else "Any"
-        return generate_question_via_llm(
-            country, category, exam, subject,
-            topic, q.get("type", "MCQ"),
-            q.get("difficulty", "Medium"),
-            int(q.get("marks", 1)),
-            languages
-        )
-    return q
-# =========================
-# Main Entry
-# =========================
-if __name__ == "__main__":
-    pdf_path =r"C:\Users\llmengine\Desktop\image\bitsat.pdf"  # your PDF path
-    question_year = input("Enter the previous question year: ")
-    year_for_question_gen = input("Enter the exam year: ")
-    country = input("Enter country (e.g., India): ").strip()
-    category = input("Enter category (e.g., medical, engineering): ").strip()
-    exam = input("Enter exam name (e.g., NEET, UPSC): ").strip()
-    subject = input("Enter subject (e.g., Biology, Physics): ").strip()
-    # data = extract_text_and_images_from_pdf(pdf_path, exam)
-    # process_json(data, exam, question_year)
-    interactive_run(country, category, exam, subject, year_for_question_gen)
-    # convert_batch_to_format("generated_test_IIT JEE_Mathematics.json", "formatted_input_for_docx.json")
-    #formatted_data = convert_batch_to_format("generated_test_IIT JEE_Mathematics.json", None)
-    # If JSON is in a file
-    #generate_question_paper_docx(batch_json_path="generated_test_IIT JEE_Mathematics.json",output_docx_path="Formatted_Question_Paper.docx",include_answers=True)
-
-    # Or if you already have Python dict/list
-    #generate_question_paper_docx(batch_data=formatted_data, output_docx_path="Formatted_Question_Paper.docx")
-    #update_exam_from_pdf(pdf_path="2025_1_English.pdf",json_path="generated_test_IIT JEE_Mathematics.json")
-
-
-
-
-def assqqemble_test_llm(
-    country: str, category: str, exam: str, subject: str,
-    pattern: Dict[str, Any], total_questions: Optional[int] = None,
-    languages: Optional[List[str]] = None,
-    bank_df: Optional[Any] = None,  # ✅ Add question bank DataFrame
-    fallback_to_llm: bool = True,
-    parallel: bool = False  # No need for parallel here if generating one-by-one
-) -> Dict[str, Any]:
-    languages = languages or ['en']
-    if total_questions is None:
-        total_questions = int(float(pattern.get('avg_total_questions', 20)))
-
-    # Build tasks based on pattern
-    topic_distribution = pattern.get('topic_distribution', {})
-    diff_dist = pattern.get('difficulty_distribution', {'Easy': 0.4, 'Medium': 0.45, 'Hard': 0.15})
-    type_order = list(pattern.get('type_distribution', {}).keys()) or ['MCQ']
-
-    tasks = []
-    quotas = {topic: int(round(total_questions * float(pct))) for topic, pct in topic_distribution.items()}
-    for topic, qcount in quotas.items():
-        for diff_name, diff_pct in diff_dist.items():
-            needed = int(round(qcount * float(diff_pct)))
-            for _ in range(needed):
-                tasks.append({'topic': topic, 'type': type_order, 'difficulty': diff_name, 'marks': int(pattern.get('avg_marks', 1))})
-
-    while len(tasks) < total_questions:
-        top_topic = max(topic_distribution, key=topic_distribution.get)
-        tasks.append({'topic': top_topic, 'type': type_order, 'difficulty': sample_difficulty(diff_dist), 'marks': int(pattern.get('avg_marks', 1))})
-
-    # ✅ Generate questions one-by-one via LLM
-    generated_questions = []
-
-    for t in tasks:
-        # Generate a question for each task
-        question = generate_question_via_llm(
-            country=country,
-            category=category,
-            exam=exam,
-            subject=subject,
-            topic=t["topic"],
-            qtype=t.get("type", "MCQ"),
-            difficulty=t.get("difficulty", "Medium"),
-            marks=int(t.get("marks", 1)),
-            languages=languages
-        )
-        generated_questions.append(question)
-
-    # Ensure we return only the required number of questions
-    generated_questions = generated_questions[:total_questions]
-
-    return {
-        'country': country,
-        'category': category,
-        'exam': exam,
-        'subject': subject,
-        'generated_at': time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        'questions': generated_questions,
-        'total_questions': len(generated_questions),
-        'pattern_used': pattern
+@router.get("/faq_feedback_v2")
+async def get_faq_feedback(
+    session_id: Optional[str] = None,
+    question_id: Optional[int] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get structured feedback for a FAQ session (all attempts + overall feedback).
+    Can use either session_id OR user_id+question_id.
+    
+    AUTO-GENERATES final feedback if session was never ended with action='end'.
+    """
+    
+    user_id = current_user.id if current_user else None
+    if not session_id and user_id and question_id:
+        user_sessions = await db.get_sessions_by_user_id(user_id, session_type="faq")
+        for s in user_sessions:
+            if s.get("question_id") == question_id:
+                session_id = s["session_id"]
+                break
+    
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Provide session_id or user_id+question_id")
+    
+    feedback = await db.get_session_feedback(session_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    # Get full session data for auto-generating final feedback if needed
+    session_data = await db.get_user_session(session_id)
+    attempts = session_data.get("attempts", []) if session_data else []
+    
+    # AUTO-GENERATE FINAL FEEDBACK if it doesn't exist
+    if not feedback.get("final_feedback") and attempts:
+        logger.info(f"Auto-generating final feedback for session {session_id}")
+        summary = await generate_session_summary(session_data, model="gpt")
+        native = session_data.get("native_lang", "en")
+        final_feedback = await make_bilingual(summary, "en", native)
+        
+        # Save it back to session
+        session_data["final_feedback"] = final_feedback
+        session_data["status"] = "paused"  # Mark as paused if it wasn't already
+        await db.update_session(session_id, session_data, overall_score=summary.get("best_score"))
+        
+        # Add to response
+        feedback["final_feedback"] = final_feedback
+    
+    grammar_errors = []
+    vocabulary_suggestions = []
+    pronunciation_issues = []
+    
+    turn_feedback = feedback.get("turn_feedback", [])
+    
+    for turn in turn_feedback:
+        # Grammar errors
+        grammar = turn.get("grammar") or {}
+        for err in grammar.get("errors", []):
+            if isinstance(err, dict):
+                grammar_errors.append({
+                    "wrong": err.get("you_said", err.get("wrong_word", "")),
+                    "correct": err.get("should_be", err.get("correct_word", ""))
+                })
+        
+        # Vocabulary suggestions
+        vocab = turn.get("vocabulary") or {}
+        for sug in vocab.get("suggestions", []):
+            if isinstance(sug, dict):
+                vocabulary_suggestions.append({
+                    "weak_word": sug.get("word", sug.get("weak_word", "")),
+                    "better_options": sug.get("better_options", sug.get("better_word", []))
+                })
+        
+        # Pronunciation issues
+        pron = turn.get("pronunciation") or {}
+        if isinstance(pron, dict):
+            for word in pron.get("words_to_practice", []):
+                if isinstance(word, dict):
+                    pronunciation_issues.append({"word": word.get("word", ""), "issue": word.get("issue", "needs practice")})
+                elif isinstance(word, str):
+                    pronunciation_issues.append({"word": word, "issue": "needs practice"})
+    
+    # Remove duplicates - convert dicts to strings for hashability (bilingual values are dicts)
+    def make_hashable(val):
+        if isinstance(val, dict):
+            target = val.get("target")
+            if isinstance(target, dict):
+                target = target.get("target")
+            if isinstance(target, (str, int, float)):
+                return str(target)
+            word = val.get("word")
+            if isinstance(word, (str, int, float)):
+                return str(word)
+            try:
+                return json.dumps(val, sort_keys=True)
+            except Exception:
+                return str(val)
+        if isinstance(val, list):
+            return tuple(make_hashable(v) for v in val)
+        return val
+    
+    seen = set()
+    unique_grammar = []
+    for g in grammar_errors:
+        wrong_val = make_hashable(g.get("wrong"))
+        correct_val = make_hashable(g.get("correct"))
+        if wrong_val and (wrong_val, correct_val) not in seen:
+            seen.add((wrong_val, correct_val))
+            unique_grammar.append(g)
+    
+    seen = set()
+    unique_vocab = []
+    for v in vocabulary_suggestions:
+        weak_word = make_hashable(v.get("weak_word"))
+        if weak_word and weak_word not in seen:
+            seen.add(weak_word)
+            unique_vocab.append(v)
+    
+    seen = set()
+    unique_pron = []
+    for p in pronunciation_issues:
+        word = make_hashable(p.get("word"))
+        if word and word not in seen:
+            seen.add(word)
+            unique_pron.append(p)
+    
+    # Add summary to feedback response
+    feedback["summary"] = {
+        "grammar": {"total_errors": len(unique_grammar), "errors": unique_grammar},
+        "vocabulary": {"total_suggestions": len(unique_vocab), "suggestions": unique_vocab},
+        "pronunciation": {"total_issues": len(unique_pron), "issues": unique_pron}
     }
+    
+    # Aggregate vocab CEFR words and WPM per turn
+    wpm_per_turn = []
+    vocab_overall = {
+        "A1": {"count": 0, "words": []},
+        "A2": {"count": 0, "words": []},
+        "B1": {"count": 0, "words": []},
+        "B2": {"count": 0, "words": []},
+        "C1": {"count": 0, "words": []},
+        "C2": {"count": 0, "words": []}
+    }
+    
+    for i, turn in enumerate(turn_feedback, 1):
+        # Track WPM per turn
+        fluency_data = turn.get("fluency") or {}
+        turn_wpm = fluency_data.get("wpm", 0) if fluency_data else 0
+        wpm_per_turn.append({"turn": i, "wpm": turn_wpm})
+        
+        # Aggregate CEFR vocabulary words
+        vocab_data = turn.get("vocabulary") or {}
+        cefr_dist = vocab_data.get("cefr_distribution", {}) if vocab_data else {}
+        for level in ["A1", "A2", "B1", "B2", "C1", "C2"]:
+            level_data = cefr_dist.get(level, {})
+            if isinstance(level_data, dict):
+                words = level_data.get("words", [])
+                if isinstance(words, list):
+                    vocab_overall[level]["words"].extend(words)
+                    # Count will be calculated after deduplication below
+    
+    # Deduplicate vocab words and calculate percentages
+    # Helper to get string from word (handles dict {"target": ..., "native": ...} or plain string)
+    def word_to_str(w):
+        if isinstance(w, dict):
+            return w.get("target", str(w))
+        return str(w) if w else ""
+    
+    # Deduplicate using string representation
+    for level in vocab_overall:
+        seen_words = set()
+        unique_words = []
+        for w in vocab_overall[level]["words"]:
+            w_str = word_to_str(w)
+            if w_str and w_str not in seen_words:
+                seen_words.add(w_str)
+                unique_words.append(w)
+        vocab_overall[level]["words"] = unique_words
+        vocab_overall[level]["count"] = len(unique_words)
+    
+    total_vocab_words = sum(vocab_overall[level]["count"] for level in vocab_overall)
+    for level in vocab_overall:
+        vocab_overall[level]["percentage"] = round((vocab_overall[level]["count"] / total_vocab_words * 100), 1) if total_vocab_words > 0 else 0
+    
+    feedback["wpm_per_turn"] = wpm_per_turn
+    feedback["vocab_overall"] = vocab_overall
+    
+    return feedback
