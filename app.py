@@ -1,72 +1,42 @@
-@router.get("/user_scenarios")
-async def get_user_scenarios(
+@router.get("/user_sessions")
+async def get_interview_sessions_by_user(
+    role: Optional[str] = None,
     current_user: User = Depends(get_current_user)
 ):
     """
-    Get all unique scenarios the user has practiced from their session data in DB.
-    Returns list of scenarios with count of sessions for each.
-    """
-    user_id = current_user.id
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="fluent")
+    Get all Interview sessions for the authenticated user.
     
-    # Extract scenarios from each session
-    scenario_counts = {}
-    for session in sessions:
-        session_data = await db.get_user_session(session.get("session_id"))
-        if session_data:
-            scenario = session_data.get("scenario")
-            if scenario:
-                scenario_counts[scenario] = scenario_counts.get(scenario, 0) + 1
-    
-    # Build response with scenario details
-    scenarios = [
-        {"scenario": sc, "practice_count": count, "display_name": sc.replace("_", " ").title()}
-        for sc, count in scenario_counts.items()
-    ]
-    
-    # Sort by practice count (most practiced first)
-    scenarios.sort(key=lambda x: x["practice_count"], reverse=True)
-    
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_unique_scenarios": len(scenarios),
-        "scenarios": scenarios
-    }
-   
-
-@router.get("/user_roles")
-async def get_user_roles(
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get all unique job roles the user has practiced from their session data in DB.
-    Returns list of roles with count of sessions for each.
+    Optionally filter by role (e.g., 'software', 'marketing', 'sales').
+    Returns sessions with session_ids included.
     """
     user_id = current_user.id if current_user else None
     sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
     
-    # Extract roles from each session
-    role_counts = {}
-    for session in sessions:
-        session_data = await db.get_user_session(session.get("session_id"))
-        if session_data:
-            role = session_data.get("role")
-            if role:
-                role_counts[role] = role_counts.get(role, 0) + 1
     
-    # Build response with role details
-    roles = [
-        {"role": r, "practice_count": count, "display_name": r.replace("_", " ").title()}
-        for r, count in role_counts.items()
-    ]
+    if role:
+        filtered_sessions = []
+        for session in sessions:
+            session_data = await db.get_user_session(session.get("session_id"))
+            if session_data and session_data.get("role") == role:
+                session["role"] = role
+                filtered_sessions.append(session)
+        sessions = filtered_sessions
+    else:
+        
+        for session in sessions:
+            session_data = await db.get_user_session(session.get("session_id"))
+            if session_data:
+                session["role"] = session_data.get("role", "unknown")
     
-    # Sort by practice count (most practiced first)
-    roles.sort(key=lambda x: x["practice_count"], reverse=True)
+    for idx, session in enumerate(sessions, 1):
+        session["session_number"] = f"Session {idx}"
+    
+    session_ids = [s.get("session_id") for s in sessions]
     
     return {
-        "status": "success",
         "user_id": user_id,
-        "total_unique_roles": len(roles),
-        "roles": roles
+        "total_sessions": len(sessions),
+        "filter": {"role": role} if role else None,
+        "session_ids": session_ids,
+        "sessions": sessions
     }
