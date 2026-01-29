@@ -1,5 +1,38 @@
-{
-    "conversation": "Please choose the topic from available topics and continue\n\nContinuing with the topic 'Climate Change'. Please enter time and start the discussion.\n\nTopic chosen for discussion is Climate Change. To start the discussion please provide your initial input on the topic.\n\nVijeta input: um like what evaporation is and how does it works?\nAakash responds: Oh, evaporation is actually a pretty key part of the whole climate system! It's basically when water turns from liquid to vapor and rises into the air. Think of it like when you leave a puddle out in the sun and it slowly disappears—that's evaporation doing its thing. This process helps move heat around the planet because it takes energy to turn water into vapor, which cools the surface, and then when that vapor condenses back into clouds, it releases heat higher up in the atmosphere. So, evaporation isn't just about water disappearing; it's a big player in weather patterns and even climate change. Without it, we wouldn't have rain or storms, which are crucial for ecosystems and agriculture. Pretty wild how something so simple connects to the bigger climate picture, right?\n\nVijeta input: I doesnt understand fully what evaporation does in global warming, I think it is not related much?\nAakash responds: Oh, evaporation is basically when a liquid, like water, turns into vapor and rises into the air. It's a key part of the water cycle—think of puddles drying up after rain or sweat disappearing from your skin on a hot day. In terms of climate change, evaporation plays a big role because warmer temperatures speed it up, which can mess with weather patterns and even lead to more intense storms. It's wild how something as simple as water turning into vapor can have such a huge impact on the planet!\n\nArpita responds: Totally! It's crazy to think about how evaporation isn't just some random thing but actually a major player in the whole climate system. And when you factor in things like deforestation or urban heat islands, it gets even more complicated because those can change how much water evaporates locally. Plus, with more evaporation, you get more moisture in the air, which can fuel storms like hurricanes. It's like the atmosphere's way of turning up the drama! Makes you appreciate how delicate the balance really is.\n\nVijeta interrupt input: you know basically I goes to school everyday and we learns about this but I didnt knew it was so important, like I mean the teacher she dont explain it good.\nArpita responds: Oh, global warming is basically the gradual increase in Earth's average temperature, mostly because of human activities like burning fossil fuels, deforestation, and industrial processes. These activities release greenhouse gases like carbon dioxide and methane into the atmosphere, trapping heat and causing the planet to warm up. It's a big deal because it leads to melting ice caps, rising sea levels, extreme weather, and all sorts of disruptions to ecosystems and human life. Have you noticed how summers seem way hotter than they used to be? It's kind of scary when you think about the long-term effects.\n\nSatish responds: Totally, Arpita. It's wild how just a few decades ago, a really hot summer was a bit of a novelty, and now it feels like the new normal. What really gets me is how interconnected everything is—like, melting ice caps don't just mean less ice; they mess with ocean currents, which can throw weather patterns completely out of whack. It's like the planet's trying to tell us something, but we're still debating whether to listen. Have you guys noticed any changes in your local weather or environment?\n\nVijeta input: yeah actually I thinked about it and um the weather is more hotter now, we should do something for protect the environment.",
-    "category": "Climate Change",
-    "topic": "Global Warming Discussion"
-}
+   async def get_pronunciation_vocab(self, set_number: int = None) -> list:
+        """Fetch pronunciation vocabulary from database, optionally filtered by set"""
+        await self.init_db()
+        async with async_session() as sess:
+            if set_number:
+                result = await sess.execute(
+                    text("SELECT word, meaning_en, sentences FROM pronunciation_vocab WHERE set_number = :set_num"),
+                    {"set_num": set_number}
+                )
+            else:
+                result = await sess.execute(
+                    text("SELECT word, meaning_en, sentences FROM pronunciation_vocab")
+                )
+            rows = result.fetchall()
+            vocab_list = []
+            for r in rows:
+                # Handle sentences - may be list or JSON string (possibly doubly-serialized)
+                sentences_raw = r[2]
+                if isinstance(sentences_raw, list):
+                    sentences = sentences_raw
+                elif isinstance(sentences_raw, str):
+                    try:
+                        parsed = json.loads(sentences_raw)
+                        # Handle doubly-serialized JSON string
+                        if isinstance(parsed, str):
+                            parsed = json.loads(parsed)
+                        sentences = parsed if isinstance(parsed, list) else []
+                    except (json.JSONDecodeError, TypeError):
+                        sentences = []
+                else:
+                    sentences = []
+                
+                vocab_list.append({
+                    "word": r[0],
+                    "meaning_en": r[1] or "",
+                    "sentences": sentences
+                })
+            return vocab_list
