@@ -1,100 +1,75 @@
-    async def get_distinct_roles_by_user(self, user_id: int, session_type: str = "interview") -> list:
-        """Get distinct roles from data column for a user/session_type"""
-        if user_id is None:
-            return []
-        await self.init_db()
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("""
-                    SELECT DISTINCT (data->>'role')
-                    FROM user_chat_sessions
-                    WHERE user_id = :uid
-                      AND session_type = :stype
-                      AND data->>'role' IS NOT NULL
-                    ORDER BY (data->>'role')
-                """),
-                {"uid": user_id, "stype": session_type}
-            )
-            return [r[0] for r in result.fetchall() if r[0]]
-
-    async def get_distinct_scenarios_by_user(self, user_id: int, session_type: str = "fluent") -> list:
-        """Get distinct scenarios from data column for a user/session_type"""
-        if user_id is None:
-            return []
-        await self.init_db()
-        async with async_session() as sess:
-            result = await sess.execute(
-                text("""
-                    SELECT DISTINCT (data->>'scenario')
-                    FROM user_chat_sessions
-                    WHERE user_id = :uid
-                      AND session_type = :stype
-                      AND data->>'scenario' IS NOT NULL
-                    ORDER BY (data->>'scenario')
-                """),
-                {"uid": user_id, "stype": session_type}
-            )
-            return [r[0] for r in result.fetchall() if r[0]]
 @router.get("/scenarios")
 async def get_user_scenarios_from_db(current_user: User = Depends(get_current_user)):
     """
     Get distinct scenarios practiced by the current user from DB session data.
+    Excludes scenarios that match context_names from ChatManagement table.
     """
     user_id = current_user.id if current_user else None
     scenarios = await db.get_distinct_scenarios_by_user(user_id, session_type="fluent")
+    
+    # Get context_names from ChatManagement to filter out
+    try:
+        context_names = await db.get_chat_management_context_names()
+        # Filter out scenarios that match any context_name (case-insensitive)
+        context_names_lower = [cn.lower() for cn in context_names]
+        filtered_scenarios = [s for s in scenarios if s.lower() not in context_names_lower]
+    except Exception:
+        # If ChatManagement table doesn't exist or query fails, return all scenarios
+        filtered_scenarios = scenarios
+    
     return {
         "status": "success",
         "user_id": user_id,
-        "total_scenarios": len(scenarios),
-        "scenarios": scenarios
+        "total_scenarios": len(filtered_scenarios),
+        "scenarios": filtered_scenarios
     }
-@router.get("/roles")
-async def get_user_roles_from_db(current_user: User = Depends(get_current_user)):
+@router.get("/scenarios")
+async def get_user_scenarios_from_db(current_user: User = Depends(get_current_user)):
     """
-    Get distinct job roles practiced by the current user from DB session data.
+    Get distinct scenarios practiced by the current user from DB session data.
+    Excludes scenarios that match context_names from ChatManagement table.
     """
+    from utils.db import SessionLocal
+    from sqlalchemy import text
+    import asyncio
+    
     user_id = current_user.id if current_user else None
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
+    scenarios = await db.get_distinct_scenarios_by_user(user_id, session_type="fluent")
+    
+    # Get context_names from ChatManagement (sync db) to filter out
+    def get_context_names_sync():
+        sync_db = SessionLocal()
+        try:
+            result = sync_db.execute(text("SELECT DISTINCT context_name FROM chat_management WHERE context_name IS NOT NULL"))
+            return [r[0] for r in result.fetchall() if r[0]]
+        finally:
+            sync_db.close()
+    
+    try:
+        loop = asyncio.get_event_loop()
+        context_names = await loop.run_in_executor(None, get_context_names_sync)
+        # Filter out scenarios that match any context_name (case-insensitive)
+        context_names_lower = [cn.lower() for cn in context_names]
+        filtered_scenarios = [s for s in scenarios if s.lower() not in context_names_lower]
+    except Exception:
+        # If ChatManagement table doesn't exist or query fails, return all scenarios
+        filtered_scenarios = scenarios
+    
     return {
         "status": "success",
         "user_id": user_id,
-        "total_roles": len(roles),
-        "roles": roles
+        "total_scenarios": len(filtered_scenarios),
+        "scenarios": filtered_scenarios
     }
 
-@router.get("/session_ids_by_role")
-async def get_interview_session_ids_by_role(
-    role: str,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get session IDs for interview sessions filtered by role for the current user.
-    """
-    user_id = current_user.id if current_user else None
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
 
-    ids = []
-    for s in sessions:
-        data = await db.get_user_session(s.get("session_id"))
-        if data and data.get("role") == role:
-            ids.append(s.get("session_id"))
+            return sessions
 
-    return {"user_id": user_id, "role": role, "session_ids": ids}
-@router.get("/session_ids_by_scenario")
-async def get_fluent_session_ids_by_scenario(
-    scenario: str,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get session IDs for fluent sessions filtered by scenario for the current user.
-    """
-    user_id = current_user.id if current_user else None
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="fluent")
-
-    ids = []
-    for s in sessions:
-        data = await db.get_user_session(s.get("session_id"))
-        if data and data.get("scenario") == scenario:
-            ids.append(s.get("session_id"))
-
-    return {"user_id": user_id, "scenario": scenario, "session_ids": ids}
+    async def get_chat_management_context_names(self) -> list:
+        """Get all context_names from chat_management table for filtering"""
+        await self.init_db()
+        async with async_session() as sess:
+            result = await sess.execute(
+                text("SELECT DISTINCT context_name FROM chat_management WHERE context_name IS NOT NULL")
+            )
+            return [r[0] for
