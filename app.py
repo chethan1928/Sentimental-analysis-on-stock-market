@@ -1,831 +1,261 @@
-@router.post("/practice_pronunciation")
-async def practice_pronunciation(
-    name: str = Form(default="User"),
-    level: str = Form(default="B1"),
-    mode: str = Form(default="normal"),
-    native_language: str = Form(...),  
-    target_lang: str = Form(default="en"),  
-    topic: str = Form(default="daily life"),
-    num_words: int = Form(default=5),
-    set_number: int = Form(default=None),  
-    audio_file: Optional[UploadFile] = File(default=None),
-    session_id: Optional[str] = Form(default=None),
-    action: Optional[str] = Form(default=None),
-    model: Optional[str] = Form(default="gpt"),
-    voice_id: Optional[str] = Form(default=None),
-    request: Request = None,
-    current_user: User = Depends(get_current_user),
-):
-
-    """
-    pronunciation practice api - handles word and sentence practice
+async def transcribe_audio_file(audio_file, target_lang: str = "en") -> str:
+    """Helper function to transcribe audio file using Whisper - eliminates code duplication"""
+    audio_file.file.seek(0)
+    logger.info(f"[transcribe_audio_file] Starting transcription, target_lang: {target_lang}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
+        shutil.copyfileobj(audio_file.file, tmp)
+        temp_upload = tmp.name
+    logger.info(f"[transcribe_audio_file] Audio saved to temp: {temp_upload}, size: {os.path.getsize(temp_upload)} bytes")
     
-    modes:
-    - normal: llm-generated lessons with full analysis
-    - strict: vocab file based with 15 words, 3 sentences each
-    
-    flow:
-    1. first call (no audio): creates session, returns first word
-    2. with audio: analyzes pronunciation, returns feedback
-    3. action="next": skip to next word/sentence
-    4. action="end": end session early
-    """
-    
+    audio_path = None
     try:
         
-        if action == "end" and session_id:
-            session = await db.get_user_session(session_id)
-            if session:
-                summary = await generate_session_summary(session, model=model)
-                native_lang = session.get("native_language", "en")
-                summary_bilingual = await make_bilingual(summary, "en", native_lang)
-                msg_en = "Session ended. Great practice!"
-                msg_native = await translate_text(msg_en, "en", native_lang)
-                
-                # Build response first, then save it
-                response = {
-                    "status": "complete",
-                    "session_id": session_id,
-                    "target_lang": session.get("target_lang", "en"),
-                    "native_lang": native_lang,
-                    "is_session_complete": True,
-                    "session_summary": summary_bilingual,
-                    "message": {"target": msg_en, "native": msg_native}
-                }
-                
-                await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
-                
-                return response
-            else:
-                
-                return {
-                    "status": "error",
-                    "session_id": session_id,
-                    "error": "Session not found or already expired. Cannot end a non-existent session."
-                }
+        def convert_audio():
+            audio = AudioSegment.from_file(temp_upload)
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            converted_path = temp_upload.replace('.tmp', '_converted.wav')
+            audio.export(converted_path, format="wav")
+            return converted_path
         
+        audio_path = await asyncio.to_thread(convert_audio)
+        logger.info(f"[transcribe_audio_file] Converted audio: {audio_path}, size: {os.path.getsize(audio_path)} bytes")
+        os.unlink(temp_upload)  
         
-        session = None
-        if session_id:
-            session = await db.get_user_session(session_id)
+        # Auto-detect language from audio (don't force to target_lang)
+        segments, _ = await asyncio.to_thread(_whisper_model.transcribe, audio_path)
+        user_text = " ".join([seg.text for seg in segments]).strip()
+        logger.info(f"[transcribe_audio_file] Transcription result: '{user_text[:100] if user_text else 'empty'}'")
         
-        
-        if session and session.get("status") == "completed":
-            return {"status": "error", "session_id": session_id, "error": "This session has ended. Please start a new session."}
-        
-        if not session:
-            session_id = str(uuid.uuid4())
-            
-            
-            if mode == "strict":
-                lesson = await build_lesson_strict(target_lang, num_words, set_number=set_number, model=model)
-            else:
-                lesson = await generate_lesson_llm(topic, num_words, target_lang, model=model)
-            
-            if not lesson:
-                return {
-                    "status": "error",
-                    "message": "failed to generate lesson. please try again."
-                }
-            
-            
-            session = {
-                "user_name": name,
-                "mode": mode,
-                "level": level,
-                "native_language": native_language,  
-                "target_lang": target_lang,
-                "topic": topic,
-                "lesson": lesson,
-                "current_word_index": 0,
-                "current_phase": "word",
-                "current_sentence_index": 0,
-                "attempt_count": 0,
-                "history": [],
-                "scores": {"pronunciation": []},
-                "total_words": len(lesson),
-                "turn_history": []
-            }
-            await db.create_session(
-                session_id=session_id,
-                session_type="pronunciation",
-                data=session,
-                user_id=current_user.id if current_user else None,
-                user_name=name
-            )
-            
-            
-            first_word = lesson[0]
-            
-            
-            greeting_en = f"Hi {name}! I'm Sara. Let's practice pronunciation together. Relax and speak naturally."
-            instruction_en = f"Listen carefully and repeat after me: {first_word['word']}"
-            greeting_native = await translate_text(greeting_en, "en", native_language)
-            instruction_native = await translate_text(instruction_en, "en", native_language)
-            
-            # Generate TTS audio URLs for greeting
-            greeting_audio = ""
-            if request:
-                greeting_audio = await generate_tts_url(request, greeting_en, target_lang, voice_id=voice_id)
-            
-            meaning_native = first_word.get(f"meaning_{native_language}", "")
-            if not meaning_native:
-                meaning_native = await translate_text(first_word.get("meaning_en") or first_word["word"], "en", native_language)
-            
-            return {
-                "status": "new_session",
-                "session_id": session_id,
-                "target_lang": target_lang,
-                "native_lang": native_language,
-                "mode": mode,
-                "greeting": {"target": greeting_en, "native": greeting_native, "audio_url": greeting_audio},
-                "current_word": {
-                    "word": first_word["word"],
-                    "meaning": {
-                        "target": first_word.get("meaning_en", ""),
-                        "native": meaning_native
-                    },
-                    "instruction": {"target": instruction_en, "native": instruction_native}
-                },
-                "phase": "word",
-                "attempt_number": 1,
-                "max_attempts": MAX_ATTEMPTS,
-                "progress": {
-                    "current_word_index": 1,
-                    "total_words": len(lesson),
-                    "completed_words": []
-                }
-            }
-        
-        
-        lesson = session["lesson"]
-        current_idx = session["current_word_index"]
-        current_phase = session["current_phase"]
-        current_word = lesson[current_idx]
-        
-        
-        
-        native_lang = session.get("native_language", "en")
-        
-        if action == "next":
-            
-            session_mode = session.get("mode", "normal")
-            
-            if current_phase == "word":
-                
-                session["current_phase"] = "sentence"
-                session["current_sentence_index"] = 0
-                session["attempt_count"] = 0
-                
-                instruction_en = "Now practice this sentence."
-                instruction_native = await translate_text(instruction_en, "en", native_lang)
-                
-                
-                if "sentences" in current_word and current_word["sentences"]:
-                    sentence = current_word["sentences"][0]
-                    sentence_en = safe_get_sentence_text(sentence, "en")
-                    sentence_native = safe_get_sentence_text(sentence, native_lang) or await translate_text(sentence_en, "en", native_lang)
-                    
-                    
-                    await db.update_session(session_id, session)
-                    
-                    return {
-                        "status": "next_phase",
-                        "session_id": session_id,
-                        "target_lang": session.get("target_lang", "en"),
-                        "native_lang": native_lang,
-                        "current_word": {"word": current_word["word"]},
-                        "current_sentence": {
-                            "text": {"target": sentence_en, "native": sentence_native}
-                        },
-                        "phase": "sentence",
-                        "sentence_number": 1,
-                        "total_sentences": len(current_word["sentences"]),
-                        "instruction": {"target": instruction_en, "native": instruction_native},
-                        "progress": {
-                            "current_word_index": current_idx + 1,
-                            "total_words": len(lesson)
-                        }
-                    }
-                else:
-                    
-                    sentence_en = current_word.get("sentence", f"Practice saying {current_word['word']}.")
-                    sentence_native = await translate_text(sentence_en, "en", native_lang)
-                    
-                    
-                    await db.update_session(session_id, session)
-                    
-                    return {
-                        "status": "next_phase",
-                        "session_id": session_id,
-                        "target_lang": session.get("target_lang", "en"),
-                        "native_lang": native_lang,
-                        "current_word": {"word": current_word["word"]},
-                        "current_sentence": {
-                            "text": {"target": sentence_en, "native": sentence_native}
-                        },
-                        "phase": "sentence",
-                        "sentence_number": 1,
-                        "total_sentences": 1,
-                        "instruction": {"target": instruction_en, "native": instruction_native},
-                        "progress": {
-                            "current_word_index": current_idx + 1,
-                            "total_words": len(lesson)
-                        }
-                    }
-            else:
-                
-                sentence_idx = session.get("current_sentence_index", 0)
-                
-                
-                if "sentences" in current_word and sentence_idx + 1 < len(current_word["sentences"]):
-                    
-                    session["current_sentence_index"] = sentence_idx + 1
-                    next_sentence = current_word["sentences"][session["current_sentence_index"]]
-                    next_sentence_en = safe_get_sentence_text(next_sentence, "en")
-                    sentence_native = safe_get_sentence_text(next_sentence, native_lang) or await translate_text(next_sentence_en, "en", native_lang)
-                    
-                    
-                    await db.update_session(session_id, session)
-                    
-                    return {
-                        "status": "next_sentence",
-                        "session_id": session_id,
-                        "target_lang": session.get("target_lang", "en"),
-                        "native_lang": native_lang,
-                        "current_word": {"word": current_word["word"]},
-                        "current_sentence": {
-                            "text": {"target": next_sentence_en, "native": sentence_native}
-                        },
-                        "phase": "sentence",
-                        "sentence_number": session["current_sentence_index"] + 1,
-                        "total_sentences": len(current_word["sentences"]),
-                        "progress": {
-                            "current_word_index": current_idx + 1,
-                            "total_words": len(lesson)
-                        }
-                    }
-                
-                
-                session["current_word_index"] += 1
-                session["current_phase"] = "word"
-                session["current_sentence_index"] = 0
-                session["attempt_count"] = 0
-                
-                if session["current_word_index"] >= len(lesson):
-                    
-                    summary = await generate_session_summary(session)
-                    
-                    summary_bilingual = await make_bilingual(summary, "en", native_lang)
-                    msg_en = "Excellent work! You've completed all words."
-                    msg_native = await translate_text(msg_en, "en", native_lang)
-                    
-                    # Build response first, then save it
-                    response = {
-                        "status": "complete",
-                        "session_id": session_id,
-                        "target_lang": session.get("target_lang", "en"),
-                        "native_lang": native_lang,
-                        "is_session_complete": True,
-                        "session_summary": summary_bilingual,
-                        "message": {"target": msg_en, "native": msg_native}
-                    }
-                    
-                    await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
-                    
-                    return response
-                
-                next_word = lesson[session["current_word_index"]]
-                instruction_en = f"Next word: {next_word['word']}"
-                instruction_native = await translate_text(instruction_en, "en", native_lang)
-                
-                
-                meaning_native = next_word.get(f"meaning_{native_lang}", "") or await translate_text(next_word.get("meaning_en") or next_word["word"], "en", native_lang)
-                
-                
-                await db.update_session(session_id, session)
-                
-                return {
-                    "status": "next_word",
-                    "session_id": session_id,
-                    "target_lang": session.get("target_lang", "en"),
-                    "native_lang": native_lang,
-                    "current_word": {
-                        "word": next_word["word"],
-                        "meaning": {
-                            "target": next_word.get("meaning_en", ""),
-                            "native": meaning_native
-                        },
-                        "instruction": {"target": instruction_en, "native": instruction_native}
-                    },
-                    "phase": "word",
-                    "attempt_number": 1,
-                    "max_attempts": MAX_ATTEMPTS,
-                    "progress": {
-                        "current_word_index": session["current_word_index"] + 1,
-                        "total_words": len(lesson)
-                    }
-                }
-        
-        
-        if not audio_file:
-            msg_en = "please provide audio to continue"
-            msg_native = await translate_text(msg_en, "en", native_lang)
-            return {
-                "status": "waiting_audio",
-                "session_id": session_id,
-                "target_lang": session.get("target_lang", "en"),
-                "native_lang": native_lang,
-                "message": {"target": msg_en, "native": msg_native},
-                "current_word": {"word": current_word["word"]},
-                "phase": current_phase
-            }
-        
-        temp_dir = tempfile.mkdtemp()
-        audio_path = os.path.join(temp_dir, f"audio_{session_id}.wav")
-        
-        try:
-            
-            content = await audio_file.read()
-            original_filename = audio_file.filename or "audio.wav"
-            original_ext = os.path.splitext(original_filename)[1].lower()
-            temp_input_path = os.path.join(temp_dir, f"input_{session_id}{original_ext or '.wav'}")
-            
-            with open(temp_input_path, "wb") as f:
-                f.write(content)
-            
-            
-            if original_ext in ['.mp3', '.m4a', '.ogg', '.flac', '.aac', '.webm']:
-                try:
-                    from pydub import AudioSegment
-                    audio = AudioSegment.from_file(temp_input_path)
-                    audio.export(audio_path, format="wav")
-                except Exception as conv_err:
-                    logger.warning(f"Audio conversion failed, using original: {conv_err}")
-                    shutil.copy(temp_input_path, audio_path)
-            else:
-                
-                shutil.copy(temp_input_path, audio_path)
-            
-            
-            target_lang_for_audio = session.get("target_lang", "en")
-            transcription = await transcribe_audio(audio_path, target_lang_for_audio)
-            
-            if not transcription:
-                
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return {
-                    "status": "transcription_failed",
-                    "session_id": session_id,
-                    "message": "could not understand audio. please try again.",
-                    "phase": current_phase
-                }
-
-            
-            
-            if current_phase == "word":
-                expected = current_word["word"]
-                
-                
-                word_analysis = await analyze_word_pronunciation(audio_path, expected, target_lang_for_audio)
-                score = word_analysis["score"]
-                transcription = word_analysis["transcription"] or transcription
-                
-                
-                try:
-                    from pydub import AudioSegment
-                    audio_for_wpm = AudioSegment.from_file(audio_path)
-                    audio_duration_seconds = len(audio_for_wpm) / 1000
-                    word_count = len(transcription.split()) if transcription else 1
-                    word_wpm = int((word_count / audio_duration_seconds) * 60) if audio_duration_seconds > 0 else 120
-                except:
-                    word_wpm = 120  
-                
-                # Calculate speed_status for word
-                if word_wpm < 100:
-                    word_speed_status = "slow"
-                elif word_wpm <= 150:
-                    word_speed_status = "normal"
-                else:
-                    word_speed_status = "fast"
-                
-                session["attempt_count"] += 1
-                
-                feedback = await generate_word_feedback(expected, transcription, score, session["attempt_count"], word_analysis, model=model)
-                
-                session["history"].append({
-                    "phase": "word",
-                    "word": {  
-                        "target": current_word["word"],
-                        "meaning_en": current_word.get("meaning_en", ""),
-                        "meaning_native": current_word.get(f"meaning_{session.get('native_language', 'hi')}", current_word.get("meaning_native", ""))
-                    },
-                    "expected": expected,
-                    "spoken": transcription,
-                    "score": score,
-                    "attempt": session["attempt_count"],
-                    "confidence": word_analysis.get("confidence", 0),
-                    "wpm": word_wpm,
-                    "speed_status": word_speed_status,
-                    "pronunciation_analysis": word_analysis,
-                    # Store feedback text for /feedback endpoint
-                    "feedback_message": feedback.get("message", ""),
-                    "feedback_tip": feedback.get("tip", ""),
-                    "feedback_status": feedback.get("status", "")
-                })
-                session["scores"]["pronunciation"].append(score)
-                
-                syllable_guide = None
-                if word_analysis.get("needs_practice"):
-                    
-                    syllable_cache = session.get("syllable_cache", {})
-                    if expected.lower() in syllable_cache:
-                        syllable_guide = syllable_cache[expected.lower()]
-                    else:
-                        syllable_guide = await generate_syllable_guide(expected, model=model)
-                        
-                        if "syllable_cache" not in session:
-                            session["syllable_cache"] = {}
-                        session["syllable_cache"][expected.lower()] = syllable_guide
-                
-                
-                current_attempt = session["attempt_count"]
-                
-                
-                if feedback["next_action"] == "next_phase":
-                    session["current_phase"] = "sentence"
-                    session["current_sentence_index"] = 0
-                    session["attempt_count"] = 0
-                
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                
-                
-                await db.update_session(session_id, session)
-                
-                
-                feedback_native = await translate_text(feedback["message"], "en", native_lang)
-                
-                # Generate TTS audio URL for feedback
-                feedback_audio = ""
-                if request:
-                    feedback_audio = await generate_tts_url(request, feedback["message"], session.get("target_lang", "en"), voice_id=voice_id)
-                
-                response = {
-                    "status": feedback["status"],
-                    "session_id": session_id,
-                    "target_lang": session.get("target_lang", "en"),
-                    "native_lang": native_lang,
-                    "transcription": transcription,
-                    "pronunciation_score": score,
-                    "feedback": {"target": feedback["message"], "native": feedback_native, "audio_url": feedback_audio},
-                    "current_word": {"word": current_word["word"]},
-                    "phase": "word" if feedback["next_action"] == "retry" else "sentence",
-                    "attempt_number": current_attempt,
-                    "max_attempts": MAX_ATTEMPTS,
-                    "next_action": feedback["next_action"],
-                    "progress": {
-                        "current_word_index": current_idx + 1,
-                        "total_words": len(lesson)
-                    },
-                    
-                    "analysis": {
-                        "pronunciation": {
-                            "score": score,
-                            "confidence": word_analysis.get("confidence", 0),
-                            "expected": expected,
-                            "spoken": transcription,
-                            "detected": word_analysis.get("detected", False),
-                            "match_type": word_analysis.get("match_type", "unknown")
-                        }
-                    }
-                }
-                
-                
-                if syllable_guide:
-                    response["syllable_guide"] = syllable_guide
-                
-                
-                if feedback["next_action"] == "next_phase":
-                    
-                    if "sentences" in current_word and current_word["sentences"]:
-                        sentence = current_word["sentences"][0]
-                        sentence_en = safe_get_sentence_text(sentence, "en")
-                        sentence_native = safe_get_sentence_text(sentence, native_lang) or await translate_text(sentence_en, "en", native_lang)
-                        response["current_sentence"] = {
-                            "text": {"target": sentence_en, "native": sentence_native}
-                        }
-                        response["sentence_number"] = 1
-                        response["total_sentences"] = len(current_word["sentences"])
-                    else:
-                        
-                        sentence_en = current_word.get("sentence", "")
-                        sentence_native = current_word.get(f"sentence_{native_lang}", "") or await translate_text(sentence_en, "en", native_lang) if sentence_en else ""
-                        response["current_sentence"] = {
-                            "text": {"target": sentence_en, "native": sentence_native},
-                            "example": current_word.get("example", "")
-                        }
-                        response["sentence_number"] = 1
-                        response["total_sentences"] = 1
-                
-                return response
-            
-            
-            else:
-                
-                sentence_idx = session.get("current_sentence_index", 0)
-                if "sentences" in current_word and current_word["sentences"]:
-                    sentences = current_word["sentences"]
-                    current_sentence = sentences[sentence_idx]
-                    expected = safe_get_sentence_text(current_sentence, "en")
-                else:
-                    
-                    expected = current_word.get("sentence", "")
-                
-                
-                sentence_analysis = await analyze_sentence_pronunciation(audio_path, expected, transcription, target_lang_for_audio)
-                score = sentence_analysis["score"]
-                
-                analysis = {
-                    "pronunciation": {
-                        "score": score,
-                        "expected": expected,
-                        "spoken": transcription,
-                        "mismatches": sentence_analysis.get("mismatches", []),
-                        "mismatch_count": sentence_analysis.get("mismatch_count", 0),
-                        "mispronounced_words": sentence_analysis.get("mispronounced_words", []),
-                        "well_pronounced_words": sentence_analysis.get("well_pronounced_words", []),
-                        "fluency": sentence_analysis.get("fluency", {}),
-                        "accuracy_percentage": sentence_analysis.get("accuracy_percentage", 0)
-                    }
-                }
-                
-                # Get speed_status from fluency analysis
-                sentence_speed_status = sentence_analysis.get("fluency", {}).get("speed_status", "normal")
-                
-                feedback = await generate_sentence_feedback(expected, transcription, score, analysis, model=model)
-                
-                session["history"].append({
-                    "phase": "sentence",
-                    "word": {  
-                        "target": current_word["word"],
-                        "meaning_en": current_word.get("meaning_en", ""),
-                        "meaning_native": current_word.get(f"meaning_{session.get('native_language', 'hi')}", current_word.get("meaning_native", ""))
-                    },
-                    "expected": expected,
-                    "spoken": transcription,
-                    "score": score,
-                    "mismatches": sentence_analysis.get("mismatches", []),
-                    "wpm": sentence_analysis.get("fluency", {}).get("wpm", 120),
-                    "speed_status": sentence_speed_status,
-                    "pronunciation_analysis": sentence_analysis,
-                    # Store feedback text for /feedback endpointttttt
-                    "feedback_message": feedback.get("message", ""),
-                    "feedback_tip": feedback.get("tip", ""),
-                    "feedback_status": feedback.get("status", ""),
-                    "focus_word": feedback.get("focus_word", ""),
-                    "fluency_note": feedback.get("fluency_note", "")
-                })
-                session["scores"]["pronunciation"].append(score)
-                
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                
-                
-                next_action = "next_word"
-                is_complete = False
-                
-                
-                if "sentences" in current_word and current_word["sentences"]:
-                    sentence_idx = session.get("current_sentence_index", 0)
-                    if sentence_idx + 1 < len(current_word["sentences"]):
-                        session["current_sentence_index"] = sentence_idx + 1
-                        next_action = "next_sentence"
-                    else:
-                        
-                        session["current_word_index"] += 1
-                        session["current_phase"] = "word"
-                        session["current_sentence_index"] = 0
-                        session["attempt_count"] = 0
-                        
-                        if session["current_word_index"] >= len(lesson):
-                            is_complete = True
-                            next_action = "complete"
-                else:
-                    
-                    session["current_word_index"] += 1
-                    session["current_phase"] = "word"
-                    session["attempt_count"] = 0
-                    
-                    if session["current_word_index"] >= len(lesson):
-                        is_complete = True
-                        next_action = "complete"
-                
-                
-                feedback_native = await translate_text(feedback["message"], "en", native_lang)
-                
-                # Generate TTS audio URL for feedback
-                feedback_audio = ""
-                if request:
-                    feedback_audio = await generate_tts_url(request, feedback["message"], session.get("target_lang", "en"), voice_id=voice_id)
-                
-                response_status = "complete" if is_complete else feedback["status"]
-                
-                response = {
-                    "status": response_status,
-                    "session_id": session_id,
-                    "target_lang": session.get("target_lang", "en"),
-                    "native_lang": native_lang,
-                    "transcription": transcription,
-                    "pronunciation_score": score,
-                    "feedback": {"target": feedback["message"], "native": feedback_native, "audio_url": feedback_audio},
-                    "analysis": analysis,
-                    "current_word": {"word": current_word["word"]},
-                    "phase": "sentence",
-                    "next_action": next_action,
-                    "is_session_complete": is_complete,
-                    "progress": {
-                        "current_word_index": session["current_word_index"] + 1 if not is_complete else len(lesson),
-                        "total_words": len(lesson)
-                    }
-                }
-                
-                
-                if is_complete:
-                    summary = await generate_session_summary(session, model=model)
-                    
-                    summary_bilingual = await make_bilingual(summary, "en", native_lang)
-                    response["session_summary"] = summary_bilingual
-                    
-                    # Save the complete termination response for get feedback endpoint
-                    await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
-                    return response
-                    
-                elif next_action == "next_sentence" and "sentences" in current_word:
-                    next_sentence = current_word["sentences"][session["current_sentence_index"]]
-                    next_sentence_en = safe_get_sentence_text(next_sentence, "en")
-                    sentence_native = safe_get_sentence_text(next_sentence, native_lang) or await translate_text(next_sentence_en, "en", native_lang)
-                    response["current_sentence"] = {
-                        "text": {"target": next_sentence_en, "native": sentence_native}
-                    }
-                    response["sentence_number"] = session["current_sentence_index"] + 1
-                    response["total_sentences"] = len(current_word["sentences"])
-                elif next_action == "next_word" and session["current_word_index"] < len(lesson):
-                    next_word = lesson[session["current_word_index"]]
-                    
-                    meaning_native = next_word.get(f"meaning_{native_lang}", "") or await translate_text(next_word.get("meaning_en") or next_word["word"], "en", native_lang)
-                    response["next_word"] = {
-                        "word": next_word["word"],
-                        "meaning": {
-                            "target": next_word.get("meaning_en", ""),
-                            "native": meaning_native
-                        }
-                    }
-                
-                
-                await db.update_session(session_id, session)
-                
-                return response
-        
-        except Exception as e:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise e
-    
+        return user_text
     except Exception as e:
-        logger.error(f"pronunciation api error: {e}")
-        return {
-            "status": "error",
-            "message": f"an error occurred: {str(e)}"
-        }
-in db.py 
-
-async def complete_session(self, session_id: str, final_feedback: dict = None, overall_score: int = None, termination_response: dict = None) -> bool:
-        """Mark session as completed and store final feedback, overall_score, and termination_response"""
-        await self.init_db()
-        async with async_session() as sess:
-
-            result = await sess.execute(
-                text("SELECT data FROM user_chat_sessions WHERE session_id = :sid"),
-                {"sid": session_id}
-            )
-            row = result.fetchone()
-            if row:
-                data = row[0] if isinstance(row[0], dict) else (json.loads(row[0]) if isinstance(row[0], str) else {})
-                data["status"] = "completed"
-                data["completed_at"] = datetime.utcnow().isoformat()
-                if final_feedback:
-                    data["final_feedback"] = final_feedback
-                if termination_response:
-                    data["termination_response"] = termination_response
-
-
-                if overall_score is None and final_feedback:
-                    overall_score = final_feedback.get("overall_score")
-
-
-                await sess.execute(
-                    text("""UPDATE user_chat_sessions 
-                            SET data = :data, overall_score = :score, updated_at = NOW() 
-                            WHERE session_id = :sid"""),
-                    {"sid": session_id, "data": json.dumps(data), "score": overall_score}
-                )
-                await sess.commit()
-            return True
-@router.get("/feedback/{session_id}")
-async def get_pronunciation_feedback(session_id: str):
-    """
-    Get detailed per-turn feedback for a pronunciation session.
-    
-    Returns the same response that was returned when the session ended.
-    Falls back to structured per-turn feedback if termination_response not available.
-    """
-    # First try to get the stored termination response
-    session_data = await db.get_user_session(session_id)
-    if not session_data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    # Return the stored termination response if available (same as session end response)
-    if "termination_response" in session_data:
-        return session_data["termination_response"]
-    
-    # Fall back to get_session_feedback for older sessions without termination_response
-    feedback = await db.get_session_feedback(session_id)
-    if not feedback:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if feedback["session_type"] != "pronunciation":
-        raise HTTPException(status_code=400, detail="Not a pronunciation session")
-    return feedback
-@router.get("/completed_sessions")
-async def get_completed_pronunciation_sessions(current_user: User = Depends(get_current_user)):
-    """
-    Get only completed pronunciation sessions for the current user.
-    Returns sessions where status='completed' and termination_response exists.
-    """
-    user_id = current_user.id if current_user else None
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="pronunciation")
-    
-    completed_sessions = []
-    for s in sessions:
-        session_data = await db.get_user_session(s.get("session_id"))
-        if not session_data:
-            continue
-        if session_data.get("status") != "completed":
-            continue
-        if not session_data.get("termination_response"):
-            continue
+        logger.error(f"[transcribe_audio_file] Audio transcription failed: {e}")
+        return ""
+    finally:
         
-        completed_sessions.append({
-            "session_id": s.get("session_id"),
-            "created_at": s.get("created_at"),
-            "target_lang": session_data.get("target_lang", "en"),
-            "native_lang": session_data.get("native_language", "en"),
-            "mode": session_data.get("mode", "normal")
-        })
+        for path in [temp_upload, audio_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+
+
+                except Exception as e:
+                    logger.warning(f"[transcribe_audio_file] Failed to cleanup {path}: {e}")
+async def analyze_pronunciation_llm(audio_path: str = None, spoken_text: str = None, level: str = "B1", user_type: str = "student", model: str = "gpt", target_language: str = "en") -> dict:
+    """pronunciation analysis using Whisper word-level confidence to detect mispronounced words"""
+    if not audio_path:
+        return {
+            "accuracy": 70, "transcription": spoken_text or "", 
+            "word_pronunciation_scores": [],
+            "words_to_practice": [], "well_pronounced_words": spoken_text.split() if spoken_text else [],
+            "feedback": "No audio provided for pronunciation analysis",
+            "tips": ["Record audio for pronunciation feedback"], 
+            "mispronounced_count": 0, "level": level, "user_type": user_type
+        }
     
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_completed": len(completed_sessions),
-        "sessions": completed_sessions
-    }
-@router.get("/roles_with_session_ids")
-async def get_roles_and_session_ids(current_user: User = Depends(get_current_user)):
-    """
-    Get all roles, their corresponding session IDs, and the total session counts for each role for the current user.
-    """
-    user_id = current_user.id if current_user else None
+    try:
+        target_lang = normalize_language_code(target_language, default="en")
 
-    # Get distinct roles
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
-
-    # List to hold roles with session info
-    roles_with_session_ids = []
-
-    # Get all sessions for the user once
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-
-    for role in roles:
-        session_ids_for_role = []
-
-        for s in sessions:
-            session_data = await db.get_user_session(s.get("session_id"))
-            if not session_data:
+        # Auto-detect language from audio (don't force to target_lang)
+        segments, info = await asyncio.to_thread(
+            _whisper_model.transcribe, audio_path, word_timestamps=True
+        )
+        
+        
+        words_data = []
+        transcription = ""
+        for seg in segments:
+            transcription += seg.text + " "
+            if seg.words:
+                for w in seg.words:
+                    words_data.append({
+                        "word": w.word.strip().lower(),
+                        "confidence": w.probability,
+                        "start": w.start,
+                        "end": w.end
+                    })
+        
+        transcription = transcription.strip()
+        
+        if not words_data:
+            return {
+                "accuracy": 0, "transcription": transcription, 
+                "word_pronunciation_scores": [],
+                "words_to_practice": [], "well_pronounced_words": [],
+                "feedback": "No speech detected in audio",
+                "tips": ["Speak clearly into the microphone"], 
+                "mispronounced_count": 0, "level": level, "user_type": user_type
+            }
+        
+        
+        
+        CONFIDENCE_THRESHOLD = 0.70
+        
+        mispronounced_words = []
+        well_pronounced = []
+        all_words_pronunciation = []  
+        
+        for wd in words_data:
+            word = wd["word"].strip(".,!?")
+            if len(word) < 2:  
                 continue
-            if session_data.get("role") != role:
-                continue
-            if session_data.get("status") != "completed":
-                continue
-            if not session_data.get("final_feedback"):
-                continue
-            session_ids_for_role.append(s.get("session_id"))
+            
+            
+            pronunciation_percentage = round(wd["confidence"] * 100, 1)
+            
+            
+            if pronunciation_percentage >= 90:
+                status = "excellent"
+            elif pronunciation_percentage >= 70:
+                status = "good"
+            elif pronunciation_percentage >= 50:
+                status = "needs_improvement"
+            else:
+                status = "poor"
+            
+            all_words_pronunciation.append({
+                "word": word,
+                "pronunciation_percentage": pronunciation_percentage,
+                "status": status
+            })
+                
+            if wd["confidence"] < CONFIDENCE_THRESHOLD:
+                mispronounced_words.append({
+                    "word": word,
+                    "confidence": round(wd["confidence"] * 100, 1),
+                    "issue": "unclear pronunciation" if wd["confidence"] < 0.5 else "slight pronunciation issue"
+                })
+            else:
+                well_pronounced.append(word)
+        
+        
+        if words_data:
+            avg_confidence = sum(w["confidence"] for w in words_data) / len(words_data)
+            accuracy = int(avg_confidence * 100)
+        else:
+            accuracy = 70
+        
+        
+        llm_prompt = f"""You are a pronunciation coach.
 
-        roles_with_session_ids.append({
-            "role": role,
-            "session_ids": session_ids_for_role,
-            "total_sessions": len(session_ids_for_role)
-        })
+USER CONTEXT:
+- Level: {level}
+- User Type: {user_type}
 
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_roles": len(roles),
-        "roles_with_session_ids": roles_with_session_ids
-    }
+TRANSCRIPTION: "{transcription}"
+
+PER-WORD PRONUNCIATION SCORES (confidence-based):
+{all_words_pronunciation}
+
+MISPRONOUNCED WORDS (low confidence from speech recognition):
+{mispronounced_words if mispronounced_words else "None - all words were clear!"}
+
+WELL PRONOUNCED WORDS: {well_pronounced[:10]}
+
+OVERALL ACCURACY: {accuracy}%
+
+For each word, analyze their pronunciation percentage and provide specific guidance.
+
+Return STRICTLY valid JSON:
+{{
+    "word_analysis": [
+        {{
+            "word": "the word",
+            "pronunciation_match": 85.5,
+            "rating": "excellent/good/needs_improvement/poor",
+            "phonetic_guide": "how to pronounce: ex-AM-ple",
+            "improvement_tip": "specific tip if needed, or null if pronunciation is good"
+        }}
+    ],
+    "words_to_practice": [
+        {{
+            "word": "the word",
+            "how_to_say": "syllable breakdown with stress: ex-AM-ple",
+            "tip": "specific tip to pronounce this word better"
+        }}
+    ],
+    "well_pronounced_words": ["word1", "word2"],
+    "feedback": "2-3 encouraging sentences about their pronunciation",
+    "tips": ["general pronunciation tip 1", "general tip 2"]
+}}"""
+
+        
+        llm_data = None
+        for attempt in range(3):
+            try:
+                llm_response = await call_llm(llm_prompt, mode="strict_json", timeout=30, model=model)
+                json_match = re.search(r'\{[\s\S]*\}', llm_response)
+                if json_match:
+                    llm_data = json.loads(json_match.group())
+                    break  
+                else:
+                    raise ValueError("No JSON found in response")
+            except json.JSONDecodeError as e:
+                logger.warning(f"[analyze_pronunciation_llm] JSON parse error (attempt {attempt+1}/3): {e}")
+                continue  
+            except Exception as llm_error:
+                logger.warning(f"[analyze_pronunciation_llm] LLM error (attempt {attempt+1}/3): {llm_error}")
+                continue  
+        
+        
+        if not llm_data:
+            logger.error(f"[analyze_pronunciation_llm] All 3 retries failed, using fallback")
+            llm_data = {
+                "words_to_practice": [
+                    {
+                        "word": w["word"],
+                        "how_to_say": f"Say '{w['word']}' more clearly",
+                        "tip": f"Confidence was {w['confidence']}%. Speak slower and clearer."
+                    } for w in mispronounced_words[:5]
+                ],
+                "well_pronounced_words": well_pronounced[:5],
+                "feedback": f"Pronunciation accuracy: {accuracy}%. " + (
+                    f"Focus on: {', '.join([w['word'] for w in mispronounced_words[:3]])}" 
+                    if mispronounced_words else "Great clarity!"
+                ),
+                "tips": ["Speak slowly and clearly", "Stress syllables properly"]
+            }
+        
+        
+        llm_word_analysis = llm_data.get("word_analysis", [])
+        
+        
+        word_pronunciation_scores = []
+        llm_analysis_map = {w.get("word", "").lower(): w for w in llm_word_analysis}
+        
+        for wp in all_words_pronunciation:
+            word_key = wp["word"].lower()
+            llm_info = llm_analysis_map.get(word_key, {})
+            word_pronunciation_scores.append({
+                "word": wp["word"],
+                "pronunciation_match_percentage": wp["pronunciation_percentage"],
+                "status": wp["status"],
+                "phonetic_guide": llm_info.get("phonetic_guide", ""),
+                "improvement_tip": llm_info.get("improvement_tip", "")
+            })
+        
+        return {
+            "accuracy": accuracy, 
+            "transcription": transcription, 
+            "word_pronunciation_scores": word_pronunciation_scores,
+            "words_to_practice": llm_data.get("words_to_practice", []),
+            "well_pronounced_words": llm_data.get("well_pronounced_words", well_pronounced),
+            "feedback": llm_data.get("feedback", "Analysis complete."),
+            "tips": llm_data.get("tips", []),
+            "mispronounced_count": len(mispronounced_words),
+            "confidence_data": [{"word": w["word"], "confidence": w["confidence"]} for w in mispronounced_words],
+            "level": level, 
+            "user_type": user_type
+        }
+        
+    except Exception as e:
+        logger.error(f"Pronunciation error: {e}")
+        return {
+            "accuracy": 70, "transcription": spoken_text or "", 
+            "word_pronunciation_scores": [],
+            "words_to_practice": [], "well_pronounced_words": [],
+            "feedback": f"Could not analyze pronunciation: {str(e)}",
+            "tips": ["Ensure clear audio recording"],
+            "mispronounced_count": 0,
+            "level": level, "user_type": user_type
+        }
+
