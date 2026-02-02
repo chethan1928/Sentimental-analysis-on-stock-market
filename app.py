@@ -102,36 +102,6 @@ async def handle_session_termination(session: dict, session_id: str, model: str 
         model=model
     )
     
-    termination_response = {
-        "status": "conversation_ended", 
-        "session_id": session_id,
-        "target_lang": session.get("target_language", "en"),
-        "native_lang": session.get("native_language", "hi"),
-        "final_scores": final_scores, 
-        "overall_score": overall, 
-        "passing_score": PASSING_SCORE,
-        "average_wpm": average_wpm,
-        "wpm_per_turn": wpm_per_turn,
-        "wpm_status": "slow" if average_wpm < 110 else "normal" if average_wpm <= 160 else "fast",
-        "vocab_overall": vocab_overall,
-        "strengths": strengths, 
-        "improvement_areas": improvement_areas,
-        "total_turns": session.get("turn_number", 0),
-        "turn_history": turn_history,  
-        "turn_feedback": turn_feedback,
-        "summary": summary,  # Aggregated mistakes from all turns
-        "overall_assessment": llm_summary.get("overall_assessment", ""),
-        "grammar_feedback": llm_summary.get("grammar_feedback", {}),
-        "vocabulary_feedback": llm_summary.get("vocabulary_feedback", {}),
-        "pronunciation_feedback": llm_summary.get("pronunciation_feedback", {}),
-        "fluency_feedback": llm_summary.get("fluency_feedback", {}),
-        "interview_skills": llm_summary.get("interview_skills", {}),
-        "action_plan": llm_summary.get("action_plan", []),
-        "encouragement": llm_summary.get("encouragement", ""),
-        "next_practice_topics": llm_summary.get("next_practice_topics", [])
-    }
-    await db.complete_session(session_id, final_feedback=termination_response)
-    
     # Build turn_feedback for termination response (same format as /interview_feedback)
     turn_feedback = []
     # Aggregate grammar mistakes and vocabulary suggestions from all turns
@@ -199,20 +169,35 @@ async def handle_session_termination(session: dict, session_id: str, model: str 
             "issues": pronunciation_issues
         }
     }
-    
+
+    termination_response = {
+        "status": "conversation_ended", 
+        "session_id": session_id,
+        "target_lang": session.get("target_language", "en"),
+        "native_lang": session.get("native_language", "hi"),
+        "final_scores": final_scores, 
+        "overall_score": overall, 
+        "passing_score": PASSING_SCORE,
+        "average_wpm": average_wpm,
+        "wpm_per_turn": wpm_per_turn,
+        "wpm_status": "slow" if average_wpm < 110 else "normal" if average_wpm <= 160 else "fast",
+        "vocab_overall": vocab_overall,
+        "strengths": strengths, 
+        "improvement_areas": improvement_areas,
+        "total_turns": session.get("turn_number", 0),
+        "turn_history": turn_history,  
+        "turn_feedback": turn_feedback,
+        "summary": summary,
+        "overall_assessment": llm_summary.get("overall_assessment", ""),
+        "grammar_feedback": llm_summary.get("grammar_feedback", {}),
+        "vocabulary_feedback": llm_summary.get("vocabulary_feedback", {}),
+        "pronunciation_feedback": llm_summary.get("pronunciation_feedback", {}),
+        "fluency_feedback": llm_summary.get("fluency_feedback", {}),
+        "interview_skills": llm_summary.get("interview_skills", {}),
+        "action_plan": llm_summary.get("action_plan", []),
+        "encouragement": llm_summary.get("encouragement", ""),
+        "next_practice_topics": llm_summary.get("next_practice_topics", [])
+    }
+    await db.complete_session(session_id, final_feedback=termination_response)
+
     return termination_response
-@router.get("/feedback/{session_id}")
-async def get_interview_feedback(session_id: str):
-    """
-    Get the exact same response as session termination.
-    Simply returns the stored final_feedback from DB.
-    """
-    session = await db.get_user_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Session not completed yet")
-    final_feedback = session.get("final_feedback")
-    if not final_feedback:
-        raise HTTPException(status_code=404, detail="Final feedback not found")
-    return final_feedback
