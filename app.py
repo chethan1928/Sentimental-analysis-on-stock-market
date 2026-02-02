@@ -1,557 +1,19 @@
-async def transcribe_audio_file(audio_file, target_lang: str = "en") -> str:
-    """Helper function to transcribe audio file using Whisper - eliminates code duplication"""
-    audio_file.file.seek(0)
-    logger.info(f"[transcribe_audio_file] Starting transcription, target_lang: {target_lang}")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-        shutil.copyfileobj(audio_file.file, tmp)
-        temp_upload = tmp.name
-    logger.info(f"[transcribe_audio_file] Audio saved to temp: {temp_upload}, size: {os.path.getsize(temp_upload)} bytes")
-    
-    audio_path = None
-    try:
-        
-        def convert_audio():
-            audio = AudioSegment.from_file(temp_upload)
-            audio = audio.set_frame_rate(16000).set_channels(1)
-            converted_path = temp_upload.replace('.tmp', '_converted.wav')
-            audio.export(converted_path, format="wav")
-            return converted_path
-        
-        audio_path = await asyncio.to_thread(convert_audio)
-        logger.info(f"[transcribe_audio_file] Converted audio: {audio_path}, size: {os.path.getsize(audio_path)} bytes")
-        os.unlink(temp_upload)  
-        
-        # Pass language to Whisper for proper transcription in target language
-        # If target_lang is specified, use it; otherwise let Whisper auto-detect
-        whisper_lang = normalize_language_code(target_lang, default=None) if target_lang != "en" else None
-        segments, info = await asyncio.to_thread(
-            _whisper_model.transcribe, audio_path, language=whisper_lang
-        )
-        user_text = " ".join([seg.text for seg in segments]).strip()
-        detected_lang = info.language if hasattr(info, 'language') else 'unknown'
-        logger.info(f"[transcribe_audio_file] Transcription result (detected: {detected_lang}): '{user_text[:100] if user_text else 'empty'}'")
-        
-        return user_text
-    except Exception as e:
-        logger.error(f"[transcribe_audio_file] Audio transcription failed: {e}")
-        return ""
-    finally:
-        
-        for path in [temp_upload, audio_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception as e:
-                    logger.warning(f"[transcribe_audio_file] Failed to cleanup {path}: {e}")
-
-
-
-async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", user_type: str = "student", model: str = "gpt", target_lang: str = "en") -> dict:
-    """llm-based grammar analysis for spoken language with detailed suggestions"""
-    
-    # Normalize target_lang for response language instruction
-    response_lang_instruction = ""
-    if target_lang and target_lang.lower() != "en":
-        response_lang_instruction = f"\n\nIMPORTANT: Provide ALL feedback text, explanations, and suggestions in {target_lang} language. The JSON keys should remain in English, but all text values (feedback, explanations, etc.) must be in {target_lang}."
-    
-    level_context = ""
-    if level == "Beginner":
-        level_context = f"User is at Beginner level. Focus on basic grammar errors and simple corrections."
-    elif level == "Intermediate":
-        level_context = f"User is at Intermediate level. Check for intermediate grammar issues and provide detailed explanations."
-    elif level == "Advanced":
-        level_context = f"User is at Advanced level. Focus on subtle grammar nuances and advanced corrections."
-    else:
-        level_context = f"User is at Proficient level. Focus on native-like polish and professional refinement."
-    
-    user_type_context = ""
-    if user_type == "professional":
-        user_type_context = "This is a professional user. Provide business-appropriate grammar feedback."
-    elif user_type == "student":
-        user_type_context = "This is a student. Provide educational grammar feedback with clear explanations."
-    
-    prompt = f"""
-    Analyze grammar in this SPOKEN text: "{user_text}"
-    
-    USER CONTEXT:
-    - Level: {level} (adapt complexity of explanations accordingly)
-    - User Type: {user_type} (make feedback relevant to their context)
-    
-    Based on the user's level and type, provide appropriate feedback.
-    
-    CRITICAL: This is transcribed speech. COMPLETELY IGNORE:
-    - Punctuation errors
-    - Capitalization errors
-    - Spelling/typo errors
-    - Vocabulary weakness (handled separately)
-    
-    CHECK ONLY FOR THESE GRAMMAR ERRORS:
-    1. Filler words (um, uh, uhh, like, you know, I mean, basically, actually)
-    2. Wrong prepositions (e.g., "good in" → "good at")
-    3. Wrong verb tense (e.g., "I goed" → "I went")
-    4. Subject-verb agreement (e.g., "He don't" → "He doesn't")
-    5. Missing/wrong articles (e.g., "I am engineer" → "I am an engineer")
-    6. Word order issues (e.g., "Always I work" → "I always work")
-    7. Missing words (e.g., "I going" → "I am going")
-    
-    CRITICAL FORMATTING FOR EACH ERROR - MUST USE # MARKERS:
-    - "you_said": Copy the EXACT sentence from transcription, mark the WRONG PART with # on both sides
-    - "should_be": Show the SAME sentence with corrections, mark the CORRECTED PART with # on both sides
-    
-    EXAMPLES OF CORRECT # MARKING:
-    - Single word error: "I #goed# to store" → "I #went# to the store"
-    - Word order error: "#Always I work#" → "#I always work#" (mark entire rearranged phrase)
-    - Missing word: "I #going#" → "I #am going#" (mark where word was added)
-    - Multiple errors: "I #goed# #yesterday store#" → "I #went# #to the store yesterday#"
-    - Article missing: "I am #engineer#" → "I am #an engineer#"
-    
-    Return STRICTLY valid JSON:
-    {{
-      "score": 0-100,
-      "is_correct": true/false,
-      "filler_words": ["um", "like"],
-      "filler_count": 0,
-      
-      "you_said": "{user_text}",
-      "you_should_say": "the grammatically correct version",
-      
-      "errors": [
-        {{
-          "type": "verb_tense/preposition/article/subject_verb/word_order/missing_word",
-          "you_said": "#Always I work# hard",
-          "should_be": "#I always work# hard",
-          "wrong_word": "Always I work",
-          "correct_word": "I always work",
-          "explanation": "In English, adverbs of frequency come after the subject"
-        }}
-      ],
-      
-      "word_suggestions": [
-        {{"you_used": "good", "use_instead": "excellent", "why": "more impactful for {user_type}", "example": "The food was excellent."}}
-      ],
-      
-      "corrected_sentence": "sentence with grammar fixed",
-      "improved_sentence": "more natural version with better words",
-      "feedback": "2-3 specific sentences about their grammar, tailored to {level} level and {user_type} context"
-    }}{response_lang_instruction}
-    
-    RULES:
-    - DO NOT include capitalization, punctuation, or spelling errors
-    - DO NOT include vocabulary suggestions (handled separately)
-    - Tailor feedback complexity to {level} level
-    - Make suggestions relevant for {user_type}
-    - ALWAYS use the user's ACTUAL transcription for you_said (copy from above)
-    - For WORD ORDER errors: mark the ENTIRE phrase that needs rearranging with #phrase#
-    - For SINGLE WORD errors: mark just the word with #word#
-    - Empty arrays [] if no issues
-    """
-    # Retry up to 3 times if JSON parsing fails
-    for attempt in range(3):
-        try:
-            raw = await call_llm(prompt, model=model)
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                data = json.loads(json_match.group())
-                if isinstance(data, dict):
-                    if not data.get("improved_sentence"):
-                        data["improved_sentence"] = data.get("corrected_sentence", user_text)
-                    
-                    
-                    if "errors" in data and isinstance(data["errors"], list):
-                        cleaned_errors = []
-                        for error in data["errors"]:
-                            if isinstance(error, dict):
-                                
-                                error_type = error.get("type", "").lower()
-                                if error_type in ["punctuation", "capitalization", "spelling", "typo"]:
-                                    continue
-                                
-                                
-                                if not error.get("better_word"):
-                                    error.pop("better_word", None)
-                                    error.pop("explanation", None)
-                                cleaned_errors.append(error)
-                        data["errors"] = cleaned_errors
-                    
-                    return data
-        except json.JSONDecodeError as e:
-            logger.warning(f"[analyze_grammar_llm] JSON parse error (attempt {attempt+1}/3): {e}")
-            continue  # Retry
-        except Exception as e:
-            logger.error(f"[analyze_grammar_llm] Error: {e}")
-            break  # Don't retry on other errors
-    
-    word_count = len(user_text.split())
-    return {
-        "score": 70, "is_correct": True, "filler_words": [], "filler_count": 0,
-        "you_said": user_text, "you_should_say": user_text, "errors": [],
-        "word_suggestions": [], "corrected_sentence": user_text, "improved_sentence": user_text,
-        "feedback": f"Analyzed {word_count} words. No major grammatical issues detected."
-    }
-    
-
-async def analyze_vocab_llm(user_text: str, user_type: str = "student", level: str = "Intermediate", model: str = "gpt", target_lang: str = "en") -> dict:
-    """llm-based vocabulary analysis with cefr levels and percentages"""
-
-    # Normalize target_lang for response language instruction
-    response_lang_instruction = ""
-    if target_lang and target_lang.lower() != "en":
-        response_lang_instruction = f"\n\nIMPORTANT: Provide ALL feedback text, context descriptions, and suggestions in {target_lang} language. The JSON keys should remain in English, but all text values (feedback, context, etc.) must be in {target_lang}."
-    level_context = ""
-    if level == "Beginner":
-        level_context = "User is at Beginner level. Suggest simple vocabulary improvements."
-    elif level == "Intermediate":
-        level_context = "User is at Intermediate level. Suggest intermediate-level vocabulary enhancements."
-    elif level == "Advanced":
-        level_context = "User is at Advanced level. Suggest sophisticated vocabulary alternatives."
-    else:
-        level_context = "User is at Proficient level. Suggest native-like vocabulary refinements."
-
-    user_type_context = ""
-    if user_type == "professional":
-        user_type_context = "This is a professional user. Suggest business-appropriate vocabulary."
-    elif user_type == "student":
-        user_type_context = "This is a student. Suggest academic-appropriate vocabulary."
-
-    prompt = f"""
-    Analyze vocabulary CEFR levels for this user's spoken text: "{user_text}"
-
-    USER CONTEXT:
-    - Level: {level} (tailor suggestions to this level)
-    - User Type: {user_type} (make suggestions relevant to their context)
-
-    CRITICAL - YOU MUST FIND AND SUGGEST IMPROVEMENTS FOR WEAK/BASIC WORDS:
-    Scan the transcription above and identify ANY of these weak words:
-    - good, nice, bad, thing, things, stuff
-    - do, did, does, doing, done
-    - get, got, gets, getting  
-    - make, made, makes, making
-    - very, really, pretty, quite
-    - big, small, little, a lot
-    - said, told, asked
-    - went, go, goes, going
-    - want, wanted, need, needed
-    - like, liked, think, thought
-
-    For EACH weak word found, you MUST add a suggestion in the suggestions array.
-
-    SPELLING ERRORS:
-    If a word is MISSPELLED (e.g., "awareded", "recieved", "definately"):
-    - Set current_level = "spelling_error"
-    - Set better_word = correct spelling
-
-    CRITICAL FORMATTING FOR SUGGESTIONS - MUST USE # MARKERS:
-    - original_sentence: Copy the EXACT sentence from transcription containing the weak word, mark it with #word#
-    - improved_sentence: Same sentence with better word, mark it with #better_word#
-    - ALWAYS use # on both sides of the word
-    - Example: original_sentence: "The food was #good#" → improved_sentence: "The food was #excellent#"
-
-    Return STRICTLY valid JSON:
-    {{
-      "score": 0-100,
-      "overall_level": "A1/A2/B1/B2/C1/C2",
-      "total_words": <word count>,
-      "cefr_distribution": {{
-        "A1": {{"percentage": 20, "words": ["I", "is"]}},
-        "A2": {{"percentage": 30, "words": ["name", "good"]}},
-        "B1": {{"percentage": 40, "words": ["actually", "however"]}},
-        "B2": {{"percentage": 10, "words": ["sophisticated"]}},
-        "C1": {{"percentage": 0, "words": []}},
-        "C2": {{"percentage": 0, "words": []}}
-      }},
-      "feedback": "vocabulary feedback tailored to {level} level and {user_type} context",
-      "suggestions": [
-        {{"word": "good", "current_level": "A2", "better_word": "excellent", "suggested_level": "B1", "context": "appropriate for {user_type}", "original_sentence": "The food was #good# here", "improved_sentence": "The food was #excellent# here"}}
-      ]
-    }}
-
-    IMPORTANT RULES:
-    - suggestions array MUST NOT be empty if ANY weak words are found in the transcription
-    - If you find "good", "nice", "thing", "get", "make", "very", etc. - add a suggestion for EACH
-    - original_sentence MUST be copied from the user's ACTUAL transcription (above)
-    - ALWAYS mark words with #word# (single hash on both sides)
-    - For MISSPELLED words: current_level = "spelling_error"{response_lang_instruction}
-    """
-    
-    for attempt in range(3):
-        try:
-            raw = await call_llm(prompt, model=model)
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                data = json.loads(json_match.group())
-                if isinstance(data, dict):
-
-                    default_cefr = {
-                        "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-                        "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-                        "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-                    }
-                    if "cefr_distribution" not in data or not isinstance(data.get("cefr_distribution"), dict):
-                        data["cefr_distribution"] = default_cefr
-                    else:
-
-                        for level_key in default_cefr:
-                            if level_key not in data["cefr_distribution"]:
-                                data["cefr_distribution"][level_key] = default_cefr[level_key]
-                            elif not isinstance(data["cefr_distribution"][level_key], dict):
-                                data["cefr_distribution"][level_key] = default_cefr[level_key]
-                            else:
-
-                                if "percentage" not in data["cefr_distribution"][level_key]:
-                                    data["cefr_distribution"][level_key]["percentage"] = 0
-                                if "words" not in data["cefr_distribution"][level_key]:
-                                    data["cefr_distribution"][level_key]["words"] = []
-                    return data
-        except json.JSONDecodeError as e:
-            logger.warning(f"[analyze_vocab_llm] JSON parse error (attempt {attempt+1}/3): {e}")
-            continue  
-        except Exception as e:
-            logger.error(f"[analyze_vocab_llm] Error: {e}")
-            break  
-    
-    return {
-        "score": 70, "overall_level": "B1", "total_words": 0,
-        "cefr_distribution": {
-            "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-            "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-            "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-        },
-        "feedback": "", "suggestions": []
-    }
-
-
-async def analyze_pronunciation_llm(audio_path: str = None, spoken_text: str = None, level: str = "B1", user_type: str = "student", model: str = "gpt", target_language: str = "en") -> dict:
-    """pronunciation analysis using Whisper word-level confidence to detect mispronounced words"""
-    if not audio_path:
-        return {
-            "accuracy": 70, "transcription": spoken_text or "", 
-            "whisper_detection": {"detected_language": "unknown", "language_probability": 0, "original_transcription": spoken_text or ""},
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": spoken_text.split() if spoken_text else [],
-            "feedback": "No audio provided for pronunciation analysis",
-            "tips": ["Record audio for pronunciation feedback"], 
-            "mispronounced_count": 0, "level": level, "user_type": user_type
-        }
-    
-    try:
-        target_lang = normalize_language_code(target_language, default="en")
-
-        # Pass language to Whisper for proper transcription in target language
-        whisper_lang = target_lang if target_lang and target_lang != "en" else None
-        segments, info = await asyncio.to_thread(
-            _whisper_model.transcribe, audio_path, word_timestamps=True, language=whisper_lang
-        )
-        
-        
-        words_data = []
-        transcription = ""
-        for seg in segments:
-            transcription += seg.text + " "
-            if seg.words:
-                for w in seg.words:
-                    words_data.append({
-                        "word": w.word.strip().lower(),
-                        "confidence": w.probability,
-                        "start": w.start,
-                        "end": w.end
-                    })
-        
-        transcription = transcription.strip()
-        
-        if not words_data:
-            return {
-                "accuracy": 0, "transcription": transcription, 
-                "word_pronunciation_scores": [],
-                "words_to_practice": [], "well_pronounced_words": [],
-                "feedback": "No speech detected in audio",
-                "tips": ["Speak clearly into the microphone"], 
-                "mispronounced_count": 0, "level": level, "user_type": user_type
-            }
-        
-        
-        
-        CONFIDENCE_THRESHOLD = 0.70
-        
-        mispronounced_words = []
-        well_pronounced = []
-        all_words_pronunciation = []  
-        
-        for wd in words_data:
-            word = wd["word"].strip(".,!?")
-            if len(word) < 2:  
-                continue
-            
-            
-            pronunciation_percentage = round(wd["confidence"] * 100, 1)
-            
-            
-            if pronunciation_percentage >= 90:
-                status = "excellent"
-            elif pronunciation_percentage >= 70:
-                status = "good"
-            elif pronunciation_percentage >= 50:
-                status = "needs_improvement"
-            else:
-                status = "poor"
-            
-            all_words_pronunciation.append({
-                "word": word,
-                "pronunciation_percentage": pronunciation_percentage,
-                "status": status
-            })
-                
-            if wd["confidence"] < CONFIDENCE_THRESHOLD:
-                mispronounced_words.append({
-                    "word": word,
-                    "confidence": round(wd["confidence"] * 100, 1),
-                    "issue": "unclear pronunciation" if wd["confidence"] < 0.5 else "slight pronunciation issue"
-                })
-            else:
-                well_pronounced.append(word)
-        
-        
-        if words_data:
-            avg_confidence = sum(w["confidence"] for w in words_data) / len(words_data)
-            accuracy = int(avg_confidence * 100)
-        else:
-            accuracy = 70
-        
-        
-        # Add target language instruction for LLM response
-        response_lang_instruction = ""
-        if target_language and target_language.lower() != "en":
-            response_lang_instruction = f"\n\nIMPORTANT: Provide ALL feedback text, tips, and improvement suggestions in {target_language} language. The JSON keys should remain in English, but all text values (feedback, tips, etc.) must be in {target_language}."
-        
-        llm_prompt = f"""You are a pronunciation coach.
-
-USER CONTEXT:
-- Level: {level}
-- User Type: {user_type}
-
-TRANSCRIPTION: "{transcription}"
-
-PER-WORD PRONUNCIATION SCORES (confidence-based):
-{all_words_pronunciation}
-
-MISPRONOUNCED WORDS (low confidence from speech recognition):
-{mispronounced_words if mispronounced_words else "None - all words were clear!"}
-
-WELL PRONOUNCED WORDS: {well_pronounced[:10]}
-
-OVERALL ACCURACY: {accuracy}%
-
-For each word, analyze their pronunciation percentage and provide specific guidance.
-
-Return STRICTLY valid JSON:
-{{
-    "word_analysis": [
-        {{
-            "word": "the word",
-            "pronunciation_match": 85.5,
-            "rating": "excellent/good/needs_improvement/poor",
-            "phonetic_guide": "how to pronounce: ex-AM-ple",
-            "improvement_tip": "specific tip if needed, or null if pronunciation is good"
-        }}
-    ],
-    "words_to_practice": [
-        {{
-            "word": "the word",
-            "how_to_say": "syllable breakdown with stress: ex-AM-ple",
-            "tip": "specific tip to pronounce this word better"
-        }}
-    ],
-    "well_pronounced_words": ["word1", "word2"],
-    "feedback": "2-3 encouraging sentences about their pronunciation",
-    "tips": ["general pronunciation tip 1", "general tip 2"]
-}}{response_lang_instruction}"""
-
-        
-        llm_data = None
-        for attempt in range(3):
-            try:
-                llm_response = await call_llm(llm_prompt, mode="strict_json", timeout=30, model=model)
-                json_match = re.search(r'\{[\s\S]*\}', llm_response)
-                if json_match:
-                    llm_data = json.loads(json_match.group())
-                    break  
-                else:
-                    raise ValueError("No JSON found in response")
-            except json.JSONDecodeError as e:
-                logger.warning(f"[analyze_pronunciation_llm] JSON parse error (attempt {attempt+1}/3): {e}")
-                continue  
-            except Exception as llm_error:
-                logger.warning(f"[analyze_pronunciation_llm] LLM error (attempt {attempt+1}/3): {llm_error}")
-                continue  
-        
-        
-        if not llm_data:
-            logger.error(f"[analyze_pronunciation_llm] All 3 retries failed, using fallback")
-            llm_data = {
-                "words_to_practice": [
-                    {
-                        "word": w["word"],
-                        "how_to_say": f"Say '{w['word']}' more clearly",
-                        "tip": f"Confidence was {w['confidence']}%. Speak slower and clearer."
-                    } for w in mispronounced_words[:5]
-                ],
-                "well_pronounced_words": well_pronounced[:5],
-                "feedback": f"Pronunciation accuracy: {accuracy}%. " + (
-                    f"Focus on: {', '.join([w['word'] for w in mispronounced_words[:3]])}" 
-                    if mispronounced_words else "Great clarity!"
-                ),
-                "tips": ["Speak slowly and clearly", "Stress syllables properly"]
-            }
-        
-        
-        llm_word_analysis = llm_data.get("word_analysis", [])
-        
-        
-        word_pronunciation_scores = []
-        llm_analysis_map = {w.get("word", "").lower(): w for w in llm_word_analysis}
-        
-        for wp in all_words_pronunciation:
-            word_key = wp["word"].lower()
-            llm_info = llm_analysis_map.get(word_key, {})
-            word_pronunciation_scores.append({
-                "word": wp["word"],
-                "pronunciation_match_percentage": wp["pronunciation_percentage"],
-                "status": wp["status"],
-                "phonetic_guide": llm_info.get("phonetic_guide", ""),
-                "improvement_tip": llm_info.get("improvement_tip", "")
-            })
-        
-        return {
-            "accuracy": accuracy, 
-            "transcription": transcription, 
-            "whisper_detection": {
-                "detected_language": info.language if hasattr(info, 'language') else "unknown",
-                "language_probability": round(info.language_probability * 100, 1) if hasattr(info, 'language_probability') else 0,
-                "original_transcription": transcription
-            },
-            "word_pronunciation_scores": word_pronunciation_scores,
-            "words_to_practice": llm_data.get("words_to_practice", []),
-            "well_pronounced_words": llm_data.get("well_pronounced_words", well_pronounced),
-            "feedback": llm_data.get("feedback", "Analysis complete."),
-            "tips": llm_data.get("tips", []),
-            "mispronounced_count": len(mispronounced_words),
-            "confidence_data": [{"word": w["word"], "confidence": w["confidence"]} for w in mispronounced_words],
-            "level": level, 
-            "user_type": user_type
-        }
-        
-    except Exception as e:
-        logger.error(f"Pronunciation error: {e}")
-        return {
-            "accuracy": 70, "transcription": spoken_text or "", 
-            "whisper_detection": {"detected_language": "unknown", "language_probability": 0, "original_transcription": spoken_text or ""},
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": [],
-            "feedback": f"Could not analyze pronunciation: {str(e)}",
-            "tips": ["Ensure clear audio recording"],
-            "mispronounced_count": 0,
-            "level": level, "user_type": user_type
-        }
-
+@router.post("/practice")
+async def practice_fluent_lang(
+    request: Request,
+    name: str = Form(...),
+    native_language: str = Form(...),
+    target_language: str = Form(default="en"),
+    level: Optional[str] = Form(default=None),  
+    scenario: Optional[str] = Form(default=None),  
+    user_type: str = Form(default="student"),
+    audio_file: Optional[UploadFile] = File(default=None),
+    text_input: Optional[str] = Form(default=None),
+    session_id: Optional[str] = Form(default=None),
+    skip_retry: bool = Form(default=False),
+    model: Optional[str] = Form(default="gpt"),
+    voice_id: Optional[str] = Form(default=None, description="Custom TTS voice ID (e.g., 'en-US-JennyNeural'). If not provided, auto-selects based on language."),
+    current_user: User = Depends(get_current_user),
 ):
     """
     fluent language practice api - CONVERSATIONAL ONBOARDING
@@ -885,19 +347,13 @@ Return STRICTLY valid JSON:
                     except Exception as e:
                         logger.warning(f"[practice] Failed to cleanup temp file: {e}")
             
+            # Step 1: Get transcription from transcribe_audio_file (uses large-v3, auto-detect)
+            audio_file.file.seek(0)
+            user_text = await transcribe_audio_file(audio_file, target_language)
             
+            # Step 2: Get other metrics from analyze_speaking_advanced (pass transcription to skip re-transcribing)
             session_level_for_audio = session.get("level", "B1")
-            audio_analysis = await asyncio.to_thread(analyze_speaking_advanced, audio_path, session_level_for_audio)
-            if audio_analysis.get("success") and audio_analysis.get("transcription"):
-                user_text = audio_analysis.get("transcription")
-            elif not user_text:
-                
-                try:
-                    user_text = await asyncio.to_thread(
-                        speech_to_text, audio_path, normalize_language_code(target_language, default="en")
-                    )
-                except Exception as e:
-                    logger.error(f"[practice] Fallback speech_to_text failed: {e}")
+            audio_analysis = await asyncio.to_thread(analyze_speaking_advanced, audio_path, session_level_for_audio, user_text)
 
         
         if not user_text or not user_text.strip():
@@ -1720,4 +1176,158 @@ Return STRICTLY valid JSON:
             except:
                 pass
 
+def analyze_speaking_advanced(audio_path: str, target_cefr: str = "B1", transcription: str = None) -> dict:
+    """
+    Advanced speaking analysis: fluency, pronunciation, 
+    grammar errors, filler words, and CEFR vocabulary assessment.
+    
+    Args:
+        audio_path: Path to the audio file for audio-based metrics (fluency, pronunciation)
+        target_cefr: Target CEFR level for vocabulary assessment
+        transcription: Optional - if provided, skips Whisper transcription and uses this text.
+                       Use transcribe_audio_file() from fluent_api_v2 to get transcription.
+    """
+    result = {
+        "success": False,
+        "error": None,
+        "transcription": "",
+        "fluency": {},
+        "pronunciation": {},
+        "grammar_assessment": {
+            "errors": [],
+            "filler_words": [],
+            "corrected_text": "",
+            "filler_count": 0
+        },
+        "vocabulary_analysis": {
+            "cefr_level": "",
+            "vocabulary_score": 0,
+            "suggestions": []
+        },
+        "overall_score": 0.0,
+        "llm_feedback": ""
+    }
+    
+    try:
+        # Use provided transcription or do Whisper transcription as fallback
+        if transcription:
+            # Use the provided transcription (from transcribe_audio_file)
+            result["transcription"] = transcription
+        else:
+            # Fallback: do transcription here
+            model = _get_whisper_model()
+            segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
+            segments = list(segments)
+            transcription = " ".join([s.text.strip() for s in segments]).strip()
+            result["transcription"] = transcription
+        
+        if not transcription:
+            result["error"] = "No speech detected"
+            return _to_python_type(result)
 
+        
+        y, sr = librosa.load(audio_path, sr=16000)
+        duration = librosa.get_duration(y=y, sr=sr)
+        word_count = len(transcription.split())
+        wpm = (word_count / duration) * 60 if duration > 0 else 0
+        
+        
+        intervals = librosa.effects.split(y, top_db=30)
+        pauses = []
+        if len(intervals) > 1:
+            for i in range(1, len(intervals)):
+                p_dur = (intervals[i][0] - intervals[i-1][1]) / sr
+                if p_dur > 0.3: pauses.append(p_dur)
+        
+        wpm_score = 100
+        if wpm < IDEAL_WPM_MIN: wpm_score = max(0, 100 - (IDEAL_WPM_MIN - wpm) * 2)
+        elif wpm > IDEAL_WPM_MAX: wpm_score = max(0, 100 - (wpm - IDEAL_WPM_MAX) * 2)
+        
+        pause_score = max(0, 100 - len(pauses) * 5 - sum(p for p in pauses if p > 2) * 10)
+        fluency_score = (wpm_score * 0.5 + pause_score * 0.5)
+        
+        result["fluency"] = {
+            "wpm": round(wpm, 1),
+            "pause_count": len(pauses),
+            "score": round(fluency_score, 1)
+        }
+        
+        
+        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
+        pitch_vals = [pitches[magnitudes[:, t].argmax(), t] for t in range(pitches.shape[1]) if pitches[magnitudes[:, t].argmax(), t] > 0]
+        pitch_std = np.std(pitch_vals) if pitch_vals else 0
+        
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        clarity_score = min(100, np.mean(spectral_centroids) / 30)
+        intonation_score = min(100, max(0, 85 + (pitch_std - 20) * 0.2)) if 20 < pitch_std < 100 else (60 if pitch_std < 20 else 75)
+        
+        pron_score = (intonation_score * 0.4 + clarity_score * 0.6)
+        result["pronunciation"] = {
+            "clarity": round(clarity_score, 1),
+            "intonation": round(intonation_score, 1),
+            "score": round(pron_score, 1)
+        }
+
+        
+        prompt = f"""Analyze the following spoken transcript for a language learner targeting CEFR level {target_cefr}.
+        
+        TRANSCRIPT: "{transcription}"
+        
+        INSTRUCTIONS:
+        1. Identify GRAMMAR ERRORS and provide corrections.
+        2. Identify FILLER WORDS (like "um", "ah", "like", "you know", "er").
+        3. Provide a FULL CORRECTED VERSION of the text.
+        4. Analyze VOCABULARY:
+           - Is it appropriate for {target_cefr}?
+           - Suggest 3 better/more advanced words.
+        5. Provide an overall linguistic feedback.
+
+        Respond ONLY in this JSON format:
+        {{
+            "grammar_assessment": {{
+                "errors": [
+                    {{"error": "incorrect phrase", "correction": "correct phrase", "rule": "why it was wrong"}}
+                ],
+                "filler_words": ["um", "like"],
+                "corrected_text": "Complete corrected transcription here"
+            }},
+            "vocabulary_analysis": {{
+                "detected_cefr": "B1",
+                "vocabulary_score": 85,
+                "suggestions": [
+                    {{"original": "good", "advanced": "exceptional", "context": "describing weather"}}
+                ]
+            }},
+            "linguistic_score": 80,
+            "feedback": "Overall assessment of language usage."
+        }}
+        """
+        
+        llm_response = call_gpt(prompt, "You are an expert language examiner. Focus on grammar, filler words, and CEFR vocabulary.")
+        
+        import json
+        try:
+            json_start = llm_response.find('{')
+            json_end = llm_response.rfind('}') + 1
+            if json_start != -1:
+                parsed = json.loads(llm_response[json_start:json_end])
+                
+                
+                result["grammar_assessment"] = parsed.get("grammar_assessment", {})
+                result["grammar_assessment"]["filler_count"] = len(result["grammar_assessment"].get("filler_words", []))
+                
+                result["vocabulary_analysis"] = parsed.get("vocabulary_analysis", {})
+                result["llm_feedback"] = parsed.get("feedback", "")
+                
+                
+                ling_score = parsed.get("linguistic_score", 0)
+                result["overall_score"] = round((fluency_score * 0.3 + pron_score * 0.3 + ling_score * 0.4), 1)
+        except Exception as e:
+            result["llm_feedback"] = f"AI Analysis failed to parse: {str(e)}"
+            result["overall_score"] = round((fluency_score + pron_score) / 2, 1)
+
+        result["success"] = True
+    except Exception as e:
+        result["error"] = str(e)
+        
+    return _to_python_type(result)
