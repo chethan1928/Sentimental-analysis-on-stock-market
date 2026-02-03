@@ -1,3 +1,4 @@
+
 import asyncio
 import json
 import logging
@@ -7,15 +8,34 @@ import shutil
 import tempfile
 import uuid
 from typing import Optional
+
+from sqlalchemy import text
+from db.base import SessionLocal
 from faster_whisper import WhisperModel
-from fastapi import APIRouter, Form, File, UploadFile, HTTPException
+from fastapi import APIRouter, Form, File, UploadFile, HTTPException, Depends, Request
 from deep_translator import GoogleTranslator
 from openai import AzureOpenAI
 from pydub import AudioSegment
 
-from utils.tts_utils import analyze_speaking_advanced, load_language_mapping, normalize_language_code
-from ai_fluent import speech_to_text
-from db import chat_session_db as db
+from utils.agents_utils import analyze_speaking_advanced, load_language_mapping
+from utils.ai_fluent_utils import (
+    call_gpt,
+    detect_emotion,
+    score_fluency,
+    speech_to_text,
+    BOT_NAME,
+    BOT_ROLE,
+    THRESHOLD,
+)
+from models import User
+from db.agents_db import chat_session_db as db
+from utils.tts_utils import generate_tts_url
+from utils.user_details import get_current_user
+import shutil
+
+ffmpeg = shutil.which("ffmpeg")
+
+
 
 # from utils.common_utils import llm_client
 
@@ -1785,6 +1805,7 @@ Be specific to their scenario ({scenario}) and reference their actual progress."
 
 @router.post("/practice")
 async def practice_fluent_lang(
+    request: Request,
     name: str = Form(...),
     native_language: str = Form(...),
     target_language: str = Form(default="en"),
@@ -1795,7 +1816,9 @@ async def practice_fluent_lang(
     text_input: Optional[str] = Form(default=None),
     session_id: Optional[str] = Form(default=None),
     skip_retry: bool = Form(default=False),
-    model: Optional[str] = Form(default="gpt"),  
+    model: Optional[str] = Form(default="gpt"),
+    voice_id: Optional[str] = Form(default=None, description="Custom TTS voice ID (e.g., 'en-US-JennyNeural'). If not provided, auto-selects based on language."),
+    current_user: User = Depends(get_current_user),
 ):
     """
     fluent language practice api - CONVERSATIONAL ONBOARDING
@@ -1808,8 +1831,9 @@ async def practice_fluent_lang(
     5. termination phrase: ends session with summary
     """
     try:
-        
+        user_id = current_user.id if current_user else None
         audio_path = None
+        user_text = ""
         
         if not session_id or session_id.strip() == "" or session_id == "string":
             session_id = str(uuid.uuid4())
@@ -1864,7 +1888,7 @@ async def practice_fluent_lang(
                 session_id=session_id,
                 session_type="fluent",
                 data=session,
-                user_id=None,
+                user_id=user_id,
                 user_name=name
             )
             
@@ -1879,12 +1903,17 @@ async def practice_fluent_lang(
                 session["chat_history"].append({"role": "assistant", "content": ask_level})
                 await db.update_session(session_id, session)
                 
+                ask_level_audio = await generate_tts_url(request, ask_level_target, target_language, voice_id=voice_id)
+                
                 return {
                     "status": "onboarding",
                     "step": "collecting_level",
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
                     "scenario": scenario,
-                    "message": {"target": ask_level_target, "native": ask_level_native}
+                    "message": {"target": ask_level_target, "native": ask_level_native},
+                    "audio_url": ask_level_audio
                 }
 
         
@@ -1906,11 +1935,17 @@ async def practice_fluent_lang(
             session["chat_history"].append({"role": "assistant", "content": greeting})
             await db.update_session(session_id, session)
             
+            greeting_audio = await generate_tts_url(request, greeting_target, target_language, voice_id=voice_id)
+            
             return {
                 "status": "onboarding",
                 "step": "collecting_scenario",
                 "session_id": session_id,
-                "message": {"target": greeting_target, "native": greeting_native}
+                "target_lang": target_language,
+                "native_lang": native_language,
+                "transcription": user_text,
+                "message": {"target": greeting_target, "native": greeting_native},
+                "audio_url": greeting_audio
             }
         
         
@@ -1943,12 +1978,18 @@ async def practice_fluent_lang(
                 session["chat_history"].append({"role": "assistant", "content": ask_level})
                 await db.update_session(session_id, session)
                 
+                ask_level_audio = await generate_tts_url(request, ask_level, target_language, voice_id=voice_id)
+                
                 return {
                     "status": "onboarding",
                     "step": "collecting_level", 
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
+                    "transcription": user_text,
                     "scenario": scenario,
-                    "message": {"target": ask_level, "native": ask_level_native}
+                    "message": {"target": ask_level, "native": ask_level_native},
+                    "audio_url": ask_level_audio
                 }
             else:
                 
@@ -1963,6 +2004,9 @@ async def practice_fluent_lang(
                     "status": "onboarding",
                     "step": "collecting_scenario",
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
+                    "transcription": user_text,
                     "retry": True,
                     "message": {"target": retry_msg, "native": retry_native}
                 }
@@ -2008,14 +2052,20 @@ async def practice_fluent_lang(
             session["chat_history"].append({"role": "assistant", "content": question})
             await db.update_session(session_id, session)
             
+            question_audio = await generate_tts_url(request, question, target_language, voice_id=voice_id)
+            
             return {
                 "status": "practice_started",
                 "session_id": session_id,
+                "target_lang": target_language,
+                "native_lang": native_language,
                 "level": level_display,
                 "scenario": scenario,
+                "transcription": user_text,
                 "message": {"target": start_target, "native": start_native},
                 "next_question": {"target": question, "native": q_native},
-                "hint": {"target": hint, "native": h_native}
+                "hint": {"target": hint, "native": h_native},
+                "audio_url": question_audio
             }
         
         
@@ -2041,8 +2091,12 @@ async def practice_fluent_lang(
             skipped_msg = await translate_text("Skipped", "en", native_language)
             skipped_next_msg = await translate_text("Skipped. Let's try the next question!", "en", native_language)
             
+            follow_up_audio = await generate_tts_url(request, follow_up, target_language, voice_id=voice_id)
+            
             return {
-                "status": "continue", "session_id": session_id, "transcription": "(skipped)",
+                "status": "continue", "session_id": session_id,
+                "target_lang": target_language, "native_lang": native_language,
+                "transcription": "(skipped)",
                 "next_question": {"target": follow_up, "native": await translate_text(follow_up, target_language, native_language)},
                 "hint": {"target": hint, "native": await translate_text(hint, target_language, native_language)},
                 "grammar": {"score": 0, "is_correct": True, "you_said": "", "you_should_say": "", "errors": [], "word_suggestions": [], "corrected_sentence": "", "improved_sentence": "", "feedback": skipped_msg},
@@ -2050,7 +2104,8 @@ async def practice_fluent_lang(
                 "pronunciation": {"accuracy": 0, "total_words": 0, "words_to_practice": [], "well_pronounced_words": [], "feedback": skipped_msg, "practice_sentence": "", "tips": []},
                 "fluency": {"score": 0, "wpm": 0, "speed_status": "skipped", "original_text": "", "corrected_text": "", "improved_sentence": ""},
                 "personalized_feedback": {"user_type": user_type, "message": skipped_next_msg, "improvement_areas": [], "strengths": [], "perfect_areas": [], "perfect_feedback": {}, "quick_tip": ""},
-                "overall_score": 0, "passing_score": PASSING_SCORE, "should_retry": False, "turn_number": session["turn_number"]
+                "overall_score": 0, "passing_score": PASSING_SCORE, "should_retry": False, "turn_number": session["turn_number"],
+                "audio_url": follow_up_audio
             }
         
         
@@ -2075,11 +2130,15 @@ async def practice_fluent_lang(
             
             await db.update_session(session_id, session)
             
+            question_audio = await generate_tts_url(request, question, target_language, voice_id=voice_id)
+            
             return {
                 "status": "conversation_started", "session_id": session_id,
+                "target_lang": target_language, "native_lang": native_language,
                 "greeting": {"target": greeting_target, "native": greeting_native},
                 "next_question": {"target": question, "native": question_native},
-                "hint": {"target": hint, "native": hint_native}
+                "hint": {"target": hint, "native": hint_native},
+                "audio_url": question_audio
             }
         
         user_text = text_input or ""
@@ -2189,6 +2248,8 @@ async def practice_fluent_lang(
                 return {
                     "status": "conversation_ended",
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
                     "final_scores": final_scores,
                     "overall_score": overall,
                     "passing_score": PASSING_SCORE,
@@ -2231,13 +2292,18 @@ async def practice_fluent_lang(
                     translate_text(retry_msg, target_language, native_language)
                 )
                 
+                question_audio = await generate_tts_url(request, current_q, target_language, voice_id=voice_id)
+                
                 return {
                     "status": "continue",
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
                     "next_question": {"target": current_q, "native": q_native},
                     "hint": {"target": current_h, "native": h_native},
                     "message": {"target": retry_msg, "native": retry_msg_native},
-                    "turn_number": session.get("turn_number", 0)
+                    "turn_number": session.get("turn_number", 0),
+                    "audio_url": question_audio
                 }
             elif wants_skip:
                 
@@ -2267,13 +2333,18 @@ async def practice_fluent_lang(
                     translate_text(hint, target_language, native_language)
                 )
                 
+                follow_up_audio = await generate_tts_url(request, follow_up, target_language, voice_id=voice_id)
+                
                 return {
                     "status": "continue",
                     "session_id": session_id,
+                    "target_lang": target_language,
+                    "native_lang": native_language,
                     "message": {"target": skip_msg, "native": skip_msg_native},
                     "next_question": {"target": follow_up, "native": follow_up_native},
                     "hint": {"target": hint, "native": hint_native},
-                    "turn_number": session["turn_number"]
+                    "turn_number": session["turn_number"],
+                    "audio_url": follow_up_audio
                 }
             else:
                 
@@ -2292,13 +2363,18 @@ async def practice_fluent_lang(
                     
                     await db.update_session(session_id, session)
                     
+                    auto_skip_audio = await generate_tts_url(request, follow_up, target_language, voice_id=voice_id)
+                    
                     return {
                         "status": "auto_skipped",
                         "session_id": session_id,
+                        "target_lang": target_language,
+                        "native_lang": native_language,
                         "message": {"target": "Moving to the next question.", "native": await translate_text("Moving to the next question.", "en", native_language)},
                         "next_question": {"target": follow_up, "native": await translate_text(follow_up, target_language, native_language)},
                         "hint": {"target": hint, "native": await translate_text(hint, target_language, native_language)},
-                        "turn_number": session["turn_number"]
+                        "turn_number": session["turn_number"],
+                        "audio_url": auto_skip_audio
                     }
                 else:
                     
@@ -2624,6 +2700,7 @@ Return STRICTLY valid JSON:
             
             return {
                 "status": "conversation_ended", "session_id": session_id,
+                "target_lang": target_language, "native_lang": native_language,
                 "final_scores": final_scores, "overall_score": overall, "passing_score": PASSING_SCORE,
                 "average_wpm": average_wpm, "wpm_status": wpm_status,
                 "detailed_feedback": detailed_feedback, "turn_comparison": turn_comparison,
@@ -2801,8 +2878,12 @@ Return STRICTLY valid JSON:
             session["waiting_retry_decision"] = True
             await db.update_session(session_id, session)
             
+            retry_audio = await generate_tts_url(request, retry_prompt_target, target_language, voice_id=voice_id)
+            
             return {
-                "status": "feedback", "session_id": session_id, "transcription": user_text,
+                "status": "feedback", "session_id": session_id,
+                "target_lang": target_language, "native_lang": native_language,
+                "transcription": user_text,
                 "grammar": grammar_translated, "vocabulary": vocab_translated, 
                 "pronunciation": pron_translated, "fluency": fluency_translated,
                 "personalized_feedback": feedback_translated, "overall_score": overall_score,
@@ -2810,7 +2891,8 @@ Return STRICTLY valid JSON:
                 "retry_prompt": {"target": retry_prompt_target, "native": retry_prompt_native},
                 "retry_count": session.get("retry_count", 1), "improvement": improvement, "turn_number": session["turn_number"],
                 "next_question": {"target": current_q, "native": q_native},
-                "hint": {"target": current_h, "native": h_native}
+                "hint": {"target": current_h, "native": h_native},
+                "audio_url": retry_audio
             }
 
         else:
@@ -2830,15 +2912,20 @@ Return STRICTLY valid JSON:
             
             await db.update_session(session_id, session, overall_score=overall_score)
             
+            follow_up_audio = await generate_tts_url(request, follow_up, target_language, voice_id=voice_id)
+            
             return {
-                "status": "continue", "session_id": session_id, "transcription": user_text,
+                "status": "continue", "session_id": session_id,
+                "target_lang": target_language, "native_lang": native_language,
+                "transcription": user_text,
                 "grammar": grammar_translated, "vocabulary": vocab_translated,
                 "pronunciation": pron_translated, "fluency": fluency_translated,
                 "personalized_feedback": feedback_translated, "overall_score": overall_score,
                 "passing_score": PASSING_SCORE, "should_retry": False, "turn_number": session["turn_number"],
                 "improvement": improvement,  
                 "next_question": {"target": follow_up, "native": follow_up_native},
-                "hint": {"target": hint, "native": hint_native}
+                "hint": {"target": hint, "native": hint_native},
+                "audio_url": follow_up_audio
             }
     
     except Exception as e:
@@ -2882,217 +2969,3 @@ async def get_fluent_feedback(session_id: str):
     if feedback["session_type"] != "fluent":
         raise HTTPException(status_code=400, detail="Not a fluent session")
     return feedback
-this def analyze_speaking_advanced(audio_path: str, target_cefr: str = "B1", transcription: str = None, target_lang: str = "en") -> dict:
-    """
-    Advanced speaking analysis: fluency, pronunciation, 
-    grammar errors, filler words, and CEFR vocabulary assessment.
-    
-    Args:
-        audio_path: Path to the audio file for audio-based metrics (fluency, pronunciation)
-        target_cefr: Target CEFR level for vocabulary assessment
-        transcription: Optional - if provided, skips Whisper transcription and uses this text.
-                       Use transcribe_audio_file() from fluent_api_v2 to get transcription.
-        target_lang: Target language code (e.g., "en", "hi", "es") - will translate if detected language differs
-    """
-    result = {
-        "success": False,
-        "error": None,
-        "transcription": "",
-        "fluency": {},
-        "pronunciation": {},
-        "grammar_assessment": {
-            "errors": [],
-            "filler_words": [],
-            "corrected_text": "",
-            "filler_count": 0
-        },
-        "vocabulary_analysis": {
-            "cefr_level": "",
-            "vocabulary_score": 0,
-            "suggestions": []
-        },
-        "overall_score": 0.0,
-        "llm_feedback": ""
-    }
-    
-    try:
-        # Normalize target language code
-        normalized_target = target_lang.lower() if target_lang else "en"
-        lang_mapping = load_language_mapping()
-        if normalized_target in lang_mapping:
-            normalized_target = lang_mapping[normalized_target]
-        
-        # Use provided transcription or do Whisper transcription as fallback
-        if transcription:
-            # Use the provided transcription (from transcribe_audio_file)
-            result["transcription"] = transcription
-        else:
-            # Fallback: do transcription here with auto-detection
-            model = _get_whisper_model()
-            segments, info = model.transcribe(audio_path, beam_size=5, word_timestamps=True)
-            segments = list(segments)
-            transcription = " ".join([s.text.strip() for s in segments]).strip()
-            
-            # Detect language and translate if needed
-            detected_lang = info.language if info else "en"
-            if transcription and detected_lang != normalized_target:
-                try:
-                    from deep_translator import GoogleTranslator
-                    translated = GoogleTranslator(source=detected_lang, target=normalized_target).translate(transcription)
-                    if translated:
-                        transcription = translated
-                except Exception as e:
-                    logger.debug(f"Translation to {normalized_target} failed: {e}")
-            
-            result["transcription"] = transcription
-        
-        if not transcription:
-            result["error"] = "No speech detected"
-            return _to_python_type(result)
-
-        
-        y, sr = librosa.load(audio_path, sr=16000)
-        duration = librosa.get_duration(y=y, sr=sr)
-        word_count = len(transcription.split())
-        wpm = (word_count / duration) * 60 if duration > 0 else 0
-        
-        
-        intervals = librosa.effects.split(y, top_db=30)
-        pauses = []
-        if len(intervals) > 1:
-            for i in range(1, len(intervals)):
-                p_dur = (intervals[i][0] - intervals[i-1][1]) / sr
-                if p_dur > 0.3: pauses.append(p_dur)
-        
-        wpm_score = 100
-        if wpm < IDEAL_WPM_MIN: wpm_score = max(0, 100 - (IDEAL_WPM_MIN - wpm) * 2)
-        elif wpm > IDEAL_WPM_MAX: wpm_score = max(0, 100 - (wpm - IDEAL_WPM_MAX) * 2)
-        
-        pause_score = max(0, 100 - len(pauses) * 5 - sum(p for p in pauses if p > 2) * 10)
-        fluency_score = (wpm_score * 0.5 + pause_score * 0.5)
-        
-        result["fluency"] = {
-            "wpm": round(wpm, 1),
-            "pause_count": len(pauses),
-            "score": round(fluency_score, 1)
-        }
-        
-        
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr)
-        pitch_vals = [pitches[magnitudes[:, t].argmax(), t] for t in range(pitches.shape[1]) if pitches[magnitudes[:, t].argmax(), t] > 0]
-        pitch_std = np.std(pitch_vals) if pitch_vals else 0
-        
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        clarity_score = min(100, np.mean(spectral_centroids) / 30)
-        intonation_score = min(100, max(0, 85 + (pitch_std - 20) * 0.2)) if 20 < pitch_std < 100 else (60 if pitch_std < 20 else 75)
-        
-        pron_score = (intonation_score * 0.4 + clarity_score * 0.6)
-        result["pronunciation"] = {
-            "clarity": round(clarity_score, 1),
-            "intonation": round(intonation_score, 1),
-            "score": round(pron_score, 1)
-        }
-
-        
-        prompt = f"""Analyze the following spoken transcript for a language learner targeting CEFR level {target_cefr}.
-        
-        TRANSCRIPT: "{transcription}"
-        
-        INSTRUCTIONS:
-        1. Identify GRAMMAR ERRORS and provide corrections.
-        2. Identify FILLER WORDS (like "um", "ah", "like", "you know", "er").
-        3. Provide a FULL CORRECTED VERSION of the text.
-        4. Analyze VOCABULARY:
-           - Is it appropriate for {target_cefr}?
-           - Suggest 3 better/more advanced words.
-        5. Provide an overall linguistic feedback.
-
-        Respond ONLY in this JSON format:
-        {{
-            "grammar_assessment": {{
-                "errors": [
-                    {{"error": "incorrect phrase", "correction": "correct phrase", "rule": "why it was wrong"}}
-                ],
-                "filler_words": ["um", "like"],
-                "corrected_text": "Complete corrected transcription here"
-            }},
-            "vocabulary_analysis": {{
-                "detected_cefr": "B1",
-                "vocabulary_score": 85,
-                "suggestions": [
-                    {{"original": "good", "advanced": "exceptional", "context": "describing weather"}}
-                ]
-            }},
-            "linguistic_score": 80,
-            "feedback": "Overall assessment of language usage."
-        }}
-        """
-        
-        llm_response = call_gpt(prompt, "You are an expert language examiner. Focus on grammar, filler words, and CEFR vocabulary.")
-        
-        import json
-        try:
-            json_start = llm_response.find('{')
-            json_end = llm_response.rfind('}') + 1
-            if json_start != -1:
-                parsed = json.loads(llm_response[json_start:json_end])
-                
-                
-                result["grammar_assessment"] = parsed.get("grammar_assessment", {})
-                result["grammar_assessment"]["filler_count"] = len(result["grammar_assessment"].get("filler_words", []))
-                
-                result["vocabulary_analysis"] = parsed.get("vocabulary_analysis", {})
-                result["llm_feedback"] = parsed.get("feedback", "")
-                
-                
-                ling_score = parsed.get("linguistic_score", 0)
-                result["overall_score"] = round((fluency_score * 0.3 + pron_score * 0.3 + ling_score * 0.4), 1)
-        except Exception as e:
-            result["llm_feedback"] = f"AI Analysis failed to parse: {str(e)}"
-            result["overall_score"] = round((fluency_score + pron_score) / 2, 1)
-
-        result["success"] = True
-    except Exception as e:
-        result["error"] = str(e)
-        
-    return _to_python_type(result)
-in ai fleunt 
-def speech_to_text(audio_path, lang_code="en", return_raw=False):
-    """Converts speech to text for the given language, retrying if no speech is detected."""
-
-    while True:  # Keep asking until valid speech is detected
-        speech_array, sampling_rate = librosa.load(audio_path, sr=16000)
-
-        if max(speech_array) < 0.01:  # Check if audio is silent
-            print("🔇 No speech detected. Please speak again...")
-            record_audio(audio_path)  # Re-record audio
-            continue  # Retry transcription
-
-        whisper_lang = WHISPER_LANG_MAP.get(lang_code, "english")
-
-        try:
-            # Use faster_whisper model for transcription
-            segments, _ = model.transcribe(
-                audio_path,
-                language=lang_code,   # pass ISO code ("en", "fr", etc.)
-                beam_size=5
-            )
-            raw_transcription = " ".join([seg.text for seg in segments]).strip()
-        except Exception as e:
-            print(f"⚠️ Whisper transcription failed: {e}")
-            raw_transcription = ""
-
-        print(f"📝 Raw Transcription ({whisper_lang}): {raw_transcription}")
-
-        if not raw_transcription.strip():  # If empty, ask again
-            print("⚠️ No valid speech detected. Please try again...")
-            record_audio(audio_path)  # Re-record audio
-            continue  # Retry transcription
-
-        # --- Return cases ---
-        if return_raw:
-            # Just return the raw transcription without redundant translation
-            return remove_repeated_words(raw_transcription.strip())
-
-        # Return transcription as-is (caller should use transcribe_audio_file for proper detection/translation)
-        return remove_repeated_words(raw_transcription.strip().lower())
