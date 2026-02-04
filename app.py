@@ -1,1421 +1,78 @@
-
-
-import asyncio
-import json
-import logging
-import os
-import re
-import shutil
-import tempfile
-import uuid
-from typing import Optional
-
-from fastapi import APIRouter, Form, File, UploadFile, HTTPException, Request, Depends
-from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
-from openai import AzureOpenAI
-from pydub import AudioSegment
-from logger_setup import logger
-from utils.tts_utils import generate_tts_url, load_language_mapping, normalize_language_code
-
  
 
-# from utils.common_utils import llm_client
 
-# AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
 
 QWEN_ENABLED = False
 qwen_client = None  
 QWEN_MODEL_NAME = "Qwen/Qwen3-0.6B"  
 
-_whisper_model = WhisperModel("small", compute_type="int8")
 
-router = APIRouter()
+_whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
-BOT_NAME = "Clara"
+
+ 
 PASSING_SCORE = 50
-TERMINATION_PHRASES = ["exit", "stop", "end", "finish", "quit", "done", "bye", "goodbye"]
-
-INTERVIEW_SCENARIOS = {
-    "marketing": "Marketing Executive HR Interview",
-    "sales": "Sales Representative HR Interview",
-    "software": "Software Engineer HR Interview (Non-Technical)",
-    "business_analyst": "Business Analyst HR Interview",
-    "self_intro": "Self Introduction",
-    "college_interview": "College Admission Interview",
-    "job_interview": "General Job Interview",
-    "professor_talk": "Talk with Professor",
-    "behavioral": "Behavioral Interview",
-    "technical": "Technical Interview"
-}
-
-
-GRAMMAR_FIELDS = ["feedback", "filler_feedback", "errors", "word_suggestions", "corrected_sentence", "improved_sentence", "strengths"]
-VOCAB_FIELDS = ["feedback", "suggestions", "word_levels"]
-PRON_FIELDS = ["feedback", "words_to_practice"]
-FLUENCY_FIELDS = ["feedback"]
-EVAL_FIELDS = ["clarity", "structure", "relevance", "confidence", "issue_summary", "improved_answer"]
-PERSONAL_FIELDS = ["message", "improvement_areas", "strengths"]
-
-async def call_llm(prompt: str, mode: str = "chat", timeout: int = 30, model: str = "gpt", target_language: str = "en") -> str:
-    """async llm call with proper error handling and timeout. Supports gpt (default) or qwen."""
-    base_prompts = {
-        "chat": "You are a kind, human-like conversational interview coach.",
-        "analysis": "You are an expert language evaluator. Analyze objectively and concisely.",
-        "strict_json": "You are a structured evaluator. Respond ONLY in valid JSON. No extra text."
-    }
-    
-    lang_lower = target_language.lower() if target_language else "en"
-    is_english = lang_lower in ["en", "english"]
-    lang_instruction = f" IMPORTANT: Respond entirely in {target_language} language." if not is_english else ""
-    system_prompts = {k: v + lang_instruction for k, v in base_prompts.items()}
-    
-    
-    if model.lower() == "qwen" and QWEN_ENABLED and qwen_client is not None:
-        try:
-            
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    qwen_client.chat.completions.create,
-                    model=QWEN_MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=800,
-                    temperature=0.7 if mode == "chat" else 0.3
-                ),
-                timeout=timeout
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            logger.warning(f"Qwen call failed, falling back to GPT: {e}")
-            
-    
-    
-    try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                llm_client.chat.completions.create,
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=800,
-                temperature=0.7 if mode == "chat" else 0.3
-            ),
-            timeout=timeout
-        )
-        return response.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        logger.error(f"LLM call timed out after {timeout}s")
-        return ""
-    except Exception as e:
-        logger.error(f"LLM call failed: {e}")
-        return ""
-
-
-async def translate_text(text: str, source: str, target: str) -> str:
-    """translate text between languages"""
-    if source == target or not text or not isinstance(text, str):
-        return text if isinstance(text, str) else ""
-    try:
-        translator = GoogleTranslator(source=source, target=target)
-        return await asyncio.to_thread(translator.translate, text)
-    except Exception as e:
-        logger.debug(f"Translation failed: {e}")
-        return text
-
-
-async def translate_if_needed(text: str, target_language: str) -> str:
-    """Translate English fallback text into target language when needed."""
-    if not isinstance(text, str):
-        return text
-    if not target_language or target_language.lower() in ["en", "english"]:
-        return text
-    return await translate_text(text, "en", target_language)
-
-
-async def translate_values(value, target_language: str):
-    """Translate all string values in nested structures to target language."""
-    if not target_language or target_language.lower() in ["en", "english"]:
-        return value
-    if isinstance(value, str):
-        return await translate_text(value, "en", target_language)
-    if isinstance(value, list):
-        return [await translate_values(v, target_language) for v in value]
-    if isinstance(value, dict):
-        return {k: await translate_values(v, target_language) for k, v in value.items()}
-    return value
-
-
-async def make_bilingual(value, source: str, target: str):
-    """Convert a value to {target, native} structure with translations"""
-    if source == target:
-        return value  
-    
-    if isinstance(value, str):
-        if not value.strip():
-            return {"target": value, "native": value}
-        native = await translate_text(value, source, target)
-        return {"target": value, "native": native}
-    
-    elif isinstance(value, list):
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                
-                translated_item = {}
-                for k, v in item.items():
-                    translated_item[k] = await make_bilingual(v, source, target)
-                result.append(translated_item)
-            elif isinstance(item, str):
-                native = await translate_text(item, source, target)
-                result.append({"target": item, "native": native})
-            else:
-                result.append(item)
-        return result
-    
-    elif isinstance(value, dict):
-        
-        result = {}
-        for k, v in value.items():
-            result[k] = await make_bilingual(v, source, target)
-        return result
-    
-    else:
-        return value
-
-
-async def translate_analysis(analysis: dict, source: str, target: str, fields_to_translate: list) -> dict:
-    """Translate specified fields in analysis dict to target/native format"""
-    if source == target:
-        return analysis  
-    
-    result = {}
-    for key, value in analysis.items():
-        if key in fields_to_translate:
-            result[key] = await make_bilingual(value, source, target)
-        else:
-            result[key] = value  
-    return result
-
-# BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# language_codes_path = os.path.join(BASE_DIR, "language-codes.json")
-
-# def load_language_mapping():
-#     try:
-#         if not os.path.exists(language_codes_path):
-#             logger.error(f"File not found - {language_codes_path}")
-            
-#         with open(language_codes_path, "r") as f:
-#             language_codes = json.load(f)
-#             print("Language codes loaded:", language_codes)
-#             return language_codes
-#     except:
-#         logger.error("Error loading language mapping.")
-#         return {}
-
-
-async def transcribe_audio_file(audio_file: UploadFile, target_lang: str = "en") -> str:
-    """Transcribe audio forcing target language (no auto-detect)."""
-    try:
-        audio_file.file.seek(0)
-    except:
-        pass
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-        shutil.copyfileobj(audio_file.file, tmp)
-        temp_upload = tmp.name
-    
-    audio_path = None
-    try:
-        audio = AudioSegment.from_file(temp_upload)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio_path = temp_upload.replace('.tmp', '_converted.wav')
-        audio.export(audio_path, format="wav")
-
-        # Normalize target language code using load_language_mapping (consistent with fluent_api_v2.py)
-        languages_data = load_language_mapping()
-        normalized_target = languages_data.get(target_lang.lower(), target_lang.lower()) if target_lang else "en"
-
-        # Force Whisper to transcribe in the target language
-        logger.debug(f"Transcribing audio with forced language: {normalized_target}")
-        segments, info = await asyncio.to_thread(
-            _whisper_model.transcribe, audio_path, task="transcribe", language=normalized_target
-        )
-        user_text = " ".join([seg.text for seg in segments]).strip()
-        logger.debug(f"Whisper transcribed in {normalized_target}: {user_text[:100] if user_text else 'empty'}")
-
-        return user_text
-    except Exception as e:
-        logger.debug(f"Audio transcription failed: {e}")
-        return ""
-    finally:
-        
-        if os.path.exists(temp_upload):
-            try:
-                os.unlink(temp_upload)
-            except:
-                pass
-        if audio_path and os.path.exists(audio_path):
-            try:
-                os.unlink(audio_path)
-            except:
-                pass
-
-TYPE_KEYWORDS = {
-    "hr": "hr", "human resource": "hr", "behavioral": "behavioral", "behavior": "behavioral",
-    "technical": "technical", "tech": "technical", "managerial": "managerial", "management": "managerial",
-    "general": "general", "normal": "general"
-}
-
-
-# async def extract_role_from_text(user_text: str, model: str = "gpt") -> dict:
-#     """Extract job role from natural language using LLM only - accepts ANY role"""
-    
-#     prompt = f"""Extract the job role/position from this text: "{user_text}"
-
-# If a job role/position is mentioned (e.g., "software engineer", "electrical engineer", "teacher", "chef", "pilot", etc.), 
-# extract it EXACTLY as the user said it and capitalize properly.
-
-# Return JSON: {{"success": true, "role": "Exact Job Title"}}
-# If no job role is mentioned: {{"success": false, "role": null}}
-
-# Return ONLY valid JSON."""
-    
-#     try:
-#         raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             result = json.loads(json_match.group())
-#             if result.get("success") and result.get("role"):
-#                 return result
-#     except:
-#         pass
-    
-#     return {"success": False, "role": None}
-
-
-import shutil
-ffmpeg = shutil.which("ffmpeg")
-
-async def extract_role_from_text(user_text: str, model: str = "gpt") -> dict:
-   """Extract job role from natural language using LLM - accepts ANY role from audio"""
-   user_lower = user_text.lower().strip()
-   # If text is empty or too short
-   if not user_lower or len(user_lower) < 2:
-       return {"success": False, "role": None}
-       
-   prompt = f"""You are extracting a JOB ROLE/POSITION from user's SPEECH/AUDIO transcription.
-        USER SAID: "{user_text}"
-        YOUR TASK: Extract the JOB ROLE or POSITION they mentioned.
-        CRITICAL RULES:
-        1. Extract WHATEVER job role/position the user mentioned - it can be ANY job
-        2. The user's audio might have transcription errors - understand the intent
-        3. Capitalize the job title properly (e.g., "Software Engineer", "Data Scientist")
-        4. Accept ANY job: traditional roles, modern roles, creative roles, anything
-        EXAMPLES:
-        - "software engineer" → "Software Engineer"
-        - "I want to practice for data scientist role" → "Data Scientist"
-        - "marketing" → "Marketing Manager"
-        - "teacher" → "Teacher"
-        - "chef" → "Chef"
-        - "machine learning engineer" → "Machine Learning Engineer"
-        - "product manager" → "Product Manager"
-        - "nurse" → "Nurse"
-        - "electrical engineer" → "Electrical Engineer"
-        - "content writer" → "Content Writer"
-        - "UI UX designer" → "UI/UX Designer"
-        - "devops" → "DevOps Engineer"
-        - "full stack developer" → "Full Stack Developer"
-        - "hr" → "HR Manager"
-        - "sales" → "Sales Executive"
-        - "accountant" → "Accountant"
-        - ANY job mentioned → extract and capitalize properly
-        Return ONLY this JSON format:
-        {{"success": true, "role": "Properly Capitalized Job Title"}}
-        If NO job role is mentioned at all:
-        {{"success": false, "role": null}}
-        DO NOT explain. Return ONLY the JSON.
-    """
-   try:
-       raw = await call_llm(prompt, mode="strict_json", timeout=15, model=model)
-       json_match = re.search(r'\{[\s\S]*\}', raw)
-       if json_match:
-           result = json.loads(json_match.group())
-           if result.get("success") and result.get("role"):
-               return result
-   except Exception as e:
-       logger.exception(f"LLM role extraction failed: {e}")
-
-   # Fallback: Try to extract role from user's words directly
-   # Remove common filler words and non-meaningful sounds
-   filler_words = {"i", "want", "to", "practice", "for", "the", "a", "an", "role", "position", "job", "interview", "as"}
-   non_meaningful_sounds = {"hmm", "hm", "um", "uh", "uhh", "er", "err", "ah", "ahh", "oh", "okay", "ok", "yes", "no", "yeah", "yep", "nope", "like", "well", "so", "just", "maybe", "hmmmm", "ummm", "uhhh"}
-   words = [w for w in re.findall(r'[a-z]+', user_lower)
-            if w not in filler_words and w not in non_meaningful_sounds and len(w) > 2]
-   if words:
-       # Capitalize each word and join as role
-       role = " ".join(word.capitalize() for word in words[:4])  # Take up to 4 words
-       return {"success": True, "role": role}
-
-   # No meaningful role found - return False so user can be asked to clarify
-   return {"success": False, "role": None}
-
-
-async def extract_interview_type_from_text(user_text: str, model: str = "gpt") -> dict:
-    """Extract interview type from natural language - accepts ANY type"""
-    user_lower = user_text.lower()
-    
-    
-    for keyword, itype in TYPE_KEYWORDS.items():
-        if keyword in user_lower:
-            return {"success": True, "type": itype, "confidence": "high"}
-    
-    
-    prompt = f"""Extract the interview type from: "{user_text}"
-
-IMPORTANT: Accept ANY type of interview the user mentions, not just predefined ones.
-Examples: hr, behavioral, technical, managerial, sales, marketing, customer service, finance, product management, design, data science, etc.
-
-If user mentions ANY interview type, extract and format it:
-- Return: {{"success": true, "type": "extracted_type_in_lowercase", "confidence": "high"}}
-- Example: "I want a sales interview" → {{"success": true, "type": "sales", "confidence": "high"}}
-- Example: "customer service role" → {{"success": true, "type": "customer_service", "confidence": "high"}}
-
-If the text is completely unclear or no interview type is mentioned at all:
-- Return: {{"success": false, "type": "general", "confidence": "low"}}
-
-Return ONLY valid JSON."""
-    
-    try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-            
-            if result.get("type"):
-                result["success"] = True
-            return result
-    except:
-        pass
-    
-    return {"success": True, "type": "general", "confidence": "low"}
-
-
-async def check_answer_relevance(question: str, answer: str, model: str = "gpt", target_language: str = "en") -> dict:
-    """Check if answer is relevant to question, generate friendly redirect if not"""
-    
-    if len(answer.split()) < 5:
-        return {"relevant": True}
-    
-    prompt = f"""You are an interview coach. Check if this answer is COMPLETELY IRRELEVANT to the question.
-
-Question: "{question}"
-Answer: "{answer}"
-Target Language: "{target_language}"
-
-IMPORTANT RULES:
-1. Be VERY LENIENT - only mark as irrelevant if the answer is about a COMPLETELY DIFFERENT TOPIC
-2. If the answer even SLIGHTLY relates to the question, mark it as relevant
-3. Personal stories, examples, or tangential answers should be marked RELEVANT
-4. Only mark irrelevant if user talks about something totally unrelated (e.g., asked about skills but talks about weather)
-5. If the answer is irrelevant, write the redirect message in the Target Language specified above
-
-If relevant (even slightly), return: {{"relevant": true}}
-If COMPLETELY UNRELATED (different topic entirely), return: {{"relevant": false, "redirect": "friendly 1-line message in the target language"}}
-
-Return ONLY valid JSON."""
-    
-    try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-            
-            if not result.get("relevant", True) and not result.get("redirect"):
-                return {"relevant": True}
-            return result
-    except:
-        pass
-    return {"relevant": True}  
-
-
-async def compare_attempts(attempts: list, level: str = "B1", user_type: str = "professional", model: str = "gpt", target_language: str = "en") -> dict:
-    """
-    Compare interview attempts using LLM for detailed, elaborative feedback on ALL aspects:
-    grammar, vocabulary, pronunciation, fluency, and answer quality.
-    """
-    if len(attempts) < 2:
-        summary = "This is your first attempt. Let's see how you do!"
-        if target_language and target_language != "en":
-            try:
-                summary = await translate_text(summary, "en", target_language)
-            except Exception as e:
-                logger.debug(f"Compare attempts fallback translation failed: {e}")
-        return {
-            "overall_improvement": 0,
-            "trend": "first_attempt",
-            "overall_summary": summary,
-            "details": {}
-        }
-    
-    prev = attempts[-2]
-    current = attempts[-1]
-    
-    
-    prev_grammar = (prev.get("grammar") or {}).get("score", 0) or 0
-    current_grammar = (current.get("grammar") or {}).get("score", 0) or 0
-    
-    prev_vocab = (prev.get("vocabulary") or {}).get("score", 0) or 0
-    current_vocab = (current.get("vocabulary") or {}).get("score", 0) or 0
-    
-    prev_pron = (prev.get("pronunciation") or {}).get("accuracy", 0) or 0
-    current_pron = (current.get("pronunciation") or {}).get("accuracy", 0) or 0
-    
-    prev_fluency = (prev.get("fluency") or {}).get("score", 0) or 0
-    current_fluency = (current.get("fluency") or {}).get("score", 0) or 0
-    
-    prev_answer = (prev.get("answer_evaluation") or {}).get("score", 0) or 0
-    current_answer = (current.get("answer_evaluation") or {}).get("score", 0) or 0
-    
-    prev_overall = prev.get("overall_score", 0) or 0
-    current_overall = current.get("overall_score", 0) or 0
-    
-    
-    grammar_diff = round(current_grammar - prev_grammar, 1)
-    vocab_diff = round(current_vocab - prev_vocab, 1)
-    pron_diff = round(current_pron - prev_pron, 1)
-    fluency_diff = round(current_fluency - prev_fluency, 1)
-    answer_diff = round(current_answer - prev_answer, 1)
-    overall_diff = round(current_overall - prev_overall, 1)
-    
-    
-    if overall_diff > 10:
-        trend = "significantly_improved"
-    elif overall_diff > 0:
-        trend = "improved"
-    elif overall_diff < -10:
-        trend = "declined"
-    elif overall_diff < 0:
-        trend = "slightly_declined"
-    else:
-        trend = "no_change"
-    
-    prompt = f"""You are an expert interview coach comparing TWO attempts at the SAME question.
-Respond in the target language: {target_language}.
-Provide DETAILED, ELABORATIVE feedback on improvement or decline in ALL areas.
-
-PREVIOUS ATTEMPT:
-- Overall Score: {prev_overall}%
-- Grammar: {prev_grammar}%
-- Vocabulary: {prev_vocab}%
-- Pronunciation: {prev_pron}%
-- Fluency: {prev_fluency}%
-- Answer Quality: {prev_answer}%
-- What they said: "{prev.get('transcription', '')[:200]}"
-
-CURRENT ATTEMPT:
-- Overall Score: {current_overall}%
-- Grammar: {current_grammar}% ({'+' if grammar_diff > 0 else ''}{grammar_diff}%)
-- Vocabulary: {current_vocab}% ({'+' if vocab_diff > 0 else ''}{vocab_diff}%)
-- Pronunciation: {current_pron}% ({'+' if pron_diff > 0 else ''}{pron_diff}%)
-- Fluency: {current_fluency}% ({'+' if fluency_diff > 0 else ''}{fluency_diff}%)
-- Answer Quality: {current_answer}% ({'+' if answer_diff > 0 else ''}{answer_diff}%)
-- What they said: "{current.get('transcription', '')[:200]}"
-
-USER CONTEXT:
-- Level: {level}
-- User Type: {user_type}
-
-Analyze EACH category's improvement and provide detailed, professional feedback.
-
-Return STRICTLY valid JSON:
-{{
-    "overall_summary": "3-4 sentences summarizing the overall improvement journey in a professional tone.",
-    "grammar_analysis": {{
-        "previous_score": {prev_grammar}, "current_score": {current_grammar}, "difference": {grammar_diff},
-        "improved": {str(grammar_diff > 0).lower()},
-        "feedback": "Specific feedback about grammar improvement."
-    }},
-    "vocabulary_analysis": {{
-        "previous_score": {prev_vocab}, "current_score": {current_vocab}, "difference": {vocab_diff},
-        "improved": {str(vocab_diff > 0).lower()},
-        "feedback": "Specific feedback about vocabulary usage."
-    }},
-    "pronunciation_analysis": {{
-        "previous_score": {prev_pron}, "current_score": {current_pron}, "difference": {pron_diff},
-        "improved": {str(pron_diff > 0).lower()},
-        "feedback": "Specific feedback about pronunciation."
-    }},
-    "fluency_analysis": {{
-        "previous_score": {prev_fluency}, "current_score": {current_fluency}, "difference": {fluency_diff},
-        "improved": {str(fluency_diff > 0).lower()},
-        "feedback": "Specific feedback about speaking pace."
-    }},
-    "answer_analysis": {{
-        "previous_score": {prev_answer}, "current_score": {current_answer}, "difference": {answer_diff},
-        "improved": {str(answer_diff > 0).lower()},
-        "feedback": "Specific feedback about answer quality, structure, and relevance."
-    }},
-    "biggest_improvement": "Which area improved the most",
-    "area_needing_focus": "Which area still needs work",
-    "encouragement": "Professional, encouraging message",
-    "next_step_tip": "One specific tip for continued improvement"
-}}"""
-
-    try:
-        llm_response = await call_llm(prompt, mode="strict_json", timeout=30, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', llm_response)
-        if json_match:
-            llm_data = json.loads(json_match.group())
-        else:
-            raise ValueError("No JSON")
-    except Exception as e:
-        logger.debug(f"LLM compare_attempts fallback: {e}")
-        if overall_diff > 0:
-            summary = f"Great progress! Your overall score improved from {prev_overall}% to {current_overall}% (+{overall_diff}%)."
-        elif overall_diff < 0:
-            summary = f"Your score changed from {prev_overall}% to {current_overall}% ({overall_diff}%). Let's work on consistency."
-        else:
-            summary = f"Consistent performance at {current_overall}%. Try varying your approach for improvement."
-        
-        llm_data = {
-            "overall_summary": summary,
-            "grammar_analysis": {"previous_score": prev_grammar, "current_score": current_grammar, "difference": grammar_diff, "improved": grammar_diff > 0, "feedback": f"Grammar {'improved' if grammar_diff > 0 else 'needs focus'}"},
-            "vocabulary_analysis": {"previous_score": prev_vocab, "current_score": current_vocab, "difference": vocab_diff, "improved": vocab_diff > 0, "feedback": f"Vocabulary {'improved' if vocab_diff > 0 else 'needs focus'}"},
-            "pronunciation_analysis": {"previous_score": prev_pron, "current_score": current_pron, "difference": pron_diff, "improved": pron_diff > 0, "feedback": f"Pronunciation {'improved' if pron_diff > 0 else 'needs focus'}"},
-            "fluency_analysis": {"previous_score": prev_fluency, "current_score": current_fluency, "difference": fluency_diff, "improved": fluency_diff > 0, "feedback": f"Fluency {'improved' if fluency_diff > 0 else 'needs focus'}"},
-            "answer_analysis": {"previous_score": prev_answer, "current_score": current_answer, "difference": answer_diff, "improved": answer_diff > 0, "feedback": f"Answer quality {'improved' if answer_diff > 0 else 'needs focus'}"},
-            "biggest_improvement": "grammar" if grammar_diff == max(grammar_diff, vocab_diff, pron_diff, fluency_diff, answer_diff) else "answer quality",
-            "area_needing_focus": "grammar" if grammar_diff == min(grammar_diff, vocab_diff, pron_diff, fluency_diff, answer_diff) else "answer quality",
-            "encouragement": f"Keep practicing! Your overall score {'improved' if overall_diff > 0 else 'stayed consistent'}.",
-            "next_step_tip": "Focus on structuring your answers clearly."
-        }
-        if target_language and target_language.lower() not in ["en", "english"]:
-            llm_data = await translate_values(llm_data, target_language)
-    
-    return {
-        "previous_overall_score": prev_overall,
-        "current_overall_score": current_overall,
-        "overall_improvement": overall_diff,
-        "trend": trend,
-        "overall_summary": llm_data.get("overall_summary", ""),
-        "grammar_analysis": llm_data.get("grammar_analysis", {}),
-        "vocabulary_analysis": llm_data.get("vocabulary_analysis", {}),
-        "pronunciation_analysis": llm_data.get("pronunciation_analysis", {}),
-        "fluency_analysis": llm_data.get("fluency_analysis", {}),
-        "answer_analysis": llm_data.get("answer_analysis", {}),
-        "biggest_improvement": llm_data.get("biggest_improvement", ""),
-        "area_needing_focus": llm_data.get("area_needing_focus", ""),
-        "encouragement": llm_data.get("encouragement", ""),
-        "next_step_tip": llm_data.get("next_step_tip", "")
-    }
-
-
-async def generate_interactive_follow_up(user_response: str, chat_history: list, role: str, scenario: str, model: str = "gpt", target_language: str = "en") -> tuple:
-    """Generate interactive follow-up question with natural transitions"""
-    
-    recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
-    
-    prompt = f"""You are {BOT_NAME}, a warm and engaging interview coach conducting a {scenario} interview for a {role} position.
-
-Respond in the target language: {target_language}.
-
-The candidate just said: "{user_response}"
-
-Recent conversation context:
-{[msg.get('content', '')[:100] for msg in recent_history[-4:]]}
-
-CRITICAL RULES for your follow-up:
-1. NEVER start with generic phrases like "That's interesting", "Great answer", "I see"
-2. START by referencing something SPECIFIC they said (a keyword, example, or detail)
-3. Ask a PROBING follow-up that digs deeper or explores a new angle
-4. Include ONE encouraging word naturally (e.g., "I love that you mentioned...", "It's impressive how...")
-5. Make it conversational - like a real interview, not a quiz
-
-VARIETY - Use different question types:
-- "Building on what you said about X, how would you..."
-- "You mentioned X - can you walk me through a specific time when..."
-- "That's a thoughtful approach to X. What challenges did you face with..."
-- "I'm curious about the X you mentioned. How did that experience shape..."
-
-Return STRICTLY valid JSON:
-{{"question": "Your engaging, specific follow-up (reference their answer!)", "hint": "One practical tip for answering"}}"""
-
-    fallback_question, fallback_hint, fallback_question_alt, fallback_hint_alt = await asyncio.gather(
-        translate_if_needed("Tell me more about that.", target_language),
-        translate_if_needed("Share more details.", target_language),
-        translate_if_needed("Tell me more about that experience.", target_language),
-        translate_if_needed("Elaborate on a specific example.", target_language)
-    )
-    try:
-        raw = await call_llm(prompt, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data.get("question", fallback_question), data.get("hint", fallback_hint)
-    except:
-        pass
-    return fallback_question_alt, fallback_hint_alt
-
-async def generate_interview_question(scenario: str, role: str, level: str, user_name: str, model: str = "gpt", target_language: str = "en", turn_number: int = 0) -> tuple:
-    """generate interview question with hint - first question is always an opener"""
-    scenario_name = INTERVIEW_SCENARIOS.get(scenario, scenario)
-    
-    # First question should always be a standard opener
-    if turn_number == 0:
-        prompt = f"""You are {BOT_NAME}, a warm interview coach.
-
-Respond in the target language: {target_language}.
-
-Interview scenario: {scenario_name}
-Role: {role}
-Candidate: {user_name}
-
-This is the FIRST question of the interview. Ask a classic opening question like:
-- "Tell me about yourself"
-- "Walk me through your background"
-- "What brings you here today?"
-
-Make it warm and welcoming. Keep it short and natural.
-
-Return STRICTLY valid JSON:
-{{"question": "your opening question", "hint": "suggested answer approach - mention key experiences and why you're interested in this role"}}
-"""
-    else:
-        # Later questions should be type-specific
-        prompt = f"""You are {BOT_NAME}, a warm interview coach.
-
-Respond in the target language: {target_language}.
-
-Interview scenario: {scenario_name}
-Role: {role}
-Level: {level}
-Candidate: {user_name}
-Question Number: {turn_number + 1}
-
-Ask ONE natural interview question appropriate for this {scenario_name}.
-- For HR interviews: Ask about motivation, career goals, cultural fit, salary expectations
-- For Technical interviews: Ask about technical skills, problem-solving, coding concepts relevant to {role}
-- For Behavioral interviews: Ask situational questions (STAR method) about past experiences
-- For other types: Ask relevant domain-specific questions
-
-Provide ONE short hint for the candidate.
-
-Return STRICTLY valid JSON:
-{{"question": "your interview question", "hint": "suggested answer approach"}}
-"""
-    fallback_question, fallback_hint, fallback_question_alt, fallback_hint_alt = await asyncio.gather(
-        translate_if_needed("Tell me about yourself.", target_language),
-        translate_if_needed("Share your background briefly.", target_language),
-        translate_if_needed("Can you tell me about yourself?", target_language),
-        translate_if_needed("Share your background and key experiences.", target_language)
-    )
-    try:
-        raw = await call_llm(prompt, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data.get("question", fallback_question), data.get("hint", fallback_hint)
-    except Exception as e:
-        logger.debug(f"Question generation fallback: {e}")
-    return fallback_question_alt, fallback_hint_alt
-
-
-async def evaluate_answer(question: str, answer: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """evaluate interview answer quality"""
-    prompt = f"""Evaluate this interview answer:
-
-Question: {question}
-Answer: {answer}
-Level: {level}
-
-Respond in the target language: {target_language}.
-
-Return STRICTLY valid JSON:
-{{
-  "clarity": "Clear | Somewhat Clear | Vague",
-  "structure": "Well Structured | Needs Improvement | Disorganized",
-  "relevance": "Relevant | Partially Relevant | Off-topic",
-  "confidence": "Confident | Neutral | Hesitant",
-  "issue_summary": "brief specific feedback about the answer",
-  "improved_answer": "a better version of their answer",
-  "score": 0-100
-}}
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data
-    except Exception as e:
-        logger.debug(f"Answer evaluation fallback: {e}")
-    fallback = {
-        "clarity": "Clear",
-        "structure": "Well Structured",
-        "relevance": "Relevant",
-        "confidence": "Neutral",
-        "issue_summary": "Good answer overall.",
-        "improved_answer": answer,
-        "score": 50
-    }
-    if target_language and target_language != "en":
-        try:
-            for key in ["clarity", "structure", "relevance", "confidence", "issue_summary"]:
-                fallback[key] = await translate_text(fallback[key], "en", target_language)
-        except Exception as e:
-            logger.debug(f"Answer evaluation fallback translation failed: {e}")
-    return fallback
-
-
-async def detect_emotion(user_text: str, model: str = "gpt", target_language: str = "en") -> dict:
-    """detect emotion from user response"""
-    prompt = f"""Analyze the emotional tone of this interview answer:
-
-Answer: "{user_text}"
-Target Language: "{target_language}"
-
-Return STRICTLY valid JSON with the explanation written in the Target Language:
-{{
-  "emotion": "confident | hesitant | nervous | neutral | excited",
-  "confidence_level": "high | medium | low",
-  "explanation": "brief reason in target language"
-}}
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            return json.loads(json_match.group())
-    except Exception as e:
-        logger.debug(f"Emotion detection fallback: {e}")
-    explanation = await translate_if_needed("Tone appears neutral.", target_language)
-    return {"emotion": "neutral", "confidence_level": "medium", "explanation": explanation}
-
-
-# async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-#     """llm-based grammar analysis for spoken interview answers"""
-#     prompt = f"""You are an expert English grammar coach analyzing SPOKEN interview responses.
-# 
-# Respond in the target language: {target_language}.
-# 
-# SPOKEN TEXT: "{user_text}"
-# USER LEVEL: {level}
-# 
-# IMPORTANT RULES:
-# 1. This is TRANSCRIBED SPEECH - IGNORE punctuation, capitalization, and minor spelling
-# 2. Focus ONLY on grammatical structure and word choice
-# 3. Be encouraging but honest
-# 
-# ANALYZE FOR:
-# 
-# 1. FILLER WORDS (detect ALL of these if present):
-#    - um, uh, uhh, er, err, ah, ahh
-#    - like (when not used correctly), you know, I mean, basically, actually, literally
-#    - so, well (when used as fillers at start)
-#    - kind of, sort of (when overused)
-# 
-# 2. GRAMMAR ERRORS (check each carefully):
-#    - VERB TENSE: "I go yesterday" → "I went yesterday"
-#    - SUBJECT-VERB AGREEMENT: "He don't know" → "He doesn't know"
-#    - ARTICLES: "I am engineer" → "I am an engineer"
-#    - PREPOSITIONS: "I am good in coding" → "I am good at coding"
-#    - WORD ORDER: "Always I work hard" → "I always work hard"
-#    - PRONOUNS: "Me and him went" → "He and I went"
-#    - PLURALS: "I have many experience" → "I have much experience"
-#    - COMPARATIVES: "more better" → "better"
-# 
-# 3. WORD SUGGESTIONS:
-#    - Find weak/basic words and suggest stronger alternatives
-#    - Example: "good" → "excellent/outstanding"
-#    - Example: "bad" → "challenging/difficult"
-#    - Example: "thing" → "aspect/factor/element"
-#    - Example: "do" → "accomplish/execute/perform"
-# 
-# CRITICAL: 
-# - "corrected_sentence" = Fix ONLY grammar errors
-# - "improved_sentence" = Fix grammar errors AND USE all word suggestions to make it professional
-# 
-# SCORING GUIDE (CRITICAL - follow exactly):
-# - 95-100: Perfect grammar, no errors, no filler words
-# - 85-94: Minor issues only (1-2 fillers OR 1 minor error)
-# - 70-84: Some issues (2-3 errors or multiple fillers)
-# - 50-69: Significant issues (4+ errors)
-# - Below 50: Major problems throughout
-# 
-# Return STRICTLY valid JSON (no extra text):
-# {{
-#   "score": <0-100 integer based on SCORING GUIDE above>,
-#   "is_correct": <true if no major errors, false otherwise>,
-#   
-#   "filler_words": ["list", "of", "detected", "fillers"],
-#   "filler_count": <number>,
-#   "filler_feedback": "<specific advice on reducing fillers>",
-#   
-#   "errors": [
-#     {{
-#       "type": "verb_tense | article | subject_verb | preposition | word_order | pronoun | plural | comparative",
-#       "you_said": "<exact phrase user said>",
-#       "should_be": "<corrected phrase>",
-#       "better_word": "<if applicable, show better word IN CONTEXT: 'I have excellent skills' instead of just 'excellent'>",
-#       "explanation": "<brief, friendly explanation>"
-#     }}
-#   ],
-#   
-#   "word_suggestions": [
-#     {{
-#       "weak_word": "<basic word user used>",
-#       "better_options": ["option1", "option2"],
-#       "example": "<show how to use in THEIR sentence with better word>"
-#     }}
-#   ],
-#   
-#   "corrected_sentence": "<grammatically correct version - fix errors only>",
-#   "improved_sentence": "<USE ALL word_suggestions to make it professional and polished>",
-#   
-#   "strengths": ["<what they did well grammatically>"],
-#   "feedback": "<2-3 sentences: acknowledge positives, then specific improvement tips>"
-# }}
-# """
-#     try:
-#         raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             data = json.loads(json_match.group())
-#             
-#             data.setdefault("filler_words", [])
-#             data.setdefault("filler_count", len(data.get("filler_words", [])))
-#             data.setdefault("filler_feedback", "")
-#             data.setdefault("errors", [])
-#             data.setdefault("word_suggestions", [])
-#             data.setdefault("strengths", [])
-#             if not data.get("improved_sentence"):
-#                 data["improved_sentence"] = data.get("corrected_sentence", user_text)
-#             
-#             
-#             error_count = len(data.get("errors", []))
-#             filler_count = len(data.get("filler_words", []))
-#             current_score = data.get("score", 75)
-#             
-#             
-#             if error_count == 0 and filler_count <= 1 and current_score < 90:
-#                 data["score"] = 95 - (filler_count * 3)  
-#             elif error_count == 1 and current_score < 80:
-#                 data["score"] = 85 - (filler_count * 2)
-#             elif error_count >= 4 and current_score > 70:
-#                 data["score"] = min(current_score, 65)
-#             
-#             return data
-#     except Exception as e:
-#         logger.debug(f"Grammar analysis fallback: {e}")
-#     return {
-#         "score": 90, "is_correct": True, "filler_words": [], "filler_count": 0,
-#         "filler_feedback": "", "errors": [], "word_suggestions": [],
-#         "corrected_sentence": user_text, "improved_sentence": user_text,
-#         "strengths": ["Good sentence structure"], "feedback": "No major grammatical issues detected. Keep up the good work!"
+MAX_ATTEMPTS = 3  
+SENTENCES_PER_WORD_NORMAL = 3   
+SENTENCES_PER_WORD_STRICT = 5   
+DEFAULT_NUM_WORDS = 5           
+
+
+# import asyncio
+# from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# MODEL_NAME = "Qwen/Qwen3-0.6B"
+
+# tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# model = AutoModelForCausalLM.from_pretrained(
+#     MODEL_NAME,
+#     torch_dtype="auto",
+#     device_map="auto"
+# )
+# import asyncio
+# import torch
+
+# async def call_llm(prompt: str, mode: str = "chat", timeout: int = 30) -> str:
+#     system_prompts = {
+#         "chat": f"You are {BOT_NAME}, a warm and helpful FAQ practice coach.",
+#         "analysis": "You are an expert language and interview evaluator. Analyze objectively.",
+#         "strict_json": "You are a structured evaluator. Respond ONLY in valid JSON. No extra text."
 #     }
 
+#     def run():
+#         messages = [
+#             {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
+#             {"role": "user", "content": prompt}
+#         ]
 
+#         text = tokenizer.apply_chat_template(
+#             messages,
+#             tokenize=False,
+#             add_generation_prompt=True
+#         )
 
-# async def analyze_vocab_llm(user_text: str, level: str = "Intermediate", model: str = "gpt") -> dict:
-#     """llm-based vocabulary analysis with cefr levels"""
-#     prompt = f"""Analyze vocabulary CEFR levels for this interview answer: "{user_text}"
- 
-# Level: {level}
- 
-# CRITICAL - SPELLING ERRORS:
-# If a word is MISSPELLED (e.g., "awareded", "recieved", "definately"):
-# - Do NOT assign it a high CEFR level like C2
-# - Include it in "suggestions" with the CORRECT SPELLING as "better_word"
- 
-# Calculate percentage of words at each CEFR level. Percentages should sum to 100.
- 
-# IMPORTANT: In the "feedback" field, DO NOT mention "A1", "A2", "B1", "B2", "C1", "C2" directly.
-# Instead use:
-# - A1/A2 words = "basic words" or "simple vocabulary"
-# - B1/B2 words = "intermediate words" or "good vocabulary"
-# - C1/C2 words = "advanced words" or "sophisticated vocabulary"
- 
-# CRITICAL FOR SUGGESTIONS:
-# - "original_sentence": Extract the EXACT phrase from the user's transcription that contains the weak word
-# - "improved_sentence": Show the SAME phrase with the better word substituted
- 
-# Return STRICTLY valid JSON:
-# {{
-#   "score": 0-100,
-#   "overall_level": "A1/A2/B1/B2/C1/C2",
-#   "total_words": <word count>,
-#   "cefr_distribution": {{
-#     "A1": {{"percentage": 20, "words": ["I", "is"]}},
-#     "A2": {{"percentage": 30, "words": ["work", "name"]}},
-#     "B1": {{"percentage": 40, "words": ["experience"]}},
-#     "B2": {{"percentage": 10, "words": ["sophisticated"]}},
-#     "C1": {{"percentage": 0, "words": []}},
-#     "C2": {{"percentage": 0, "words": []}}
-#   }},
-#   "professional_words_used": ["list", "of", "professional", "terms"],
-#   "suggestions": [
-#     {{"word": "good", "current_level": "A2", "better_word": "excellent", "suggested_level": "B1", "original_sentence": "<extract from user's actual text>", "improved_sentence": "<same phrase with better word>"}}
-#   ],
-#   "feedback": "Feedback using 'basic', 'intermediate', 'advanced' - NOT A1/B1/C1 labels"
-# }}
- 
-# IMPORTANT: For MISSPELLED words, set current_level = "spelling_error" and better_word = correct spelling
-# """
+#         inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+#         with torch.no_grad():
+#             output = model.generate(
+#                 **inputs,
+#                 max_new_tokens=1000,
+#                 temperature=0.7 if mode == "chat" else 0.3
+#             )
+
+#         # Decode only new tokens
+#         return tokenizer.decode(
+#             output[0][inputs.input_ids.shape[1]:],
+#             skip_special_tokens=True
+#         ).strip()
+
 #     try:
-#         raw = await call_llm(prompt, mode="strict_json", model=model)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             return json.loads(json_match.group())
+#         return await asyncio.wait_for(asyncio.to_thread(run), timeout)
 #     except Exception as e:
-#         logger.debug(f"Vocabulary analysis fallback: {e}")
-#     return {
-#         "score": 80, "overall_level": "B1", "total_words": len(user_text.split()),
-#         "cefr_distribution": {
-#             "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-#             "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-#             "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-#         },
-#         "professional_words_used": [], "suggestions": [],
-#         "feedback": "Vocabulary analysis could not be completed."
-#     }
+#         logger.error(f"LLM call failed: {e}")
+#         return ""
 
-
-
-
-async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """llm-based grammar analysis for spoken interview answers"""
-    prompt = f"""You are an expert English grammar coach analyzing SPOKEN interview responses.
-
-Respond in the target language: {target_language}.
-
-SPOKEN TEXT: "{user_text}"
-USER LEVEL: {level}
-
-IMPORTANT RULES:
-1. This is TRANSCRIBED SPEECH - IGNORE punctuation, capitalization, and minor spelling
-2. Focus ONLY on grammatical structure and word choice
-3. Be encouraging but honest
-
-ANALYZE FOR:
-
-1. FILLER WORDS (detect ALL of these if present):
-   - um, uh, uhh, er, err, ah, ahh
-   - like (when not used correctly), you know, I mean, basically, actually, literally
-   - so, well (when used as fillers at start)
-   - kind of, sort of (when overused)
-
-2. GRAMMAR ERRORS (check each carefully):
-   - VERB TENSE: "I go yesterday" → "I went yesterday"
-   - SUBJECT-VERB AGREEMENT: "He don't know" → "He doesn't know"
-   - ARTICLES: "I am engineer" → "I am an engineer"
-   - PREPOSITIONS: "I am good in coding" → "I am good at coding"
-   - WORD ORDER: "Always I work hard" → "I always work hard"
-   - PRONOUNS: "Me and him went" → "He and I went"
-   - PLURALS: "I have many experience" → "I have much experience"
-   - COMPARATIVES: "more better" → "better"
-
-3. WORD SUGGESTIONS:
-   - Find weak/basic words and suggest stronger alternatives
-   - Example: "good" → "excellent/outstanding"
-   - Example: "bad" → "challenging/difficult"
-   - Example: "thing" → "aspect/factor/element"
-   - Example: "do" → "accomplish/execute/perform"
-
-CRITICAL: 
-- "corrected_sentence" = Fix ONLY grammar errors
-- "improved_sentence" = Fix grammar errors AND USE all word suggestions to make it professional
-
-SCORING GUIDE (CRITICAL - follow exactly):
-- 95-100: Perfect grammar, no errors, no filler words
-- 85-94: Minor issues only (1-2 fillers OR 1 minor error)
-- 70-84: Some issues (2-3 errors or multiple fillers)
-- 50-69: Significant issues (4+ errors)
-- Below 50: Major problems throughout
-
-Return STRICTLY valid JSON (no extra text):
-{{
-  "score": <0-100 integer based on SCORING GUIDE above>,
-  "is_correct": <true if no major errors, false otherwise>,
-
-  "filler_words": ["list", "of", "detected", "fillers"],
-  "filler_count": <number>,
-  "filler_feedback": "<specific advice on reducing fillers>",
-
-  "errors": [
-    {{
-      "type": "verb_tense | article | subject_verb | preposition | word_order | pronoun | plural | comparative",
-      "you_said": "I #goed# to store",
-      "should_be": "I #went# to the store",
-      "wrong_word": "goed",
-      "correct_word": "went",
-      "explanation": "Go is irregular - past tense is went, not goed",
-      "example_sentence": "Yesterday, I went to the park with my friends."
-    }}
-  ],
-
-  "word_suggestions": [
-    {{
-      "you_used": "good",
-      "use_instead": "excellent",
-      "why": "more impactful for professional context",
-      "original_sentence": "The results were #good#",
-      "improved_sentence": "The results were #excellent#",
-      "example_sentence": "The project outcomes were excellent."
-    }}
-  ],
-
-  "corrected_sentence": "<THE WHOLE TRANSCRIPTION with ONLY grammar errors fixed>",
-  "improved_sentence": "<THE WHOLE TRANSCRIPTION with grammar fixed + vocabulary enhanced>",
-
-  "strengths": ["<what they did well grammatically>"],
-  "feedback": "<2-3 sentences: acknowledge positives, then specific improvement tips>"
-}}
-
-CRITICAL FORMATTING RULES:
-- For errors: you_said and should_be are ONLY the specific sentence/line from transcription containing the error
-- Mark the wrong word with #word# in you_said
-- Mark the correct word with #word# in should_be
-- For word_suggestions: original_sentence and improved_sentence are ONLY the specific phrase containing the weak word
-- Mark weak word with #word# in original_sentence, better word with #word# in improved_sentence
-- example_sentence is a NEW sentence showing correct usage (not from transcription)
-- corrected_sentence = THE WHOLE TRANSCRIPTION with all grammar fixes applied
-- improved_sentence = THE WHOLE TRANSCRIPTION with grammar fixed AND vocabulary enhanced
-- Empty arrays [] if no issues
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-
-            # Normalize word_suggestions keys for consistent API response
-            for item in data.get("word_suggestions", []):
-                if not isinstance(item, dict):
-                    continue
-                if not item.get("weak_word"):
-                    item["weak_word"] = item.get("you_used") or item.get("word") or ""
-                if not item.get("better_options"):
-                    better = item.get("use_instead") or item.get("better_word")
-                    item["better_options"] = [better] if better else []
-
-            data.setdefault("filler_words", [])
-            data.setdefault("filler_count", len(data.get("filler_words", [])))
-            data.setdefault("filler_feedback", "")
-            data.setdefault("errors", [])
-            data.setdefault("word_suggestions", [])
-            data.setdefault("strengths", [])
-            if not data.get("improved_sentence"):
-                data["improved_sentence"] = data.get("corrected_sentence", user_text)
-
-
-            error_count = len(data.get("errors", []))
-            filler_count = len(data.get("filler_words", []))
-            current_score = data.get("score", 75)
-
-
-            if error_count == 0 and filler_count <= 1 and current_score < 90:
-                data["score"] = 95 - (filler_count * 3)  
-            elif error_count == 1 and current_score < 80:
-                data["score"] = 85 - (filler_count * 2)
-            elif error_count >= 4 and current_score > 70:
-                data["score"] = min(current_score, 65)
-
-            return data
-    except Exception as e:
-        logger.debug(f"Grammar analysis fallback: {e}")
-    fallback_strengths = ["Good sentence structure"]
-    fallback_feedback = "No major grammatical issues detected. Keep up the good work!"
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback_strengths = await translate_values(fallback_strengths, target_language)
-        fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-    return {
-        "score": 90, "is_correct": True, "filler_words": [], "filler_count": 0,
-        "filler_feedback": "", "errors": [], "word_suggestions": [],
-        "corrected_sentence": user_text, "improved_sentence": user_text,
-        "strengths": fallback_strengths, "feedback": fallback_feedback
-    }
-
-
-async def analyze_vocab_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """llm-based vocabulary analysis with cefr levels"""
-    prompt = f"""Analyze vocabulary CEFR levels for this interview answer: "{user_text}"
-
-Respond in the target language: {target_language}.
-
-Level: {level}
-
-CRITICAL - VOCABULARY SUGGESTIONS ARE MANDATORY:
-You MUST find and suggest improvements for weak/basic words like:
-- good → excellent/outstanding
-- bad → challenging/difficult  
-- thing → aspect/factor/element
-- do → accomplish/execute/perform
-- get → obtain/acquire/receive
-- make → create/develop/establish
-- very → extremely/highly/remarkably
-- nice → pleasant/wonderful/delightful
-- big → substantial/significant
-- small → minor/minimal
-
-SPELLING ERRORS:
-If a word is MISSPELLED (e.g., "awareded", "recieved", "definately"):
-- Set current_level = "spelling_error"
-- Set better_word = correct spelling
-
-Calculate percentage of words at each CEFR level. Percentages should sum to 100.
-Count ALL words in the text for total_words.
-
-IMPORTANT: In the "feedback" field, DO NOT mention "A1", "A2", "B1", "B2", "C1", "C2" directly.
-Instead use:
-- A1/A2 words = "basic words" or "simple vocabulary"
-- B1/B2 words = "intermediate words" or "good vocabulary"
-- C1/C2 words = "advanced words" or "sophisticated vocabulary"
-
-Return STRICTLY valid JSON:
-{{
-  "score": 0-100,
-  "overall_level": "A1/A2/B1/B2/C1/C2",
-  "total_words": <actual word count>,
-  "cefr_distribution": {{
-    "A1": {{"percentage": 20, "words": ["I", "is", "the"]}},
-    "A2": {{"percentage": 30, "words": ["work", "name", "good"]}},
-    "B1": {{"percentage": 40, "words": ["experience", "actually"]}},
-    "B2": {{"percentage": 10, "words": ["sophisticated"]}},
-    "C1": {{"percentage": 0, "words": []}},
-    "C2": {{"percentage": 0, "words": []}}
-  }},
-  "professional_words_used": ["list", "of", "professional", "terms"],
-  "suggestions": [
-    {{
-      "word": "good",
-      "current_level": "A2",
-      "better_word": "excellent",
-      "suggested_level": "B1",
-      "context": "appropriate for professional interview",
-      "original_sentence": "I had a #good# experience",
-      "improved_sentence": "I had an #excellent# experience",
-      "example_sentence": "The results of the project were excellent."
-    }}
-  ],
-  "feedback": "Feedback using 'basic', 'intermediate', 'advanced' - NOT A1/B1/C1 labels"
-}}
-
-CRITICAL FORMATTING RULES:
-- original_sentence: Extract ONLY the specific sentence/line from user's transcription containing the weak word (NOT the whole transcription)
-- Mark the weak word with #word# in original_sentence
-- improved_sentence: Same sentence/line with the better word substituted
-- Mark the better word with #word# in improved_sentence
-- example_sentence: A NEW sentence showing correct usage (not from transcription, no # needed)
-- ALWAYS include suggestions if any weak/basic words (A1/A2 level) are found
-- For MISSPELLED words: current_level = "spelling_error", better_word = correct spelling
-- Provide at least 2-3 suggestions if weak words exist
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            # Ensure CEFR distribution has all levels
-            default_cefr = {
-                "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-                "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-                "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-            }
-            if "cefr_distribution" not in data or not isinstance(data.get("cefr_distribution"), dict):
-                data["cefr_distribution"] = default_cefr
-            else:
-                for level_key in default_cefr:
-                    if level_key not in data["cefr_distribution"]:
-                        data["cefr_distribution"][level_key] = default_cefr[level_key]
-            return data
-    except Exception as e:
-        logger.debug(f"Vocabulary analysis fallback: {e}")
-    fallback_feedback = "Vocabulary analysis could not be completed."
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-    return {
-        "score": 80, "overall_level": "B1", "total_words": len(user_text.split()),
-        "cefr_distribution": {
-            "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-            "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-            "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-        },
-        "professional_words_used": [], "suggestions": [],
-        "feedback": fallback_feedback
-    }
-
-
-async def analyze_pronunciation_llm(audio_path: str = None, spoken_text: str = None, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """pronunciation analysis using whisper word-level confidence"""
-    
-    if not audio_path:
-        fallback_feedback = "No audio provided for pronunciation analysis"
-        fallback_tips = ["Record audio for pronunciation feedback"]
-        if target_language and target_language.lower() not in ["en", "english"]:
-            fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-            fallback_tips = await translate_values(fallback_tips, target_language)
-        return {
-            "accuracy": 75, "transcription": spoken_text or "",
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": spoken_text.split() if spoken_text else [],
-            "feedback": fallback_feedback,
-            "tips": fallback_tips,
-            "mispronounced_count": 0
-        }
-    
-    try:
-        normalized_target = normalize_language_code(target_language, default="en")
-
-        async def _transcribe_pronunciation(lang_hint: str = None):
-            kwargs = {"word_timestamps": True}
-            if lang_hint:
-                kwargs["language"] = lang_hint
-            segments, info = await asyncio.to_thread(_whisper_model.transcribe, audio_path, **kwargs)
-            detected = info.language if info else (lang_hint or "en")
-            words = []
-            text = ""
-            for seg in segments:
-                text += seg.text + " "
-                if seg.words:
-                    for w in seg.words:
-                        words.append({
-                            "word": w.word.strip().lower(),
-                            "confidence": w.probability,
-                            "start": w.start,
-                            "end": w.end
-                        })
-            return text.strip(), words, detected
-
-        transcription, words_data, detected_lang = await _transcribe_pronunciation(normalized_target)
-        display_transcription = transcription
-
-        if not words_data:
-            fallback_feedback = "No speech detected in audio"
-            fallback_tips = ["Speak clearly into the microphone"]
-            if target_language and target_language.lower() not in ["en", "english"]:
-                fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-                fallback_tips = await translate_values(fallback_tips, target_language)
-            return {
-                "accuracy": 0, "transcription": display_transcription,
-                "word_pronunciation_scores": [],
-                "words_to_practice": [], "well_pronounced_words": [],
-                "feedback": fallback_feedback,
-                "tips": fallback_tips,
-                "mispronounced_count": 0
-            }
-        
-        CONFIDENCE_THRESHOLD = 0.70
-        mispronounced_words = []
-        well_pronounced = []
-        word_pronunciation_scores = []
-        
-        for wd in words_data:
-            word = wd["word"].strip(".,!?")
-            if len(word) < 2:
-                continue
-            
-            pronunciation_percentage = round(wd["confidence"] * 100, 1)
-            
-            if pronunciation_percentage >= 90:
-                status = "excellent"
-            elif pronunciation_percentage >= 70:
-                status = "good"
-            elif pronunciation_percentage >= 50:
-                status = "needs_improvement"
-            else:
-                status = "poor"
-            
-            word_pronunciation_scores.append({
-                "word": word,
-                "pronunciation_match_percentage": pronunciation_percentage,
-                "status": status
-            })
-            
-            if wd["confidence"] < CONFIDENCE_THRESHOLD:
-                mispronounced_words.append({
-                    "word": word,
-                    "confidence": pronunciation_percentage,
-                    "issue": "unclear pronunciation" if wd["confidence"] < 0.5 else "slight pronunciation issue"
-                })
-            else:
-                well_pronounced.append(word)
-        
-        avg_confidence = sum(w["confidence"] for w in words_data) / len(words_data) if words_data else 0.7
-        accuracy = int(avg_confidence * 100)
-        
-        
-        llm_prompt = f"""You are a pronunciation coach for interview preparation.
-
-Respond in the target language: {normalized_target}.
-
-TRANSCRIPTION: "{display_transcription}"
-MISPRONOUNCED WORDS: {mispronounced_words if mispronounced_words else "None - all words were clear!"}
-WELL PRONOUNCED: {well_pronounced[:10]}
-ACCURACY: {accuracy}%
-
-Return STRICTLY valid JSON:
-{{
-    "words_to_practice": [
-        {{"word": "the word", "how_to_say": "syllable breakdown: ex-AM-ple", "tip": "specific tip"}}
-    ],
-    "feedback": "2-3 encouraging sentences about their pronunciation for interview",
-    "tips": ["general pronunciation tip 1", "general tip 2"]
-}}
-"""
-        try:
-            llm_response = await call_llm(llm_prompt, mode="strict_json", timeout=30, model=model, target_language=target_language)
-            llm_data = json.loads(re.search(r'\{[\s\S]*\}', llm_response).group())
-        except Exception as llm_error:
-            logger.debug(f"LLM pronunciation tips fallback: {llm_error}")
-            llm_data = {
-                "words_to_practice": [{"word": w["word"], "how_to_say": f"Say '{w['word']}' clearly", "tip": "Speak slower"} for w in mispronounced_words[:5]],
-                "feedback": f"Pronunciation accuracy: {accuracy}%.",
-                "tips": ["Speak slowly and clearly", "Practice word stress"]
-            }
-            if target_language and target_language.lower() not in ["en", "english"]:
-                llm_data["feedback"] = await translate_if_needed(llm_data.get("feedback", ""), target_language)
-                llm_data["tips"] = await translate_values(llm_data.get("tips", []), target_language)
-                translated_words = []
-                for item in llm_data.get("words_to_practice", []):
-                    if isinstance(item, dict):
-                        item = item.copy()
-                        item["how_to_say"] = await translate_if_needed(item.get("how_to_say", ""), target_language)
-                        item["tip"] = await translate_if_needed(item.get("tip", ""), target_language)
-                    translated_words.append(item)
-                llm_data["words_to_practice"] = translated_words
-        
-        default_feedback = await translate_if_needed("Analysis complete.", target_language)
-        return {
-            "accuracy": accuracy,
-            "transcription": display_transcription,
-            "word_pronunciation_scores": word_pronunciation_scores,
-            "words_to_practice": llm_data.get("words_to_practice", []),
-            "well_pronounced_words": well_pronounced,
-            "feedback": llm_data.get("feedback", default_feedback),
-            "tips": llm_data.get("tips", []),
-            "mispronounced_count": len(mispronounced_words)
-        }
-        
-    except Exception as e:
-        logger.error(f"Pronunciation error: {e}")
-        fallback_feedback = f"Could not analyze pronunciation: {str(e)}"
-        fallback_tips = ["Ensure clear audio recording"]
-        if target_language and target_language.lower() not in ["en", "english"]:
-            fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-            fallback_tips = await translate_values(fallback_tips, target_language)
-        return {
-            "accuracy": 75, "transcription": spoken_text or "",
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": [],
-            "feedback": fallback_feedback,
-            "tips": fallback_tips,
-            "mispronounced_count": 0
-        }
-
+# ===============================
 
 def calculate_fluency(word_count: int, audio_duration: float) -> dict:
     """calculate fluency metrics"""
@@ -1441,1855 +98,39 @@ def calculate_fluency(word_count: int, audio_duration: float) -> dict:
         "score": min(100, score),
         "wpm": wpm,
         "speed_status": speed_status,
-        "audio_duration_seconds": round(audio_duration, 1)
+        "audio_duration_seconds": round(audio_duration, 1),
+        "feedback": f"Your speaking speed is {speed_status.replace('_', ' ')} ({wpm} WPM)."
     }
 
 
 async def analyze_fluency_metrics(user_text: str, audio_duration: float) -> dict:
     """async wrapper for fluency metrics from text and duration"""
+    
     word_count = len(re.findall(r"\b\w+\b", user_text or ""))
     return calculate_fluency(word_count, audio_duration)
 
 
-async def generate_personalized_feedback(overall_score: float, scores: dict, emotion: dict, user_name: str,
-                                          grammar: dict = None, vocabulary: dict = None, 
-                                          pronunciation: dict = None, answer_eval: dict = None, model: str = "gpt",
-                                          target_language: str = "en") -> dict:
-    """Generate personalized interview feedback using LLM based on actual errors"""
-    
-    
-    grammar_errors = [
-        e for e in (grammar.get("errors", []) if grammar else [])
-        if isinstance(e, dict)
-    ]
-    filler_words = grammar.get("filler_words", []) if grammar else []
-    word_suggestions = [
-        w for w in (grammar.get("word_suggestions", []) if grammar else [])
-        if isinstance(w, dict)
-    ]
-    vocab_suggestions = [
-        v for v in (vocabulary.get("suggestions", []) if vocabulary else [])
-        if isinstance(v, dict)
-    ]
-    mispronounced = pronunciation.get("words_to_practice", []) if pronunciation else []
-    answer_issues = answer_eval.get("issue_summary", "") if answer_eval else ""
-    
-    
-    errors_context = []
-    if grammar_errors:
-        errors_context.append(f"Grammar errors: {[e.get('you_said', '') + ' → ' + e.get('should_be', '') for e in grammar_errors[:3]]}")
-    if filler_words:
-        errors_context.append(f"Filler words used: {filler_words[:5]}")
-    if word_suggestions:
-        errors_context.append(f"Weak words: {[w.get('weak_word', '') for w in word_suggestions[:3]]}")
-    if vocab_suggestions:
-        errors_context.append(f"Vocabulary improvements: {[v.get('word', '') + ' → ' + v.get('better_word', '') for v in vocab_suggestions[:3]]}")
-    if mispronounced:
-        errors_context.append(f"Pronunciation to practice: {[w.get('word', '') if isinstance(w, dict) else w for w in mispronounced[:3]]}")
-    if answer_issues:
-        errors_context.append(f"Answer feedback: {answer_issues}")
-    
-    
-    improvement_areas = []
-    strengths = []
-    for area, score in scores.items():
-        if score is None:  
-            continue
-        if score >= 75:
-            strengths.append(area)
-        elif score < 65:
-            improvement_areas.append(area)
-    
-    improvement_areas_display = improvement_areas
-    strengths_display = strengths
-    if target_language and target_language != "en":
-        try:
-            if improvement_areas:
-                improvement_areas_display = list(await asyncio.gather(
-                    *[translate_text(a, "en", target_language) for a in improvement_areas]
-                ))
-            if strengths:
-                strengths_display = list(await asyncio.gather(
-                    *[translate_text(s, "en", target_language) for s in strengths]
-                ))
-        except Exception as e:
-            logger.debug(f"Personalized feedback list translation failed: {e}")
 
-    if errors_context:
-        prompt = f"""You are a professional interview coach providing constructive feedback to candidate {user_name}.
 
-Respond in the target language: {target_language}.
 
-SCORES:
-- Grammar: {scores.get('grammar', 0)}%
-- Vocabulary: {scores.get('vocabulary', 0)}%
-- Pronunciation: {scores.get('pronunciation', 0)}%
-- Fluency: {scores.get('fluency', 0)}%
-- Answer Quality: {scores.get('answer_evaluation', 0)}%
-- Overall: {overall_score}%
 
-ACTUAL ERRORS/ISSUES FOUND:
-{chr(10).join(errors_context)}
-
-EMOTION DETECTED: {emotion.get('emotion', 'neutral')}
-
-Generate PROFESSIONAL but ENGAGING feedback. Be encouraging yet constructive.
-
-Return STRICTLY valid JSON:
-{{
-    "message": "Start with a polished, professional one-liner that acknowledges their performance (like 'That was a well-structured response.' or 'Good points raised there.' or 'I can see you're putting thought into this.'). THEN 1-2 sentences of specific, constructive feedback about their ACTUAL errors. Keep it professional but warm.",
-    "improvement_areas": {json.dumps(improvement_areas_display)},
-    "strengths": {json.dumps(strengths_display)},
-    "emotion": "{emotion.get('emotion', 'neutral')}",
-    "quick_tip": "ONE specific, actionable tip - professional tone"
-}}
-
-TONE EXAMPLES for "message" based on score:
-- Score >= 85: "That was an excellent response. Your articulation was clear and..."
-- Score 70-84: "Good effort on that answer. I noticed some strong points, though..."
-- Score 50-69: "You're on the right track. Let's work on..."
-- Score < 50: "I appreciate your attempt. Here's how we can strengthen..."
-
-RULES:
-- Professional tone (like a supportive hiring manager)
-- NOT overly formal or stiff - be human and warm
-- Reference ACTUAL errors constructively
-- Acknowledge good attempts even when score is low"""
-        
-        try:
-            raw = await call_llm(prompt, mode="strict_json", timeout=15, model=model, target_language=target_language)
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                result = json.loads(json_match.group())
-                
-                result.setdefault("improvement_areas", improvement_areas_display)
-                result.setdefault("strengths", strengths_display)
-                result.setdefault("emotion", emotion.get("emotion", "neutral"))
-                return result
-        except Exception as e:
-            logger.debug(f"LLM personalized feedback fallback: {e}")
-    
-    
-    if overall_score >= 95:
-        message = f"🌟 Outstanding interview performance, {user_name}! You're interview-ready!"
-    elif overall_score >= 85:
-        message = f"Excellent job, {user_name}! Your communication skills are impressive."
-    elif overall_score >= 70:
-        message = f"Good effort, {user_name}! Focus on {', '.join(improvement_areas) if improvement_areas else 'minor details'} to improve."
+def call_gpt_sync(prompt: str, system_prompt: str = None, model: str = "gpt") -> str:
+    """sync gpt call - will be run in thread pool. Supports gpt (default) or qwen."""
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
     else:
-        message = f"Keep practicing, {user_name}! Work on: {', '.join(improvement_areas) if improvement_areas else 'overall delivery'}."
-    
-    if emotion.get("confidence_level") == "low" or emotion.get("emotion") == "nervous":
-        message += " Remember to take a breath and project confidence."
-    
-    quick_tip = f"Practice your {improvement_areas[0] if improvement_areas else 'interview skills'} regularly."
-    if target_language and target_language != "en":
-        try:
-            message = await translate_text(message, "en", target_language)
-            quick_tip = await translate_text(quick_tip, "en", target_language)
-        except Exception as e:
-            logger.debug(f"Personalized feedback fallback translation failed: {e}")
-
-    return {
-        "message": message,
-        "improvement_areas": improvement_areas_display,
-        "strengths": strengths_display,
-        "emotion": emotion.get("emotion", "neutral"),
-        "quick_tip": quick_tip
-    }
-
-
-async def generate_session_summary_llm(user_name: str, scenario: str, final_scores: dict, 
-                                        chat_history: list, total_turns: int, average_wpm: int, 
-                                        turn_history: list = None, model: str = "gpt",
-                                        target_language: str = "en") -> dict:
-    """Generate elaborative LLM-based session summary with per-turn WPM analysis"""
-    
-    
-    conversation_summary = []
-    for i, msg in enumerate(chat_history[-10:]):  
-        role = "Clara" if msg["role"] == "assistant" else user_name
-        conversation_summary.append(f"{role}: {msg['content'][:100]}...")
-    
-    
-    turn_wpm_summary = ""
-    if turn_history:
-        turn_entries = [f"Turn {t.get('turn', i+1)}: {t.get('wpm', 0)} WPM, Score: {t.get('overall_score', 0)}%" 
-                       for i, t in enumerate(turn_history)]
-        turn_wpm_summary = "\n".join(turn_entries)
-    
-    prompt = f"""You are an expert interview coach providing a detailed session summary.
-
-Respond in the target language: {target_language}.
-
-CANDIDATE: {user_name}
-SCENARIO: {scenario}
-TOTAL QUESTIONS: {total_turns}
-AVERAGE SPEAKING SPEED: {average_wpm} words per minute
-
-FINAL SCORES:
-- Grammar: {final_scores.get('grammar', 0)}%
-- Vocabulary: {final_scores.get('vocabulary', 0)}%  
-- Pronunciation: {final_scores.get('pronunciation', 0)}%
-- Fluency: {final_scores.get('fluency', 0)}%
-
-PER-TURN PERFORMANCE:
-{turn_wpm_summary if turn_wpm_summary else "No turn data available"}
-
-RECENT CONVERSATION:
-{chr(10).join(conversation_summary)}
-
-Generate a detailed, personalized, and encouraging session summary. Analyze WPM trend across turns.
-
-Return STRICTLY valid JSON:
-{{
-    "overall_assessment": "3-4 sentences summarizing the candidate's overall interview performance, mentioning WPM trends",
-    "grammar_feedback": {{
-        "score": {final_scores.get('grammar', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip",
-        "example": "example of correct usage or common mistake to avoid"
-    }},
-    "vocabulary_feedback": {{
-        "score": {final_scores.get('vocabulary', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip",
-        "suggested_words": ["professional word 1", "professional word 2", "professional word 3"]
-    }},
-    "pronunciation_feedback": {{
-        "score": {final_scores.get('pronunciation', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip",
-        "practice_words": ["word to practice 1", "word to practice 2"]
-    }},
-    "fluency_feedback": {{
-        "score": {final_scores.get('fluency', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip for speaking pace",
-        "wpm_trend": "analysis of WPM across turns - improving/declining/stable"
-    }},
-    "interview_skills": {{
-        "confidence": "observation about confidence level",
-        "structure": "observation about answer structure",
-        "relevance": "observation about answer relevance"
-    }},
-    "action_plan": [
-        "specific action item 1 for next week",
-        "specific action item 2 for next week",
-        "specific action item 3 for next week"
-    ],
-    "encouragement": "2-3 encouraging sentences personalized for the candidate",
-    "next_practice_topics": ["topic 1", "topic 2", "topic 3"]
-}}
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=25, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            return json.loads(json_match.group())
-    except Exception as e:
-        logger.debug(f"Session summary LLM fallback: {e}")
-    
-    
-    fallback = {
-        "overall_assessment": f"Great effort, {user_name}! You completed {total_turns} questions in your {scenario} practice.",
-        "grammar_feedback": {"score": final_scores.get("grammar", 0), "status": "Good", "what_went_well": "Good sentence structure", "improvement_tip": "Practice complex sentences", "example": "Use varied sentence structures"},
-        "vocabulary_feedback": {"score": final_scores.get("vocabulary", 0), "status": "Good", "what_went_well": "Used relevant terms", "improvement_tip": "Expand professional vocabulary", "suggested_words": ["synergy", "leverage", "optimize"]},
-        "pronunciation_feedback": {"score": final_scores.get("pronunciation", 0), "status": "Good", "what_went_well": "Clear articulation", "improvement_tip": "Practice difficult words", "practice_words": ["particularly", "specifically"]},
-        "fluency_feedback": {"score": final_scores.get("fluency", 0), "status": "Good", "what_went_well": "Consistent pace", "improvement_tip": "Maintain steady rhythm", "wpm_trend": "stable"},
-        "interview_skills": {"confidence": "Showed good confidence", "structure": "Answers were organized", "relevance": "Stayed on topic"},
-        "action_plan": ["Practice speaking for 10 mins daily", "Record and review your answers", "Prepare examples for common questions"],
-        "encouragement": f"Keep up the great work, {user_name}! Regular practice will help you ace your interviews.",
-        "next_practice_topics": ["Tell me about yourself", "Why should we hire you?", "Describe a challenge you overcame"]
-    }
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback = await translate_values(fallback, target_language)
-    return fallback
-async def handle_session_termination(session: dict, session_id: str, model: str = "gpt") -> dict:
-    """
-    Helper function to handle session termination - eliminates duplicate code.
-    Returns the termination response with LLM-generated summary.
-    """
-    count = max(1, session["scores"]["count"])
-    audio_count = session["scores"].get("audio_count", 0)
-    if not audio_count and (
-        session["scores"].get("pronunciation", 0) > 0 or session["scores"].get("fluency", 0) > 0
-    ):
-        audio_count = count
-    
-    
-    has_audio_turns = session["scores"].get("pronunciation", 0) > 0 or session["scores"].get("fluency", 0) > 0
-    
-    if has_audio_turns:
-        pronunciation_avg = int(session["scores"]["pronunciation"] / audio_count) if audio_count > 0 else 0
-        fluency_avg = int(session["scores"]["fluency"] / audio_count) if audio_count > 0 else 0
-        final_scores = {
-            "grammar": int(session["scores"]["grammar"] / count),
-            "vocabulary": int(session["scores"]["vocabulary"] / count),
-            "pronunciation": pronunciation_avg,
-            "fluency": fluency_avg
-        }
-        avg_answer_score = int(session["scores"].get("answer", 50 * count) / count)
-        overall = int(
-            final_scores["grammar"] * 0.25 +
-            final_scores["vocabulary"] * 0.25 +
-            avg_answer_score * 0.25 +
-            final_scores["pronunciation"] * 0.15 +
-            final_scores["fluency"] * 0.10
-        )
-        average_wpm = int(session["scores"].get("total_wpm", 0) / audio_count) if audio_count > 0 else 0
-    else:
-        
-        final_scores = {
-            "grammar": int(session["scores"]["grammar"] / count),
-            "vocabulary": int(session["scores"]["vocabulary"] / count),
-            "pronunciation": None,
-            "fluency": None
-        }
-        avg_answer_score = int(session["scores"].get("answer", 50 * count) / count)
-        
-        overall = int(
-            final_scores["grammar"] * 0.33 +
-            final_scores["vocabulary"] * 0.33 +
-            avg_answer_score * 0.34
-        )
-        average_wpm = 0
-
-    
-    improvement_areas = [area for area, score in final_scores.items() if score is not None and score < 70]
-    strengths = [area for area, score in final_scores.items() if score is not None and score >= 80]
-    
-    
-    turn_history = session.get("turn_history", [])
-    
-    # Aggregate vocab CEFR words and WPM per turn
-    wpm_per_turn = []
-    vocab_overall = {
-        "A1": {"count": 0, "words": []},
-        "A2": {"count": 0, "words": []},
-        "B1": {"count": 0, "words": []},
-        "B2": {"count": 0, "words": []},
-        "C1": {"count": 0, "words": []},
-        "C2": {"count": 0, "words": []}
-    }
-    
-    for attempt in session.get("attempts", []):
-        # Track WPM per turn
-        fluency_data = attempt.get("fluency") or {}
-        turn_wpm = fluency_data.get("wpm", 0) if fluency_data else 0
-        wpm_per_turn.append({"turn": len(wpm_per_turn) + 1, "wpm": turn_wpm})
-        
-        # Aggregate CEFR vocabulary words
-        vocab_data = attempt.get("vocabulary") or {}
-        cefr_dist = vocab_data.get("cefr_distribution", {}) if vocab_data else {}
-        for level in ["A1", "A2", "B1", "B2", "C1", "C2"]:
-            level_data = cefr_dist.get(level, {})
-            if isinstance(level_data, dict):
-                words = level_data.get("words", [])
-                if isinstance(words, list):
-                    vocab_overall[level]["words"].extend(words)
-                    vocab_overall[level]["count"] = len(set(vocab_overall[level]["words"]))
-    
-    # Deduplicate vocab words and calculate percentages
-    total_vocab_words = sum(len(set(vocab_overall[level]["words"])) for level in vocab_overall)
-    for level in vocab_overall:
-        vocab_overall[level]["words"] = list(set(vocab_overall[level]["words"]))
-        vocab_overall[level]["count"] = len(vocab_overall[level]["words"])
-        vocab_overall[level]["percentage"] = round((vocab_overall[level]["count"] / total_vocab_words * 100), 1) if total_vocab_words > 0 else 0
-    
-    
-    llm_summary = await generate_session_summary_llm(
-        user_name=session["name"],
-        scenario=session.get("scenario", "interview"),
-        final_scores=final_scores,
-        chat_history=session["chat_history"],
-        total_turns=session.get("turn_number", 0),
-        average_wpm=average_wpm,
-        turn_history=turn_history,
-        model=model,
-        target_language=session.get("target_language", "en")
-    )
-    
-    # Build turn_feedback for termination response (same format as /interview_feedback)
-    turn_feedback = []
-    # Aggregate grammar mistakes and vocabulary suggestions from all turns
-    grammar_mistakes = []
-    vocab_suggestions = []
-    pronunciation_issues = []
-    
-    for i, attempt in enumerate(session.get("attempts", []), 1):
-        turn_feedback.append({
-            "turn": i,
-            "transcription": attempt.get("transcription", ""),
-            "grammar": attempt.get("grammar", {}),
-            "vocabulary": attempt.get("vocabulary", {}),
-            "pronunciation": attempt.get("pronunciation"),
-            "fluency": attempt.get("fluency"),
-            "answer_evaluation": attempt.get("answer_evaluation", {}),
-            "personalized_feedback": attempt.get("personalized_feedback", {}),
-            "improvement": attempt.get("improvement"),
-            "overall_score": attempt.get("overall_score", 0)
-        })
-        
-        # Collect grammar errors (wrong → correct)
-        gram = attempt.get("grammar") or {}
-        if isinstance(gram, dict):
-            for err in gram.get("errors", []):
-                if isinstance(err, dict):
-                    grammar_mistakes.append({
-                        "wrong": err.get("you_said", err.get("wrong_word", "")),
-                        "correct": err.get("should_be", err.get("correct_word", ""))
-                    })
-        
-        # Collect vocabulary suggestions (weak word → better word)
-        vocab = attempt.get("vocabulary") or {}
-        if isinstance(vocab, dict):
-            for sug in vocab.get("suggestions", []):
-                if isinstance(sug, dict):
-                    better = sug.get("better_word", "")
-                    if isinstance(better, list):
-                        better_options = better
-                    elif better:
-                        better_options = [better]
-                    else:
-                        better_options = []
-                    vocab_suggestions.append({
-                        "weak_word": sug.get("word", ""),
-                        "better_options": better_options
-                    })
-        
-        # Collect pronunciation issues
-        pron = attempt.get("pronunciation") or {}
-        if isinstance(pron, dict):
-            for word_issue in pron.get("words_to_practice", []):
-                if isinstance(word_issue, dict):
-                    pronunciation_issues.append({
-                        "word": word_issue.get("word", ""),
-                        "issue": word_issue.get("issue", ""),
-                        "how_to_say": word_issue.get("how_to_say", "")
-                    })
-    
-    # Build summary of all mistakes
-    summary = {
-        "grammar": {
-            "total_errors": len(grammar_mistakes),
-            "errors": grammar_mistakes
-        },
-        "vocabulary": {
-            "total_suggestions": len(vocab_suggestions),
-            "suggestions": vocab_suggestions
-        },
-        "pronunciation": {
-            "total_issues": len(pronunciation_issues),
-            "issues": pronunciation_issues
-        }
-    }
-
-    termination_response = {
-        "status": "conversation_ended", 
-        "session_id": session_id,
-        "target_lang": session.get("target_language", "en"),
-        "native_lang": session.get("native_language", "hi"),
-        "final_scores": final_scores, 
-        "overall_score": overall, 
-        "passing_score": PASSING_SCORE,
-        "average_wpm": average_wpm,
-        "wpm_per_turn": wpm_per_turn,
-        "wpm_status": "slow" if average_wpm < 110 else "normal" if average_wpm <= 160 else "fast",
-        "vocab_overall": vocab_overall,
-        "strengths": strengths, 
-        "improvement_areas": improvement_areas,
-        "total_turns": session.get("turn_number", 0),
-        "turn_history": turn_history,  
-        "turn_feedback": turn_feedback,
-        "summary": summary,
-        "overall_assessment": llm_summary.get("overall_assessment", ""),
-        "grammar_feedback": llm_summary.get("grammar_feedback", {}),
-        "vocabulary_feedback": llm_summary.get("vocabulary_feedback", {}),
-        "pronunciation_feedback": llm_summary.get("pronunciation_feedback", {}),
-        "fluency_feedback": llm_summary.get("fluency_feedback", {}),
-        "interview_skills": llm_summary.get("interview_skills", {}),
-        "action_plan": llm_summary.get("action_plan", []),
-        "encouragement": llm_summary.get("encouragement", ""),
-        "next_practice_topics": llm_summary.get("next_practice_topics", [])
-    }
-    await db.complete_session(session_id, final_feedback=termination_response)
-
-    return termination_response
-
-
-@router.post("/practice")
-async def practice_interview(
-    request: Request,
-    name: str = Form(...),
-    native_language: str = Form(default="hi"),
-    target_language: str = Form(default="en"),
-    level: str = Form(default="B1"),
-    audio_file: Optional[UploadFile] = File(default=None),
-    text_input: Optional[str] = Form(default=None),
-    session_id: Optional[str] = Form(default=None),
-    action: Optional[str] = Form(default=None),  
-    model: Optional[str] = Form(default="gpt"),  
-    voice_id: Optional[str] = Form(default=None),
-    current_user: User = Depends(get_current_user),
-
-):
-    """
-    interview practice api - CONVERSATIONAL ONBOARDING
-    
-    flow:
-    1. first call (no audio/text): Clara greets and asks for role
-    2. user provides role: Clara asks for interview type
-    3. user provides type: interview begins with first question
-    4. subsequent calls: normal interview with analysis
-    5. action="end" or termination phrase: ends session
-    """
-    try:
-        user_text = ""
-        audio_path = None
-
-        if not session_id or session_id.strip() == "" or session_id == "string":
-            session_id = str(uuid.uuid4())
-        
-        
-        session = await db.get_user_session(session_id)
-        session_exists = session is not None
-        native_language = session.get("native_language", native_language) if session else native_language
-        target_language = session.get("target_language", target_language) if session else target_language
-
-        native_language = normalize_language_code(native_language, default="en")
-        target_language = normalize_language_code(target_language, default="en")
-
-        if session_exists:
-            if session.get("native_language") != native_language or session.get("target_language") != target_language:
-                session["native_language"] = native_language
-                session["target_language"] = target_language
-                await db.update_session(session_id, session)
-        
-        
-        if session_exists and session.get("status") == "completed":
-            error_msg = await translate_text("This session has ended. Please start a new session.", "en", native_language)
-            return {"status": "error", "session_id": session_id, "error": error_msg} 
-        
-        if not session_exists:
-            
-            session = {
-                "state": "welcome",  
-                "name": name, 
-                "scenario": None,  
-                "role": None,      
-                "level": level,
-                "native_language": native_language, 
-                "target_language": target_language,
-                "chat_history": [],
-                "scores": {"grammar": 0, "vocabulary": 0, "pronunciation": 0, "fluency": 0, "total_wpm": 0, "count": 0, "audio_count": 0},
-                "current_question": None, "current_hint": None, "turn_number": 0,
-                "last_overall_score": None, "retry_count": 0, "attempts": [],
-                "turn_history": [],  
-                "onboarding_retry": 0  
-            }
-            await db.create_session(
-                session_id=session_id,
-                session_type="interview",
-                data=session,
-                user_id=current_user.id if current_user else None,
-                user_name=name
-            )
-        
-        
-        current_state = session.get("state", "interviewing") 
-        
-        
-        if current_state == "welcome" and not audio_file and not text_input:
-            greeting = f"Hi {name}! I'm {BOT_NAME}, your interview coach 🙂 So, which role are you ready for?"
-            
-            greeting_target, greeting_native = await asyncio.gather(
-                translate_text(greeting, "en", target_language),
-                translate_text(greeting, "en", native_language)
-            )
-            
-            session["state"] = "collecting_role"
-            session["chat_history"].append({"role": "assistant", "content": greeting})
-            await db.update_session(session_id, session)
-            
-            greeting_audio = await generate_tts_url(request, greeting_target, target_language, api_type="interview", voice_id=voice_id)
-            
-            return {
-                "status": "onboarding",
-                "step": "collecting_role",
-                "session_id": session_id,
-                "target_lang": target_language,
-                "native_lang": native_language,
-                "transcription": user_text,
-                "message": {"target": greeting_target, "native": greeting_native},
-                "audio_url": greeting_audio
-            }
-        
-        
-        if current_state == "collecting_role":
-            user_text = text_input or ""
-            if audio_file:
-                
-                user_text = await transcribe_audio_file(audio_file, target_language)
-            
-            if not user_text.strip():
-                error_msg = await translate_text("No speech detected. Please tell me which role you're preparing for.", "en", native_language)
-                return {"status": "error", "session_id": session_id, "error": error_msg}
-            
-            session["chat_history"].append({"role": "user", "content": user_text})
-            
-            
-            extraction = await extract_role_from_text(user_text, model=model)
-            
-            if extraction.get("success") and extraction.get("role"):
-                role = extraction["role"]
-                session["role"] = role
-                session["state"] = "collecting_type"
-                session["onboarding_retry"] = 0
-                
-                
-                ask_type = f"Great, {role}! Is this more of an HR interview, or would you prefer something else like behavioral or technical?"
-                ask_type_target, ask_type_native = await asyncio.gather(
-                    translate_text(ask_type, "en", target_language),
-                    translate_text(ask_type, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": ask_type})
-                await db.update_session(session_id, session)
-                
-                ask_type_audio = await generate_tts_url(request, ask_type_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_type", 
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "role": role,
-                    "message": {"target": ask_type_target, "native": ask_type_native},
-                    "audio_url": ask_type_audio
-                }
-            else:
-                
-                session["onboarding_retry"] = session.get("onboarding_retry", 0) + 1
-                retry_msg = "Could you be more specific about the role? For example: Software Engineer, Marketing Manager, Business Analyst, etc."
-                retry_target, retry_native = await asyncio.gather(
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": retry_msg})
-                await db.update_session(session_id, session)
-                
-                retry_audio = await generate_tts_url(request, retry_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_role",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "retry": True,
-                    "message": {"target": retry_target, "native": retry_native},
-                    "audio_url": retry_audio
-                }
-        
-        if current_state == "collecting_type":
-            user_text = text_input or ""
-            if audio_file:
-                
-                user_text = await transcribe_audio_file(audio_file, target_language)
-            
-            if not user_text.strip():
-                error_msg = await translate_text("No speech detected. Please tell me the interview type.", "en", native_language)
-                return {"status": "error", "session_id": session_id, "error": error_msg}
-            
-            session["chat_history"].append({"role": "user", "content": user_text})
-            
-            
-            extraction = await extract_interview_type_from_text(user_text, model=model)
-            
-            if extraction.get("success") and extraction.get("type"):
-                interview_type = extraction["type"]
-                session["scenario"] = interview_type
-                session["state"] = "interviewing"
-                session["onboarding_retry"] = 0
-                
-                
-                role = session.get("role", "Professional")
-                scenario_name = INTERVIEW_SCENARIOS.get(interview_type, interview_type.title() + " Interview")
-                
-                question, hint = await generate_interview_question(
-                    interview_type, role, level, name, model=model, target_language=target_language, turn_number=0
-                )
-                
-                start_msg = f"Perfect! Let's start your {scenario_name} practice for {role}."
-                start_target, start_native, q_native, h_native = await asyncio.gather(
-                    translate_text(start_msg, "en", target_language),
-                    translate_text(start_msg, "en", native_language),
-                    translate_text(question, target_language, native_language),
-                    translate_text(hint, target_language, native_language)
-                )
-                
-                session["current_question"] = question
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": question})
-                await db.update_session(session_id, session)
-                
-                question_audio = await generate_tts_url(request, question, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "interview_started",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "role": role,
-                    "scenario": interview_type,
-                    "greeting": {"target": start_target, "native": start_native},
-                    "next_question": {"target": question, "native": q_native},
-                    "hint": {"target": hint, "native": h_native},
-                    "turn_number": 0,
-                    "audio_url": question_audio
-                }
-            else:
-                
-                session["onboarding_retry"] = session.get("onboarding_retry", 0) + 1
-                retry_msg = "What type of interview would you like to practice? For example: HR, Technical, Sales, Marketing, Customer Service, or any other type?"
-                retry_target, retry_native = await asyncio.gather(
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": retry_msg})
-                await db.update_session(session_id, session)
-                
-                retry_audio = await generate_tts_url(request, retry_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_type",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "retry": True,
-                    "message": {"target": retry_target, "native": retry_native},
-                    "audio_url": retry_audio
-                }
-        
-        
-        role = session.get("role", "Professional")
-        scenario = session.get("scenario", "general")
-        
-        if action == "next":
-            follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-            session["current_question"] = follow_up
-            session["current_hint"] = hint
-            session["chat_history"].append({"role": "assistant", "content": follow_up})
-            
-            session["retry_count"] = 0
-            session["waiting_retry_decision"] = False  
-            session["retry_clarify_count"] = 0  
-            
-            
-            await db.update_session(session_id, session)
-            
-            follow_up_audio = await generate_tts_url(request, follow_up, target_language, api_type="interview", voice_id=voice_id)
-            
-            skipped_msg = await translate_text("Skipped", "en", target_language) if target_language != "en" else "Skipped"
-            skipped_next_msg = await translate_text("Skipped. Let's try this question!", "en", target_language) if target_language != "en" else "Skipped. Let's try this question!"
-
-            return {
-                "status": "continue", "session_id": session_id,
-                "target_lang": target_language, "native_lang": native_language,
-                "transcription": "(skipped)",
-                "next_question": {"target": follow_up, "native": await translate_text(follow_up, target_language, native_language)},
-                "hint": {"target": hint, "native": await translate_text(hint, target_language, native_language)},
-                "grammar": {"score": 0, "is_correct": True, "errors": [], "feedback": skipped_msg},
-                "vocabulary": {"score": 0, "overall_level": "skipped", "feedback": skipped_msg},
-                "pronunciation": {"accuracy": 0, "word_pronunciation_scores": [], "feedback": skipped_msg},
-                "fluency": {"score": 0, "wpm": 0, "speed_status": "skipped"},
-                "answer_evaluation": {"clarity": "", "structure": "", "relevance": "", "improved_answer": ""},
-                "personalized_feedback": {"message": skipped_next_msg, "improvement_areas": [], "strengths": []},
-                "overall_score": 0, "passing_score": PASSING_SCORE, "should_retry": False, "turn_number": session["turn_number"],
-                "audio_url": follow_up_audio
-            }
-        
-        if action == "end":
-            return await handle_session_termination(session, session_id, model)
-        
-        if not audio_file and not text_input:
-            
-            current_q = session.get("current_question")
-            current_h = session.get("current_hint", "")
-            
-            if current_q:
-                
-                q_native = await translate_text(current_q, target_language, native_language)
-                h_native = await translate_text(current_h, target_language, native_language)
-                
-                current_q_audio = await generate_tts_url(request, current_q, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    "turn_number": session.get("turn_number", 0),
-                    "audio_url": current_q_audio
-                }
-            else:
-                
-                question, hint = await generate_interview_question(
-                    scenario, role, session.get("level", level), name, model=model, target_language=target_language, turn_number=session.get("turn_number", 0)
-                )
-                session["current_question"] = question
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": question})
-                await db.update_session(session_id, session)
-                
-                q_native = await translate_text(question, target_language, native_language)
-                h_native = await translate_text(hint, target_language, native_language)
-                
-                question_audio = await generate_tts_url(request, question, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": question, "native": q_native},
-                    "hint": {"target": hint, "native": h_native},
-                    "turn_number": session.get("turn_number", 0),
-                    "audio_url": question_audio
-                }
-        
-        user_text = text_input or ""
-        audio_path = None
-        audio_duration = 5.0
-        is_audio_input = audio_file is not None  
-        
-        if audio_file:
-            try:
-                audio_file.file.seek(0)
-            except Exception:
-                pass
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-                shutil.copyfileobj(audio_file.file, tmp)
-                temp_upload = tmp.name
-            
-            try:
-                
-                def convert_audio():
-                    audio = AudioSegment.from_file(temp_upload)
-                    audio = audio.set_frame_rate(16000).set_channels(1)
-                    converted_path = temp_upload.replace('.tmp', '_converted.wav')
-                    audio.export(converted_path, format="wav")
-                    return converted_path, len(audio) / 1000
-                
-                audio_path, audio_duration = await asyncio.to_thread(convert_audio)
-                os.unlink(temp_upload)  
-            except Exception as e:
-                logger.debug(f"Audio conversion fallback: {e}")
-                audio_path = temp_upload
-            finally:
-                
-                
-                if audio_path != temp_upload and os.path.exists(temp_upload):
-                    try:
-                        os.unlink(temp_upload)
-                    except:
-                        pass
-        
-        if is_audio_input:
-            pronunciation = await analyze_pronunciation_llm(audio_path=audio_path, spoken_text=user_text, level=session.get("level", level), model=model, target_language=target_language)
-            
-            if pronunciation and pronunciation.get("transcription"):
-                user_text = pronunciation["transcription"]
-        else:
-            pronunciation = None   
-        
-        if audio_path:
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
-        
-        if not user_text or not user_text.strip():
-            error_msg = await translate_text("No speech detected. Please try again.", "en", native_language)
-            return {"status": "error", "session_id": session_id, "error": error_msg}
-        
-        user_text = user_text.strip()
-        session["chat_history"].append({"role": "user", "content": user_text})
-        
-        if session.get("waiting_retry_decision"):
-            user_choice = user_text.lower().strip()
-            
-            
-            cleaned_choice = user_choice.rstrip('.,!?')
-            if cleaned_choice in TERMINATION_PHRASES:
-                
-                session["waiting_retry_decision"] = False
-                return await handle_session_termination(session, session_id, model)
-            
-            retry_keywords = ["yes", "retry", "practice", "again", "try", "redo", "repeat", "once more", "one more"]
-            skip_keywords = ["no", "skip", "next", "move", "forward", "pass", "don't want", "not now", "let's move", "move on", "go ahead"]
-            
-            wants_retry = any(keyword in user_choice for keyword in retry_keywords)
-            wants_skip = any(keyword in user_choice for keyword in skip_keywords)
-            
-            if wants_retry:
-                
-                session["waiting_retry_decision"] = False  
-                session["retry_clarify_count"] = 0  
-                current_q = session.get("current_question", "")
-                current_h = session.get("current_hint", "")
-                session["chat_history"].append({"role": "assistant", "content": current_q})
-                await db.update_session(session_id, session)
-                
-                retry_msg = "Let's try this again! Take your time."
-                q_native, h_native, retry_msg_target, retry_msg_native = await asyncio.gather(
-                    translate_text(current_q, target_language, native_language),
-                    translate_text(current_h, target_language, native_language),
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    "message": {"target": retry_msg_target, "native": retry_msg_native},
-                    "turn_number": session.get("turn_number", 0)
-                }
-            elif wants_skip:
-                
-                session["waiting_retry_decision"] = False  
-                session["retry_clarify_count"] = 0  
-                follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-                session["current_question"] = follow_up
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": follow_up})
-                session["retry_count"] = 0
-                
-                await db.update_session(session_id, session)
-                
-                follow_up_native, hint_native = await asyncio.gather(
-                    translate_text(follow_up, target_language, native_language),
-                    translate_text(hint, target_language, native_language)
-                )
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": follow_up, "native": follow_up_native},
-                    "hint": {"target": hint, "native": hint_native},
-                    "turn_number": session["turn_number"]
-                }
-            else:
-                
-                clarify_count = session.get("retry_clarify_count", 0) + 1
-                session["retry_clarify_count"] = clarify_count
-                
-                
-                if clarify_count >= 3:
-                    session["waiting_retry_decision"] = False
-                    session["retry_clarify_count"] = 0
-                    
-                    auto_skip_msg = "I see you're having trouble deciding. Let's move on to the next question!"
-                    follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-                    session["current_question"] = follow_up
-                    session["current_hint"] = hint
-                    session["chat_history"].append({"role": "assistant", "content": auto_skip_msg})
-                    session["chat_history"].append({"role": "assistant", "content": follow_up})
-                    session["retry_count"] = 0
-                    
-                    await db.update_session(session_id, session)
-                    
-                    auto_skip_target, auto_skip_native, follow_up_native, hint_native = await asyncio.gather(
-                        translate_text(auto_skip_msg, "en", target_language),
-                        translate_text(auto_skip_msg, "en", native_language),
-                        translate_text(follow_up, target_language, native_language),
-                        translate_text(hint, target_language, native_language)
-                    )
-                    
-                    return {
-                        "status": "auto_skipped",
-                        "session_id": session_id,
-                        "target_lang": target_language,
-                        "native_lang": native_language,
-                        "message": {"target": auto_skip_target, "native": auto_skip_native},
-                        "next_question": {"target": follow_up, "native": follow_up_native},
-                        "hint": {"target": hint, "native": hint_native},
-                        "turn_number": session["turn_number"],
-                        
-                        "grammar": None,
-                        "vocabulary": None,
-                        "pronunciation": None,
-                        "fluency": None,
-                        "answer_evaluation": None,
-                        "emotion": None,
-                        "personalized_feedback": None,
-                        "overall_score": None,
-                        "improvement": None
-                    }
-                else:
-                    
-                    current_q = session.get("current_question", "")
-                    current_h = session.get("current_hint", "")
-                    level = session.get("level", "B1")
-                    
-                    if is_audio_input:
-                        word_count = len(user_text.split())
-                        estimated_duration = max(1, word_count / 2.5)  
-                        grammar, vocabulary, answer_eval, pronunciation, fluency = await asyncio.gather(
-                            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-                            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-                            evaluate_answer(current_q, user_text, level, model=model, target_language=target_language),
-                            analyze_pronunciation_llm(audio_path=audio_path, spoken_text=user_text, level=level, model=model, target_language=target_language),
-                            analyze_fluency_metrics(user_text, estimated_duration)
-                        )
-                    else:
-                        
-                        grammar, vocabulary, answer_eval = await asyncio.gather(
-                            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-                            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-                            evaluate_answer(current_q, user_text, level, model=model, target_language=target_language)
-                        )
-                        pronunciation = None
-                        fluency = None
-                    
-                    
-                    if is_audio_input:
-                        scores = {
-                            "grammar": grammar.get("score", 70),
-                            "vocabulary": vocabulary.get("score", 70),
-                            "pronunciation": pronunciation.get("score", pronunciation.get("accuracy", 70)) if pronunciation else 0,
-                            "fluency": fluency.get("score", 70) if fluency else 0,
-                            "answer_evaluation": answer_eval.get("score", 50)
-                        }
-                        
-                        overall_score = int(
-                            scores["grammar"] * 0.25 +
-                            scores["vocabulary"] * 0.25 +
-                            scores["answer_evaluation"] * 0.25 +
-                            scores["pronunciation"] * 0.15 +
-                            scores["fluency"] * 0.10
-                        )
-                    else:
-                        scores = {
-                            "grammar": grammar.get("score", 70),
-                            "vocabulary": vocabulary.get("score", 70),
-                            "pronunciation": None,
-                            "fluency": None,
-                            "answer_evaluation": answer_eval.get("score", 50)
-                        }
-                        
-                        overall_score = int(
-                            scores["grammar"] * 0.33 +
-                            scores["vocabulary"] * 0.33 +
-                            scores["answer_evaluation"] * 0.34
-                        )
-
-                    
-                    
-                    emotion = {"emotion": "neutral", "confidence_level": "medium", "explanation": ""}
-                    personalized_feedback = await generate_personalized_feedback(
-                        overall_score, scores, emotion, session.get("name", "User"),
-                        grammar=grammar, vocabulary=vocabulary, 
-                        pronunciation=pronunciation, answer_eval=answer_eval, model=model,
-                        target_language=target_language
-                    )
-                    
-                    
-                    if clarify_count == 1:
-                        clarify_msg = "I heard you say something, but I'm not sure if you want to practice again or move on. Just say 'retry' or 'skip' - or you can try answering the question again!"
-                    else:
-                        clarify_msg = "Still not quite sure what you'd like to do. Say 'yes' to practice the same question, or 'skip' to get a new one. One more unclear response and I'll move you to the next question."
-                    
-                    
-                    await db.update_session(session_id, session)
-                    
-                    
-                    if is_audio_input and pronunciation and fluency:
-                        (clarify_target, clarify_native, q_native, h_native, grammar_t, vocab_t, 
-                         pron_t, fluency_t, eval_t, personal_t) = await asyncio.gather(
-                            translate_text(clarify_msg, "en", target_language),
-                            translate_text(clarify_msg, "en", native_language),
-                            translate_text(current_q, target_language, native_language),
-                            translate_text(current_h, target_language, native_language),
-                            translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                            translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                            translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS),
-                            translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS),
-                            translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS),
-                            translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                        )
-                    else:
-                        (clarify_target, clarify_native, q_native, h_native, grammar_t, vocab_t, 
-                         eval_t, personal_t) = await asyncio.gather(
-                            translate_text(clarify_msg, "en", target_language),
-                            translate_text(clarify_msg, "en", native_language),
-                            translate_text(current_q, target_language, native_language),
-                            translate_text(current_h, target_language, native_language),
-                            translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                            translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                            translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS),
-                            translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                        )
-                        pron_t = None
-                        fluency_t = None
-                    
-                    return {
-                        "status": "clarify_retry",
-                        "session_id": session_id,
-                        "target_lang": target_language,
-                        "native_lang": native_language,
-                        "transcription": user_text,
-                        "message": {"target": clarify_target, "native": clarify_native},
-                        "next_question": {"target": current_q, "native": q_native},
-                        "hint": {"target": current_h, "native": h_native},
-                        "grammar": grammar_t,
-                        "vocabulary": vocab_t,
-                        "pronunciation": pron_t,
-                        "fluency": fluency_t,
-                        "answer_evaluation": eval_t,
-                        "emotion": emotion,
-                        "personalized_feedback": personal_t,
-                        "overall_score": overall_score,
-                        "clarify_count": clarify_count,
-                        "turn_number": session.get("turn_number", 0)
-                    }
-
-        
-        
-        cleaned_text = user_text.lower().strip().rstrip('.,!?')
-        is_termination = cleaned_text in TERMINATION_PHRASES or action == "end"
-        
-        grammar, vocabulary, answer_eval = await asyncio.gather(
-            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-            evaluate_answer(session.get("current_question", ""), user_text, level, model=model, target_language=target_language)
-        )
-        
-        
-        emotion = {"emotion": "neutral", "confidence_level": "medium", "explanation": ""}
-        
-        
-        if is_audio_input:
-            word_count = len(user_text.split())
-            fluency = calculate_fluency(word_count, audio_duration)
-        else:
-            fluency = None  
-
-        
-        
-        
-        
-        if not is_termination and session.get("current_question"):
-            relevance_check = await check_answer_relevance(session["current_question"], user_text, model=model, target_language=target_language)
-            
-            if not relevance_check.get("relevant", True):
-                
-                redirect_msg = relevance_check.get("redirect")
-                if not redirect_msg:
-                    redirect_msg = "Let's stay on track! ????"
-                    if target_language != "en":
-                        redirect_msg = await translate_text(redirect_msg, "en", target_language)
-                current_q = session["current_question"]
-                current_h = session.get("current_hint", "")
-                
-                
-                full_response = f"{redirect_msg}\n\n{current_q}"
-                session["chat_history"].append({"role": "assistant", "content": full_response})
-                await db.update_session(session_id, session)
-                
-                redirect_native, q_native, h_native, grammar_t, vocab_t, eval_t = await asyncio.gather(
-                    translate_text(redirect_msg, target_language, native_language),
-                    translate_text(current_q, target_language, native_language),
-                    translate_text(current_h, target_language, native_language),
-                    translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                    translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                    translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-                )
-                
-                
-                if is_audio_input and pronunciation and fluency:
-                    pron_t, fluency_t = await asyncio.gather(
-                        translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS),
-                        translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS)
-                    )
-                    scores = {
-                        "grammar": grammar.get("score", 75),
-                        "vocabulary": vocabulary.get("score", 75),
-                        "pronunciation": pronunciation.get("accuracy", 75),
-                        "fluency": fluency.get("score", 75)
-                    }
-                    answer_score = answer_eval.get("score", 50)
-                    overall_score = int(
-                        scores["grammar"] * 0.25 +
-                        scores["vocabulary"] * 0.25 +
-                        answer_score * 0.25 +
-                        scores["pronunciation"] * 0.15 +
-                        scores["fluency"] * 0.10
-                    )
-                else:
-                    pron_t = None
-                    fluency_t = None
-                    scores = {
-                        "grammar": grammar.get("score", 75),
-                        "vocabulary": vocabulary.get("score", 75),
-                        "pronunciation": None,
-                        "fluency": None
-                    }
-                    answer_score = answer_eval.get("score", 50)
-                    
-                    overall_score = int(
-                        scores["grammar"] * 0.33 +
-                        scores["vocabulary"] * 0.33 +
-                        answer_score * 0.34
-                    )
-
-                personalized_feedback = await generate_personalized_feedback(overall_score, scores, emotion, session["name"], model=model, target_language=target_language)
-                
-                
-                personal_t = await translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                
-                return {
-                    "status": "redirect",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "message": {"target": redirect_msg, "native": redirect_native},
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    
-                    "grammar": grammar_t,
-                    "vocabulary": vocab_t,
-                    "pronunciation": pron_t,
-                    "fluency": fluency_t,
-                    "answer_evaluation": eval_t,
-                    "emotion": emotion,
-                    "personalized_feedback": personal_t,
-                    "overall_score": overall_score,
-                    "passing_score": PASSING_SCORE,
-                    "improvement": None,  
-                    "turn_number": session.get("turn_number", 0)
-                }
-        
-        
-        if is_termination:
-            return await handle_session_termination(session, session_id, model)
-
-        
-        
-        if is_audio_input:
-            scores = {
-                "grammar": grammar.get("score", 75),
-                "vocabulary": vocabulary.get("score", 75),
-                "pronunciation": pronunciation.get("accuracy", 75) if pronunciation else 0,
-                "fluency": fluency.get("score", 75) if fluency else 0
-            }
-        else:
-            scores = {
-                "grammar": grammar.get("score", 75),
-                "vocabulary": vocabulary.get("score", 75),
-                "pronunciation": None,  
-                "fluency": None  
-            }
-        
-        
-        answer_score = answer_eval.get("score", 50)
-        if is_audio_input:
-            
-            overall_score = int(
-                scores["grammar"] * 0.25 +
-                scores["vocabulary"] * 0.25 +
-                answer_score * 0.25 +
-                scores["pronunciation"] * 0.15 +
-                scores["fluency"] * 0.10
-            )
-        else:
-            
-            overall_score = int(
-                scores["grammar"] * 0.33 +
-                scores["vocabulary"] * 0.33 +
-                answer_score * 0.34
-            )
-        
-        
-        session["scores"]["grammar"] += scores["grammar"]
-        session["scores"]["vocabulary"] += scores["vocabulary"]
-        if is_audio_input:
-            session["scores"]["pronunciation"] += scores["pronunciation"]
-            session["scores"]["fluency"] += scores["fluency"]
-            session["scores"]["total_wpm"] += fluency.get("wpm", 100) if fluency else 100
-            session["scores"]["audio_count"] = session["scores"].get("audio_count", 0) + 1  
-        session["scores"]["answer"] = session["scores"].get("answer", 0) + answer_score  
-        session["scores"]["count"] += 1
-
-        session["turn_number"] += 1
-        
-
-        
-        
-        personalized_feedback, (follow_up_question, follow_up_hint) = await asyncio.gather(
-            generate_personalized_feedback(
-                overall_score, scores, emotion, session["name"],
-                grammar=grammar, vocabulary=vocabulary, 
-                pronunciation=pronunciation, answer_eval=answer_eval, model=model,
-                target_language=target_language
-            ),
-            generate_interactive_follow_up(user_text, session["chat_history"], role, scenario, model=model, target_language=target_language)
-        )
-        
-        
-        improvement = {}
-        is_retrying = session.get("retry_count", 0) > 0
-        prev_overall = session.get("last_overall_score")
-        
-        
-        if is_retrying and prev_overall is not None:
-            
-            current_attempt = {
-                "transcription": user_text,
-                "grammar": grammar,
-                "vocabulary": vocabulary,
-                "pronunciation": pronunciation,
-                "fluency": fluency,
-                "answer_evaluation": answer_eval,
-                "overall_score": overall_score
-            }
-            session.setdefault("attempts", []).append(current_attempt)
-            
-            
-            improvement = await compare_attempts(
-                session["attempts"], 
-                level="B1",  
-                user_type="professional", 
-                model=model,
-                target_language=target_language
-            )
-        else:
-            
-            current_attempt = {
-                "transcription": user_text,
-                "grammar": grammar,
-                "vocabulary": vocabulary,
-                "pronunciation": pronunciation,
-                "fluency": fluency,
-                "answer_evaluation": answer_eval,
-                "overall_score": overall_score
-            }
-            session.setdefault("attempts", []).append(current_attempt)
-        
-        
-        
-        session["last_scores"] = scores.copy()
-        session["last_overall_score"] = overall_score
-        
-        
-        if "turn_history" not in session:
-            session["turn_history"] = []
-        
-        turn_data = {
-            "turn_number": session["turn_number"],
-            "turn": session["turn_number"],  
-            "transcription": user_text,
-            "question": session.get("current_question", ""),
-            "scores": scores.copy(),
-            "overall_score": overall_score,
-            "wpm": fluency.get("wpm", 0) if fluency else 0,  
-            "grammar": grammar,
-            "vocabulary": vocabulary,
-            "pronunciation": pronunciation,
-            "fluency": fluency,
-            "answer_evaluation": answer_eval,
-            "emotion": emotion,
-            "personalized_feedback": personalized_feedback,
-            "improvement": improvement
-        }
-        session["turn_history"].append(turn_data)
-        
-        
-        should_retry = (overall_score < PASSING_SCORE or action == "practice")
-        
-        if should_retry:
-            session["retry_count"] = session.get("retry_count", 0) + 1
-            session["waiting_retry_decision"] = True  
-            current_q = session.get("current_question", "")
-            current_h = session.get("current_hint", "")
-            
-            
-            retry_ask = "I see your answer, but it could be stronger. Would you like to practice this question again?"
-            
-            
-            base_tasks = [
-                translate_text(retry_ask, "en", target_language),
-                translate_text(retry_ask, "en", native_language),
-                translate_text(current_q, target_language, native_language),
-                translate_text(current_h, target_language, native_language),
-                translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-            ]
-            base_results = await asyncio.gather(*base_tasks)
-            retry_ask_target, retry_ask_native, q_native, h_native, grammar_t, vocab_t, eval_t = base_results
-            
-            
-            pron_t = await translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS) if pronunciation else None
-            fluency_t = await translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS) if fluency else None
-            
-            await db.update_session(session_id, session, overall_score=overall_score)
-            
-            retry_ask_audio = await generate_tts_url(request, retry_ask_target, target_language, api_type="interview")
-            
-            return {
-                "status": "feedback",
-                "session_id": session_id,
-                "target_lang": target_language,
-                "native_lang": native_language,
-                "transcription": user_text,
-                "message": {"target": retry_ask_target, "native": retry_ask_native},
-                "next_question": {"target": current_q, "native": q_native},
-                "hint": {"target": current_h, "native": h_native},
-                "grammar": grammar_t,
-                "vocabulary": vocab_t,
-                "pronunciation": pron_t,
-                "fluency": fluency_t,
-                "answer_evaluation": eval_t,
-                "emotion": emotion,
-                "personalized_feedback": personalized_feedback,
-                "overall_score": overall_score,
-                "passing_score": PASSING_SCORE,
-                "should_retry": True,
-                "retry_count": session.get("retry_count", 1),
-                "improvement": improvement,
-                "turn_number": session["turn_number"],
-                "audio_url": retry_ask_audio
-            }
-        else:
-            
-            session["current_question"] = follow_up_question
-            session["current_hint"] = follow_up_hint
-            session["chat_history"].append({"role": "assistant", "content": follow_up_question})
-            session["retry_count"] = 0
-            
-            
-            base_tasks = [
-                translate_text(follow_up_question, target_language, native_language),
-                translate_text(follow_up_hint, target_language, native_language),
-                translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS),
-                translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-            ]
-            base_results = await asyncio.gather(*base_tasks)
-            follow_up_native, hint_native, grammar_t, vocab_t, personal_t, eval_t = base_results
-            
-            
-            pron_t = await translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS) if pronunciation else None
-            fluency_t = await translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS) if fluency else None
-            
-            await db.update_session(session_id, session, overall_score=overall_score)
-            
-            follow_up_audio = await generate_tts_url(request, follow_up_question, target_language, api_type="interview")
-            
-            return {
-                "status": "continue", "session_id": session_id, 
-                "target_lang": target_language, "native_lang": native_language,
-                "transcription": user_text,
-                "next_question": {"target": follow_up_question, "native": follow_up_native},
-                "hint": {"target": follow_up_hint, "native": hint_native},
-                "grammar": grammar_t, "vocabulary": vocab_t, "pronunciation": pron_t, "fluency": fluency_t,
-                "answer_evaluation": eval_t, "emotion": emotion,
-                "personalized_feedback": personal_t,
-                "overall_score": overall_score, "passing_score": PASSING_SCORE,
-                "improvement": improvement,  
-                "should_retry": False, "turn_number": session["turn_number"],
-                "audio_url": follow_up_audio
-            }
-    
-    except Exception as e:
-        logger.exception(f"Error in practice_interview: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/sessions")
-async def list_sessions():
-    """list active interview sessions from database"""
-    sessions_list = await db.list_sessions(session_type="interview")
-    return {"active_sessions": len(sessions_list), "sessions": sessions_list}
-
-
-@router.get("/sessions/{session_id}")
-async def get_session_data(session_id: str):
-    """get complete session history including all responses, feedback, and analysis"""
-    session_data = await db.get_user_session(session_id)
-    if session_data:
-        
-        count = max(1, session_data.get("scores", {}).get("count", 1))
-        raw_scores = session_data.get("scores", {})
-        audio_count = raw_scores.get("audio_count", 0)
-        if not audio_count and (raw_scores.get("pronunciation", 0) > 0 or raw_scores.get("fluency", 0) > 0):
-            audio_count = count
-        
-        average_scores = {
-            "grammar": int(raw_scores.get("grammar", 0) / count),
-            "vocabulary": int(raw_scores.get("vocabulary", 0) / count),
-            "pronunciation": int(raw_scores.get("pronunciation", 0) / audio_count) if audio_count > 0 else None,
-            "fluency": int(raw_scores.get("fluency", 0) / audio_count) if audio_count > 0 else None,
-        }
-        
-        if audio_count > 0:
-            overall_average = int(sum(v for v in average_scores.values() if v is not None) / 4)
-        else:
-            overall_average = int((average_scores["grammar"] + average_scores["vocabulary"]) / 2)
-        average_wpm = int(raw_scores.get("total_wpm", 0) / audio_count) if audio_count > 0 else 0
-        
-        
-        session_status = session_data.get("status", "active")
-        is_completed = session_status == "completed"
-        
-        response = {
-            "status": "success",
-            "session_id": session_id,
-            "session_status": session_status,  
-            "can_continue": not is_completed,  
-            "user_name": session_data.get("name", ""),
-            "scenario": session_data.get("scenario", ""),
-            "role": session_data.get("role", ""),
-            "level": session_data.get("level", ""),
-            "current_state": session_data.get("state", "interviewing"),
-            "turns_completed": session_data.get("turn_number", 0),
-            "average_scores": average_scores,
-            "overall_score": overall_average,
-            "average_wpm": average_wpm,
-            "last_score": session_data.get("last_overall_score"),
-            "last_scores": session_data.get("last_scores", {}),
-
-            "chat_history": session_data.get("chat_history", []),
-            
-            "turn_history": session_data.get("turn_history", []),
-        }
-        
-        
-        if is_completed and session_data.get("final_feedback"):
-            response["final_feedback"] = session_data["final_feedback"]
-        
-        return response
-    
-    raise HTTPException(status_code=404, detail="Session not found")
-
-
-@router.get("/scenarios")
-async def get_scenarios():
-    """get available interview scenarios"""
-    return {"scenarios": INTERVIEW_SCENARIOS}
-
-
-@router.get("/final_feedback/{session_id}")
-async def get_interview_feedback(session_id: str):
-    """
-    Get the exact same response as session termination.
-    Returns the stored final_feedback from DB with keys in the same order as termination response.
-    """
-    session = await db.get_user_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Session not completed yet")
-    final_feedback = session.get("final_feedback")
-    if not final_feedback:
-        raise HTTPException(status_code=404, detail="Final feedback not found")
-    
-    ordered_response = {
-        "status": final_feedback.get("status", "conversation_ended"),
-        "session_id": final_feedback.get("session_id", session_id),
-        "target_lang": final_feedback.get("target_lang", session.get("target_language", "en")),
-        "native_lang": final_feedback.get("native_lang", session.get("native_language", "hi")),
-        "final_scores": final_feedback.get("final_scores", {}),
-        "overall_score": final_feedback.get("overall_score", 0),
-        "passing_score": final_feedback.get("passing_score", PASSING_SCORE),
-        "average_wpm": final_feedback.get("average_wpm", 0),
-        "wpm_per_turn": final_feedback.get("wpm_per_turn", []),
-        "wpm_status": final_feedback.get("wpm_status", "normal"),
-        "vocab_overall": final_feedback.get("vocab_overall", {}),
-        "strengths": final_feedback.get("strengths", []),
-        "improvement_areas": final_feedback.get("improvement_areas", []),
-        "total_turns": final_feedback.get("total_turns", 0),
-        "turn_history": final_feedback.get("turn_history", []),
-        "turn_feedback": final_feedback.get("turn_feedback", []),
-        "summary": final_feedback.get("summary", {}),
-        "overall_assessment": final_feedback.get("overall_assessment", ""),
-        "grammar_feedback": final_feedback.get("grammar_feedback", {}),
-        "vocabulary_feedback": final_feedback.get("vocabulary_feedback", {}),
-        "pronunciation_feedback": final_feedback.get("pronunciation_feedback", {}),
-        "fluency_feedback": final_feedback.get("fluency_feedback", {}),
-        "interview_skills": final_feedback.get("interview_skills", {}),
-        "action_plan": final_feedback.get("action_plan", []),
-        "encouragement": final_feedback.get("encouragement", ""),
-        "next_practice_topics": final_feedback.get("next_practice_topics", [])
-    }
-    
-    return ordered_response
-@router.get("/user_sessions")
-async def get_interview_sessions_by_user(
-    role: Optional[str] = None,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get all Interview sessions for the authenticated user.
-    
-    Optionally filter by role (e.g., 'software', 'marketing', 'sales').
-    Returns sessions with session_ids included.
-    """
-    user_id = current_user.id
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-    
-    
-    if role:
-        filtered_sessions = []
-        for session in sessions:
-            session_data = await db.get_user_session(session.get("session_id"))
-            if session_data and session_data.get("role") == role:
-                session["role"] = role
-                filtered_sessions.append(session)
-        sessions = filtered_sessions
-    else:
-        
-        for session in sessions:
-            session_data = await db.get_user_session(session.get("session_id"))
-            if session_data:
-                session["role"] = session_data.get("role", "unknown")
-    
-    for idx, session in enumerate(sessions, 1):
-        session["session_number"] = f"Session {idx}"
-    
-    session_ids = [s.get("session_id") for s in sessions]
-    
-    return {
-        "user_id": user_id,
-        "total_sessions": len(sessions),
-        "filter": {"role": role} if role else None,
-        "session_ids": session_ids,
-        "sessions": sessions
-    }
-
-
-@router.get("/completed_sessions")
-async def get_completed_interview_sessions(current_user: User = Depends(get_current_user)):
-    """
-    Get only completed interview sessions for the authenticated user.
-    Returns session_ids and session metadata for completed sessions.
-    """
-    user_id = current_user.id
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-    completed_sessions = []
-    for s in sessions:
-        session_data = await db.get_user_session(s.get("session_id"))
-        if not session_data:
-            continue
-        if session_data.get("status") != "completed":
-            continue
-        if not session_data.get("final_feedback"):
-            continue
-        completed_sessions.append({
-            "session_id": s.get("session_id"),
-            "created_at": s.get("created_at"),
-            "role": session_data.get("role", ""),
-            "scenario": session_data.get("scenario", ""),
-            "target_lang": session_data.get("target_language", "en"),
-            "native_lang": session_data.get("native_language", "hi")
-        })
-    return {
-        "status": "success",
-        "total_sessions": len(completed_sessions),
-        "session_ids": [s.get("session_id") for s in completed_sessions],
-        "sessions": completed_sessions
-    }
-
-    
-
- 
-
-
-
-
-
-
-@router.get("/roles")
-async def get_user_roles_from_db(current_user: User = Depends(get_current_user)):
-    """
-    Get distinct job roles practiced by the current user from DB session data.
-    """
-    user_id = current_user.id if current_user else None
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_roles": len(roles),
-        "roles": roles
-    }
-
-@router.get("/roles_with_session_ids")
-async def get_roles_and_session_ids(current_user: User = Depends(get_current_user)):
-    """
-    Get all roles, their corresponding session IDs, and the total session counts for each role for the current user.
-    """
-    user_id = current_user.id if current_user else None
-
-    # Get distinct roles
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
-
-    # List to hold roles with session info
-    roles_with_session_ids = []
-
-    # Get all sessions for the user once
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-
-    for role in roles:
-        session_ids_for_role = []
-
-        for s in sessions:
-            session_data = await db.get_user_session(s.get("session_id"))
-            if session_data and session_data.get("role") == role and session_data.get("status") == "completed":
-                session_ids_for_role.append(s.get("session_id"))
-
-        if session_ids_for_role:
-            roles_with_session_ids.append({
-                "role": role,
-                "session_ids": session_ids_for_role,
-                "total_sessions": len(session_ids_for_role)
-            })
-
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_roles": len(roles_with_session_ids),
-        "roles_with_session_ids": roles_with_session_ids
-    }
-
-
-
-
-@router.get("/final_feedback/sessions/{session_id}")
-async def get_interview_feedback_sessions(session_id: str):
-    """
-    Get the exact same response as session termination.
-    Simply returns the stored final_feedback from DB - exactly as it was when session ended.
-    """
-    session = await db.get_user_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Session not completed yet")
-    final_feedback = session.get("final_feedback")
-    if not final_feedback:
-        raise HTTPException(status_code=404, detail="Final feedback not found")
-     
-    return final_feedback
-
-
-import json
-import logging
-import os
-import re
-import shutil
-import tempfile
-import uuid
-from typing import Optional
-
-from fastapi import APIRouter, Form, File, UploadFile, HTTPException, Request, Depends
-from faster_whisper import WhisperModel
-from deep_translator import GoogleTranslator
-from openai import AzureOpenAI
-from pydub import AudioSegment
-from logger_setup import logger
-from utils.tts_utils import generate_tts_url, load_language_mapping, normalize_language_code
-
- 
-
-# from utils.common_utils import llm_client
-
-# AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
-
-QWEN_ENABLED = False
-qwen_client = None  
-QWEN_MODEL_NAME = "Qwen/Qwen3-0.6B"  
-
-_whisper_model = WhisperModel("small", compute_type="int8")
-
-router = APIRouter()
-
-BOT_NAME = "Clara"
-PASSING_SCORE = 50
-TERMINATION_PHRASES = ["exit", "stop", "end", "finish", "quit", "done", "bye", "goodbye"]
-
-INTERVIEW_SCENARIOS = {
-    "marketing": "Marketing Executive HR Interview",
-    "sales": "Sales Representative HR Interview",
-    "software": "Software Engineer HR Interview (Non-Technical)",
-    "business_analyst": "Business Analyst HR Interview",
-    "self_intro": "Self Introduction",
-    "college_interview": "College Admission Interview",
-    "job_interview": "General Job Interview",
-    "professor_talk": "Talk with Professor",
-    "behavioral": "Behavioral Interview",
-    "technical": "Technical Interview"
-}
-
-
-GRAMMAR_FIELDS = ["feedback", "filler_feedback", "errors", "word_suggestions", "corrected_sentence", "improved_sentence", "strengths"]
-VOCAB_FIELDS = ["feedback", "suggestions", "word_levels"]
-PRON_FIELDS = ["feedback", "words_to_practice"]
-FLUENCY_FIELDS = ["feedback"]
-EVAL_FIELDS = ["clarity", "structure", "relevance", "confidence", "issue_summary", "improved_answer"]
-PERSONAL_FIELDS = ["message", "improvement_areas", "strengths"]
-
-async def call_llm(prompt: str, mode: str = "chat", timeout: int = 30, model: str = "gpt", target_language: str = "en") -> str:
-    """async llm call with proper error handling and timeout. Supports gpt (default) or qwen."""
-    base_prompts = {
-        "chat": "You are a kind, human-like conversational interview coach.",
-        "analysis": "You are an expert language evaluator. Analyze objectively and concisely.",
-        "strict_json": "You are a structured evaluator. Respond ONLY in valid JSON. No extra text."
-    }
-    
-    lang_lower = target_language.lower() if target_language else "en"
-    is_english = lang_lower in ["en", "english"]
-    lang_instruction = f" IMPORTANT: Respond entirely in {target_language} language." if not is_english else ""
-    system_prompts = {k: v + lang_instruction for k, v in base_prompts.items()}
+        messages.append({"role": "system", "content": "You are a friendly language tutor. Return only valid JSON when asked."})
+    messages.append({"role": "user", "content": prompt})
     
     
     if model.lower() == "qwen" and QWEN_ENABLED and qwen_client is not None:
         try:
-            
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    qwen_client.chat.completions.create,
-                    model=QWEN_MODEL_NAME,
-                    messages=[
-                        {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
-                        {"role": "user", "content": prompt}
-                    ],
-                    max_tokens=800,
-                    temperature=0.7 if mode == "chat" else 0.3
-                ),
-                timeout=timeout
+            response = qwen_client.chat.completions.create(
+                model=QWEN_MODEL_NAME,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=1000
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -3297,3009 +138,1997 @@ async def call_llm(prompt: str, mode: str = "chat", timeout: int = 30, model: st
             
     
     
+    response = llm_client.chat.completions.create(
+        model=AZURE_OPENAI_DEPLOYMENT,
+        messages=messages,
+        temperature=0.7,
+        max_tokens=1000
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def call_llm(prompt: str, system_prompt: str = None, timeout: int = 30, model: str = "gpt") -> str:
+    """async llm call with timeout. Supports gpt (default) or qwen."""
     try:
-        response = await asyncio.wait_for(
-            asyncio.to_thread(
-                llm_client.chat.completions.create,
-                model=AZURE_OPENAI_DEPLOYMENT,
-                messages=[
-                    {"role": "system", "content": system_prompts.get(mode, system_prompts["chat"])},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=800,
-                temperature=0.7 if mode == "chat" else 0.3
-            ),
+        result = await asyncio.wait_for(
+            asyncio.to_thread(call_gpt_sync, prompt, system_prompt, model),
             timeout=timeout
         )
-        return response.choices[0].message.content.strip()
-    except asyncio.TimeoutError:
-        logger.error(f"LLM call timed out after {timeout}s")
-        return ""
+        return result
+    except asyncio.TimeoutError as e:
+        logger.error(f"llm timeout: {e}")
+        raise
     except Exception as e:
-        logger.error(f"LLM call failed: {e}")
+        logger.error(f"llm error: {e}")
+        raise
+
+
+
+
+
+
+def safe_json_loads(text: str) -> dict:
+    """extract and parse json from llm response"""
+    if not text:
+        raise ValueError("empty response")
+    
+    
+    text = text.strip()
+    text = text.replace("```json", "").replace("```", "").strip()
+    
+    
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    
+    
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    
+    raise ValueError(f"no json found in: {text[:100]}")
+
+
+def extract_json_array(text: str) -> list:
+    """extract json array from llm response"""
+    if not text:
+        return []
+    
+    text = text.strip().replace("```json", "").replace("```", "").strip()
+    
+    match = re.search(r"\[.*\]", text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    
+    return []
+
+
+
+
+
+
+async def transcribe_audio(audio_path: str, target_lang: str = "en") -> str:
+    """transcribe audio using whisper (pre-loaded model)"""
+    try:
+        # Normalize language code (e.g., "hindi" -> "hi")
+        target_lang = target_lang.lower().strip()
+        languages_data = load_language_mapping()
+        if target_lang in languages_data:
+            target_lang = languages_data.get(target_lang, "en")
+        
+        segments, info = await asyncio.to_thread(_whisper_model.transcribe, audio_path, language=target_lang)
+        text = " ".join([seg.text for seg in segments])
+        return text.lower().strip()
+    except Exception as e:
+        logger.error(f"transcription error: {e}")
         return ""
+
+
+async def transcribe_audio_with_words(audio_path: str, target_lang: str = "en") -> dict:
+    """transcribe with word-level timestamps and confidence (pre-loaded model)"""
+    try:
+        # Normalize language code (e.g., "hindi" -> "hi")
+        target_lang = target_lang.lower().strip()
+        languages_data = load_language_mapping()
+        if target_lang in languages_data:
+            target_lang = languages_data.get(target_lang, "en")
+        
+        segments, info = await asyncio.to_thread(
+            _whisper_model.transcribe, 
+            audio_path,
+            language=target_lang,
+            word_timestamps=True
+        )
+        
+        words = []
+        full_text = []
+        
+        for segment in segments:
+            full_text.append(segment.text)
+            if hasattr(segment, 'words') and segment.words:
+                for word in segment.words:
+                    words.append({
+                        "word": word.word.strip(),
+                        "start": word.start,
+                        "end": word.end,
+                        "probability": word.probability
+                    })
+        
+        return {
+            "text": " ".join(full_text).lower().strip(),
+            "words": words,
+            "duration": info.duration if info else 0
+        }
+    except Exception as e:
+        logger.error(f"transcription with words error: {e}")
+        return {"text": "", "words": [], "duration": 0}
+
+
+
+
+
+
+def pronunciation_score_wer(expected: str, spoken: str) -> int:
+    """WER-based pronunciation score for SENTENCES - compares full text match"""
+    try:
+        error = wer(expected.lower().strip(), spoken.lower().strip())
+        return max(0, 100 - int(error * 100))
+    except Exception as e:
+        logger.error(f"WER scoring error: {e}")
+        return 0
+
+
+def pronunciation_score_word(expected_word: str, transcription: str) -> dict:
+    """
+    Word-based pronunciation score - STRICT matching.
+    Returns 0 for total mismatch, score only if word is detected or very close.
+    Note: All return values are native Python types for JSON serialization.
+    """
+    expected_lower = expected_word.lower().strip()
+    transcription_lower = transcription.lower().strip()
+    
+    # Exact match - word is in transcription
+    if expected_lower in transcription_lower:
+        return {"score": 100, "detected": True, "match_type": "exact"}
+    
+    # Check each spoken word for very close match only
+    transcription_words = transcription_lower.split()
+    for spoken_word in transcription_words:
+        # Only allow if VERY similar (>80% character match) - stricter threshold
+        if len(spoken_word) > 0 and len(expected_lower) > 0:
+            common = set(spoken_word) & set(expected_lower)
+            similarity = len(common) / max(len(set(spoken_word)), len(set(expected_lower)))
+            # Also check length is similar (prevents "cat" matching "beautiful")
+            length_ratio = min(len(spoken_word), len(expected_lower)) / max(len(spoken_word), len(expected_lower))
+            # Use bool() to ensure native Python boolean (not numpy.bool_)
+            if bool(similarity >= 0.8) and bool(length_ratio >= 0.7):
+                return {"score": int(similarity * 85), "detected": True, "match_type": "partial"}
+    
+    # Total mismatch - return 0
+    return {"score": 0, "detected": False, "match_type": "none"}
+
+
+async def analyze_word_pronunciation(audio_path: str, expected_word: str, target_lang: str = "en") -> dict:
+    """
+    Analyze single word pronunciation using Whisper confidence.
+    Returns confidence score and syllable guide if needed.
+    """
+    try:
+        
+        transcription_data = await transcribe_audio_with_words(audio_path, target_lang)
+        
+        words = transcription_data.get("words", [])
+        full_transcription = transcription_data.get("text", "").strip()
+        
+        
+        word_match = pronunciation_score_word(expected_word, full_transcription)
+        
+        
+        word_confidence = 0.0
+        matched_word = None
+        for wd in words:
+            if expected_word.lower() in wd["word"].lower() or wd["word"].lower() in expected_word.lower():
+                word_confidence = wd.get("probability", 0.7)
+                matched_word = wd["word"]
+                break
+        
+        
+        if not matched_word and words:
+            word_confidence = sum(w.get("probability", 0.7) for w in words) / len(words)
+        
+        
+        confidence_score = int(word_confidence * 100)
+        
+        
+        if word_match["detected"]:
+            final_score = max(confidence_score, word_match["score"])
+        else:
+            final_score = 0  # Wrong word = zero score
+        
+        return {
+            "score": int(final_score),
+            "confidence": float(round(word_confidence * 100, 1)),
+            "transcription": full_transcription,
+            "expected": expected_word,
+            "detected": bool(word_match["detected"]),
+            "match_type": word_match["match_type"],
+            "words_data": words,
+            "needs_practice": bool(final_score < PASSING_SCORE or word_confidence < 0.70)
+        }
+        
+    except Exception as e:
+        logger.error(f"Word pronunciation analysis error: {e}")
+        return {
+            "score": 0,
+            "confidence": 0,
+            "transcription": "",
+            "expected": expected_word,
+            "detected": False,
+            "match_type": "error",
+            "words_data": [],
+            "needs_practice": True
+        }
+
+
+async def generate_syllable_guide(word: str, model: str = "gpt") -> dict:
+    """Generate detailed pronunciation guide with phoneme-level breakdown"""
+    prompt = f"""You are an expert pronunciation coach. Provide a DETAILED pronunciation guide for the word: "{word}"
+
+Return STRICTLY valid JSON:
+{{
+    "word": "{word}",
+    "syllables": "break-down with hy-phens (e.g., break-fast)",
+    "syllable_count": <number of syllables>,
+    "phonetic_ipa": "IPA transcription (e.g., /ˈbrekfəst/)",
+    "phonetic_simple": "simple phonetic guide (e.g., BREK-fuhst)",
+    "stress_pattern": "which syllable to stress (e.g., FIRST syllable)",
+    
+    "phoneme_breakdown": [
+        {{
+            "syllable": "break",
+            "sounds": [
+                {{"letter": "b", "sound": "/b/", "how_to_say": "Press lips together, release with voice"}},
+                {{"letter": "r", "sound": "/r/", "how_to_say": "Curl tongue back slightly"}},
+                {{"letter": "ea", "sound": "/e/", "how_to_say": "Short 'e' as in 'bed'"}},
+                {{"letter": "k", "sound": "/k/", "how_to_say": "Back of tongue touches soft palate"}}
+            ]
+        }},
+        {{
+            "syllable": "fast",
+            "sounds": [
+                {{"letter": "f", "sound": "/f/", "how_to_say": "Upper teeth on lower lip, blow air"}},
+                {{"letter": "a", "sound": "/ə/", "how_to_say": "Unstressed 'uh' sound"}},
+                {{"letter": "st", "sound": "/st/", "how_to_say": "'s' followed by 't'"}}
+            ]
+        }}
+    ],
+    
+    "mouth_position": "Describe how to position mouth/tongue for key sounds",
+    "common_mistakes": ["list", "of", "common", "mistakes"],
+    "practice_tip": "One specific tip for practicing this word",
+    "similar_words": ["words", "with", "similar", "sounds"]
+}}"""
+    
+    try:
+        raw = await call_llm(prompt, timeout=15, model=model)
+        data = safe_json_loads(raw)
+        
+        data.setdefault("word", word)
+        data.setdefault("syllables", word)
+        data.setdefault("phoneme_breakdown", [])
+        return data
+    except Exception as e:
+        logger.error(f"Syllable guide generation error: {e}")
+        return {
+            "word": word,
+            "syllables": word,
+            "syllable_count": 1,
+            "phonetic_ipa": f"/{word}/",
+            "phonetic_simple": word.upper(),
+            "stress_pattern": "first syllable",
+            "phoneme_breakdown": [],
+            "mouth_position": "Speak slowly and clearly",
+            "common_mistakes": [],
+            "practice_tip": "Break the word into smaller parts",
+            "similar_words": []
+        }
+
+
+async def analyze_sentence_pronunciation(audio_path: str, expected_sentence: str, spoken_text: str, target_lang: str = "en") -> dict:
+    """
+    Analyze sentence pronunciation using WER and word-level analysis.
+    Returns WER score, mismatches, and improvement suggestions.
+    """
+    try:
+        
+        transcription_data = await transcribe_audio_with_words(audio_path, target_lang)
+        words_data = transcription_data.get("words", [])
+        duration = transcription_data.get("duration", 5)
+        
+        
+        wer_score = pronunciation_score_wer(expected_sentence, spoken_text)
+        
+        
+        expected_words = expected_sentence.lower().strip().split()
+        spoken_words = spoken_text.lower().strip().split()
+        
+        mismatches = []
+        mispronounced = []
+        well_pronounced = []
+        
+        
+        for i, expected_word in enumerate(expected_words):
+            if i < len(spoken_words):
+                spoken_word = spoken_words[i]
+                if expected_word != spoken_word:
+                    mismatches.append({
+                        "position": i + 1,
+                        "expected": expected_word,
+                        "spoken": spoken_word,
+                        "issue": "word mismatch"
+                    })
+            else:
+                mismatches.append({
+                    "position": i + 1,
+                    "expected": expected_word,
+                    "spoken": "(missing)",
+                    "issue": "word missing"
+                })
+        
+        
+        if len(spoken_words) > len(expected_words):
+            for i in range(len(expected_words), len(spoken_words)):
+                mismatches.append({
+                    "position": i + 1,
+                    "expected": "(none)",
+                    "spoken": spoken_words[i],
+                    "issue": "extra word"
+                })
+        
+        
+        for wd in words_data:
+            word = wd.get("word", "").strip().lower()
+            confidence = wd.get("probability", 1.0)
+            
+            if confidence < 0.7:
+                mispronounced.append({
+                    "word": word,
+                    "confidence": round(confidence * 100, 1),
+                    "issue": "unclear pronunciation" if confidence < 0.5 else "needs improvement"
+                })
+            else:
+                well_pronounced.append(word)
+        
+        
+        fluency = await analyze_fluency_metrics(spoken_text, duration)
+        
+        return {
+            "score": wer_score,
+            "transcription": spoken_text,
+            "expected": expected_sentence,
+            "mismatches": mismatches,
+            "mismatch_count": len(mismatches),
+            "mispronounced_words": mispronounced,
+            "well_pronounced_words": well_pronounced[:10],
+            "fluency": fluency,
+            "accuracy_percentage": wer_score
+        }
+        
+    except Exception as e:
+        logger.error(f"Sentence pronunciation analysis error: {e}")
+        return {
+            "score": 0,
+            "transcription": spoken_text,
+            "expected": expected_sentence,
+            "mismatches": [],
+            "mismatch_count": 0,
+            "mispronounced_words": [],
+            "well_pronounced_words": [],
+            "fluency": {"wpm": 0, "speed_status": "unknown", "duration": 0},
+            "accuracy_percentage": 0
+        }
+
+
+
+
 
 
 async def translate_text(text: str, source: str, target: str) -> str:
-    """translate text between languages"""
-    if source == target or not text or not isinstance(text, str):
+    """translate text between languages - handles full names like 'hindi' to 'hi'"""
+    if not text or not isinstance(text, str):
         return text if isinstance(text, str) else ""
-    try:
-        translator = GoogleTranslator(source=source, target=target)
-        return await asyncio.to_thread(translator.translate, text)
-    except Exception as e:
-        logger.debug(f"Translation failed: {e}")
-        return text
-
-
-async def translate_if_needed(text: str, target_language: str) -> str:
-    """Translate English fallback text into target language when needed."""
-    if not isinstance(text, str):
-        return text
-    if not target_language or target_language.lower() in ["en", "english"]:
-        return text
-    return await translate_text(text, "en", target_language)
-
-
-async def translate_values(value, target_language: str):
-    """Translate all string values in nested structures to target language."""
-    if not target_language or target_language.lower() in ["en", "english"]:
-        return value
-    if isinstance(value, str):
-        return await translate_text(value, "en", target_language)
-    if isinstance(value, list):
-        return [await translate_values(v, target_language) for v in value]
-    if isinstance(value, dict):
-        return {k: await translate_values(v, target_language) for k, v in value.items()}
-    return value
-
-
-async def make_bilingual(value, source: str, target: str):
-    """Convert a value to {target, native} structure with translations"""
-    if source == target:
-        return value  
     
+    # Convert full language names to codes using JSON mapping
+    source = source.lower().strip()
+    target = target.lower().strip()
+    
+    languages_data = load_language_mapping()
+    if source in languages_data:
+        source = languages_data.get(source, source)
+    if target in languages_data:
+        target = languages_data.get(target, target)
+
+    if source == target:
+        return text
+        
+    try:
+        translated = await asyncio.to_thread(
+            GoogleTranslator(source=source, target=target).translate,
+            text
+        )
+        return translated
+    except Exception as e:
+        logger.error(f"translation error: {e}")
+        return text
+
+
+
+
+
+
+
+async def generate_lesson_llm(topic: str, num_words: int, target_lang: str, model: str = "gpt") -> list:
+    """Generate lesson using LLM for normal mode - creates 3 sentences per word"""
+    
+    
+    lang_names = {
+        "hi": "Hindi", "es": "Spanish", "fr": "French", "de": "German",
+        "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "ar": "Arabic",
+        "pt": "Portuguese", "ru": "Russian", "it": "Italian", "en": "English"
+    }
+    target_lang_name = lang_names.get(target_lang, target_lang)
+    
+    prompt = f"""You are a language tutor. Create exactly {num_words} {target_lang_name} vocabulary items for a lesson on '{topic}'.
+
+IMPORTANT RULES:
+- The 'word' must be in {target_lang_name}
+- 'meaning_en' must be the DEFINITION IN ENGLISH that explains what the word means (example: for "breakfast", meaning_en should be "the first meal of the day, eaten in the morning")
+- NEVER use the word itself as meaning_en - always explain what it means!
+- 'meaning_{target_lang}' must be the meaning/definition in {target_lang_name}
+- All sentences must be in {target_lang_name} with English translations
+
+For EACH word, provide:
+- word: the {target_lang_name} vocabulary word
+- meaning_en: English definition (NOT the word itself, but a clear explanation of what it means)
+- meaning_{target_lang}: meaning/definition in {target_lang_name}
+- sentences: array of {SENTENCES_PER_WORD_NORMAL} sentences containing the word
+
+Each sentence must have:
+- {target_lang}: {target_lang_name} sentence (MUST contain the word)
+- en: English translation
+
+Return ONLY valid JSON array:
+[{{"word": "<target word>", "meaning_en": "English meaning", "meaning_{target_lang}": "<target meaning>", "sentences": [{{"{target_lang}": "<target sentence>", "en": "<English translation>"}}]}}]
+
+NO markdown. NO code fences.
+"""
+    
+    try:
+        raw = await call_llm(prompt, model=model)
+        lesson = extract_json_array(raw)
+        
+        if not lesson:
+            logger.warning("lesson generation returned empty, using fallback")
+            return await generate_fallback_lesson(topic, num_words, target_lang)
+        
+        
+        valid_items = []
+        
+        for item in lesson:
+            word = item.get("word", "").lower()
+            
+            
+            if "sentences" not in item or not item["sentences"]:
+                
+                if "sentence" in item:
+                    item["sentences"] = [
+                        {"en": item["sentence"], target_lang: item.get(f"sentence_{target_lang}", item["sentence"])}
+                    ]
+                else:
+                    item["sentences"] = []
+            
+            
+            valid_sentences = []
+            for sent in item.get("sentences", []):
+                if isinstance(sent, str):
+                    sent = {"en": sent}
+                en_sent = sent.get("en", "")
+                target_sent = sent.get(target_lang, "")
+                if not target_sent and en_sent:
+                    target_sent = en_sent if target_lang == "en" else await translate_text(en_sent, "en", target_lang)
+                    sent[target_lang] = target_sent
+                if not en_sent and target_sent:
+                    en_sent = target_sent if target_lang == "en" else await translate_text(target_sent, target_lang, "en")
+                    sent["en"] = en_sent
+                if word and target_sent and word in target_sent.lower():
+                    valid_sentences.append(sent)
+                else:
+                    if target_sent:
+                        sent[target_lang] = f"{target_sent.rstrip('.')}. {word}"
+                    else:
+                        sent[target_lang] = word
+                    if not sent.get("en"):
+                        sent["en"] = f"I use the word {word}."
+                    valid_sentences.append(sent)
+            
+            
+            while len(valid_sentences) < SENTENCES_PER_WORD_NORMAL:
+                en_fallback = f"I use the word {word} often."
+                target_fallback = en_fallback if target_lang == "en" else await translate_text(en_fallback, "en", target_lang)
+                valid_sentences.append({
+                    "en": en_fallback,
+                    target_lang: target_fallback
+                })
+            
+            item["sentences"] = valid_sentences[:SENTENCES_PER_WORD_NORMAL]
+            item["meaning_en"] = item.get("meaning_en") or f"a word meaning {word}"
+            if not item.get(f"meaning_{target_lang}"):
+                if target_lang == "en":
+                    item[f"meaning_{target_lang}"] = item["meaning_en"]
+                else:
+                    item[f"meaning_{target_lang}"] = await translate_text(item["meaning_en"], "en", target_lang)
+            
+            valid_items.append(item)
+        
+        return valid_items if valid_items else await generate_fallback_lesson(topic, num_words, target_lang)
+        
+    except Exception as e:
+        logger.error(f"lesson generation error: {e}")
+        return await generate_fallback_lesson(topic, num_words, target_lang)
+
+
+async def generate_fallback_lesson(topic: str, num_words: int, target_lang: str) -> list:
+    """Fallback lesson when LLM fails - creates 3 sentences per word"""
+    basic_words = ["hello", "good", "learn", "speak", "practice", "today", "happy", "work", "friend", "time"][:num_words]
+    lesson = []
+    for word in basic_words:
+        word_target = word if target_lang == "en" else await translate_text(word, "en", target_lang)
+        meaning_en = "a common word"
+        meaning_target = meaning_en if target_lang == "en" else await translate_text(meaning_en, "en", target_lang)
+        sentence_templates = [
+            f"I want to say {word_target}.",
+            f"Let me practice {word_target} with you.",
+            f"We should use {word_target} together."
+        ]
+        sentences = []
+        for en_sent in sentence_templates:
+            target_sent = en_sent if target_lang == "en" else await translate_text(en_sent, "en", target_lang)
+            sentences.append({"en": en_sent, target_lang: target_sent})
+        lesson.append({
+            "word": word_target,
+            "meaning_en": meaning_en,
+            f"meaning_{target_lang}": meaning_target,
+            "sentences": sentences
+        })
+    return lesson
+async def make_bilingual(value, source: str, target: str):
+    """Convert value to {target, native} structure"""
+    if source == target:
+        return value
     if isinstance(value, str):
         if not value.strip():
             return {"target": value, "native": value}
         native = await translate_text(value, source, target)
         return {"target": value, "native": native}
-    
     elif isinstance(value, list):
-        result = []
-        for item in value:
-            if isinstance(item, dict):
-                
-                translated_item = {}
-                for k, v in item.items():
-                    translated_item[k] = await make_bilingual(v, source, target)
-                result.append(translated_item)
-            elif isinstance(item, str):
-                native = await translate_text(item, source, target)
-                result.append({"target": item, "native": native})
-            else:
-                result.append(item)
-        return result
-    
+        return await asyncio.gather(*[make_bilingual(item, source, target) for item in value])
     elif isinstance(value, dict):
-        
-        result = {}
-        for k, v in value.items():
-            result[k] = await make_bilingual(v, source, target)
-        return result
-    
-    else:
-        return value
+        keys = list(value.keys())
+        translated_values = await asyncio.gather(*[make_bilingual(value[k], source, target) for k in keys])
+        return dict(zip(keys, translated_values))
+    return value
 
 
-async def translate_analysis(analysis: dict, source: str, target: str, fields_to_translate: list) -> dict:
-    """Translate specified fields in analysis dict to target/native format"""
-    if source == target:
-        return analysis  
-    
-    result = {}
-    for key, value in analysis.items():
-        if key in fields_to_translate:
-            result[key] = await make_bilingual(value, source, target)
-        else:
-            result[key] = value  
-    return result
-
-# BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-# language_codes_path = os.path.join(BASE_DIR, "language-codes.json")
-
-# def load_language_mapping():
-#     try:
-#         if not os.path.exists(language_codes_path):
-#             logger.error(f"File not found - {language_codes_path}")
-            
-#         with open(language_codes_path, "r") as f:
-#             language_codes = json.load(f)
-#             print("Language codes loaded:", language_codes)
-#             return language_codes
-#     except:
-#         logger.error("Error loading language mapping.")
-#         return {}
 
 
-async def transcribe_audio_file(audio_file: UploadFile, target_lang: str = "en") -> str:
-    """Transcribe audio forcing target language (no auto-detect)."""
-    try:
-        audio_file.file.seek(0)
-    except:
-        pass
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-        shutil.copyfileobj(audio_file.file, tmp)
-        temp_upload = tmp.name
-    
-    audio_path = None
-    try:
-        audio = AudioSegment.from_file(temp_upload)
-        audio = audio.set_frame_rate(16000).set_channels(1)
-        audio_path = temp_upload.replace('.tmp', '_converted.wav')
-        audio.export(audio_path, format="wav")
-
-        # Normalize target language code using load_language_mapping (consistent with fluent_api_v2.py)
-        languages_data = load_language_mapping()
-        normalized_target = languages_data.get(target_lang.lower(), target_lang.lower()) if target_lang else "en"
-
-        # Force Whisper to transcribe in the target language
-        logger.debug(f"Transcribing audio with forced language: {normalized_target}")
-        segments, info = await asyncio.to_thread(
-            _whisper_model.transcribe, audio_path, task="transcribe", language=normalized_target
-        )
-        user_text = " ".join([seg.text for seg in segments]).strip()
-        logger.debug(f"Whisper transcribed in {normalized_target}: {user_text[:100] if user_text else 'empty'}")
-
-        return user_text
-    except Exception as e:
-        logger.debug(f"Audio transcription failed: {e}")
-        return ""
-    finally:
-        
-        if os.path.exists(temp_upload):
-            try:
-                os.unlink(temp_upload)
-            except:
-                pass
-        if audio_path and os.path.exists(audio_path):
-            try:
-                os.unlink(audio_path)
-            except:
-                pass
-
-TYPE_KEYWORDS = {
-    "hr": "hr", "human resource": "hr", "behavioral": "behavioral", "behavior": "behavioral",
-    "technical": "technical", "tech": "technical", "managerial": "managerial", "management": "managerial",
-    "general": "general", "normal": "general"
-}
 
 
-# async def extract_role_from_text(user_text: str, model: str = "gpt") -> dict:
-#     """Extract job role from natural language using LLM only - accepts ANY role"""
-    
-#     prompt = f"""Extract the job role/position from this text: "{user_text}"
 
-# If a job role/position is mentioned (e.g., "software engineer", "electrical engineer", "teacher", "chef", "pilot", etc.), 
-# extract it EXACTLY as the user said it and capitalize properly.
-
-# Return JSON: {{"success": true, "role": "Exact Job Title"}}
-# If no job role is mentioned: {{"success": false, "role": null}}
-
-# Return ONLY valid JSON."""
-    
-#     try:
-#         raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             result = json.loads(json_match.group())
-#             if result.get("success") and result.get("role"):
-#                 return result
-#     except:
-#         pass
-    
-#     return {"success": False, "role": None}
+async def load_vocab_file(set_number: int = None) -> list:
+    """load vocabulary from database, optionally filtered by set"""
+    return await db.get_pronunciation_vocab(set_number=set_number)
 
 
-import shutil
-ffmpeg = shutil.which("ffmpeg")
 
-async def extract_role_from_text(user_text: str, model: str = "gpt") -> dict:
-   """Extract job role from natural language using LLM - accepts ANY role from audio"""
-   user_lower = user_text.lower().strip()
-   # If text is empty or too short
-   if not user_lower or len(user_lower) < 2:
-       return {"success": False, "role": None}
-       
-   prompt = f"""You are extracting a JOB ROLE/POSITION from user's SPEECH/AUDIO transcription.
-        USER SAID: "{user_text}"
-        YOUR TASK: Extract the JOB ROLE or POSITION they mentioned.
-        CRITICAL RULES:
-        1. Extract WHATEVER job role/position the user mentioned - it can be ANY job
-        2. The user's audio might have transcription errors - understand the intent
-        3. Capitalize the job title properly (e.g., "Software Engineer", "Data Scientist")
-        4. Accept ANY job: traditional roles, modern roles, creative roles, anything
-        EXAMPLES:
-        - "software engineer" → "Software Engineer"
-        - "I want to practice for data scientist role" → "Data Scientist"
-        - "marketing" → "Marketing Manager"
-        - "teacher" → "Teacher"
-        - "chef" → "Chef"
-        - "machine learning engineer" → "Machine Learning Engineer"
-        - "product manager" → "Product Manager"
-        - "nurse" → "Nurse"
-        - "electrical engineer" → "Electrical Engineer"
-        - "content writer" → "Content Writer"
-        - "UI UX designer" → "UI/UX Designer"
-        - "devops" → "DevOps Engineer"
-        - "full stack developer" → "Full Stack Developer"
-        - "hr" → "HR Manager"
-        - "sales" → "Sales Executive"
-        - "accountant" → "Accountant"
-        - ANY job mentioned → extract and capitalize properly
-        Return ONLY this JSON format:
-        {{"success": true, "role": "Properly Capitalized Job Title"}}
-        If NO job role is mentioned at all:
-        {{"success": false, "role": null}}
-        DO NOT explain. Return ONLY the JSON.
-    """
-   try:
-       raw = await call_llm(prompt, mode="strict_json", timeout=15, model=model)
-       json_match = re.search(r'\{[\s\S]*\}', raw)
-       if json_match:
-           result = json.loads(json_match.group())
-           if result.get("success") and result.get("role"):
-               return result
-   except Exception as e:
-       logger.exception(f"LLM role extraction failed: {e}")
-
-   # Fallback: Try to extract role from user's words directly
-   # Remove common filler words and non-meaningful sounds
-   filler_words = {"i", "want", "to", "practice", "for", "the", "a", "an", "role", "position", "job", "interview", "as"}
-   non_meaningful_sounds = {"hmm", "hm", "um", "uh", "uhh", "er", "err", "ah", "ahh", "oh", "okay", "ok", "yes", "no", "yeah", "yep", "nope", "like", "well", "so", "just", "maybe", "hmmmm", "ummm", "uhhh"}
-   words = [w for w in re.findall(r'[a-z]+', user_lower)
-            if w not in filler_words and w not in non_meaningful_sounds and len(w) > 2]
-   if words:
-       # Capitalize each word and join as role
-       role = " ".join(word.capitalize() for word in words[:4])  # Take up to 4 words
-       return {"success": True, "role": role}
-
-   # No meaningful role found - return False so user can be asked to clarify
-   return {"success": False, "role": None}
+def sample_vocab(vocab: list, k: int) -> list:
+    """randomly sample k words from vocab"""
+    if len(vocab) < k:
+        return vocab.copy()
+    return random.sample(vocab, k)
 
 
-async def extract_interview_type_from_text(user_text: str, model: str = "gpt") -> dict:
-    """Extract interview type from natural language - accepts ANY type"""
-    user_lower = user_text.lower()
-    
-    
-    for keyword, itype in TYPE_KEYWORDS.items():
-        if keyword in user_lower:
-            return {"success": True, "type": itype, "confidence": "high"}
-    
-    
-    prompt = f"""Extract the interview type from: "{user_text}"
-
-IMPORTANT: Accept ANY type of interview the user mentions, not just predefined ones.
-Examples: hr, behavioral, technical, managerial, sales, marketing, customer service, finance, product management, design, data science, etc.
-
-If user mentions ANY interview type, extract and format it:
-- Return: {{"success": true, "type": "extracted_type_in_lowercase", "confidence": "high"}}
-- Example: "I want a sales interview" → {{"success": true, "type": "sales", "confidence": "high"}}
-- Example: "customer service role" → {{"success": true, "type": "customer_service", "confidence": "high"}}
-
-If the text is completely unclear or no interview type is mentioned at all:
-- Return: {{"success": false, "type": "general", "confidence": "low"}}
-
-Return ONLY valid JSON."""
-    
-    try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-            
-            if result.get("type"):
-                result["success"] = True
-            return result
-    except:
-        pass
-    
-    return {"success": True, "type": "general", "confidence": "low"}
-
-
-async def check_answer_relevance(question: str, answer: str, model: str = "gpt", target_language: str = "en") -> dict:
-    """Check if answer is relevant to question, generate friendly redirect if not"""
-    
-    if len(answer.split()) < 5:
-        return {"relevant": True}
-    
-    prompt = f"""You are an interview coach. Check if this answer is COMPLETELY IRRELEVANT to the question.
-
-Question: "{question}"
-Answer: "{answer}"
-Target Language: "{target_language}"
-
-IMPORTANT RULES:
-1. Be VERY LENIENT - only mark as irrelevant if the answer is about a COMPLETELY DIFFERENT TOPIC
-2. If the answer even SLIGHTLY relates to the question, mark it as relevant
-3. Personal stories, examples, or tangential answers should be marked RELEVANT
-4. Only mark irrelevant if user talks about something totally unrelated (e.g., asked about skills but talks about weather)
-5. If the answer is irrelevant, write the redirect message in the Target Language specified above
-
-If relevant (even slightly), return: {{"relevant": true}}
-If COMPLETELY UNRELATED (different topic entirely), return: {{"relevant": false, "redirect": "friendly 1-line message in the target language"}}
-
-Return ONLY valid JSON."""
-    
-    try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=10, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            result = json.loads(json_match.group())
-            
-            if not result.get("relevant", True) and not result.get("redirect"):
-                return {"relevant": True}
-            return result
-    except:
-        pass
-    return {"relevant": True}  
-
-
-async def compare_attempts(attempts: list, level: str = "B1", user_type: str = "professional", model: str = "gpt", target_language: str = "en") -> dict:
-    """
-    Compare interview attempts using LLM for detailed, elaborative feedback on ALL aspects:
-    grammar, vocabulary, pronunciation, fluency, and answer quality.
-    """
-    if len(attempts) < 2:
-        summary = "This is your first attempt. Let's see how you do!"
-        if target_language and target_language != "en":
-            try:
-                summary = await translate_text(summary, "en", target_language)
-            except Exception as e:
-                logger.debug(f"Compare attempts fallback translation failed: {e}")
-        return {
-            "overall_improvement": 0,
-            "trend": "first_attempt",
-            "overall_summary": summary,
-            "details": {}
-        }
-    
-    prev = attempts[-2]
-    current = attempts[-1]
-    
-    
-    prev_grammar = (prev.get("grammar") or {}).get("score", 0) or 0
-    current_grammar = (current.get("grammar") or {}).get("score", 0) or 0
-    
-    prev_vocab = (prev.get("vocabulary") or {}).get("score", 0) or 0
-    current_vocab = (current.get("vocabulary") or {}).get("score", 0) or 0
-    
-    prev_pron = (prev.get("pronunciation") or {}).get("accuracy", 0) or 0
-    current_pron = (current.get("pronunciation") or {}).get("accuracy", 0) or 0
-    
-    prev_fluency = (prev.get("fluency") or {}).get("score", 0) or 0
-    current_fluency = (current.get("fluency") or {}).get("score", 0) or 0
-    
-    prev_answer = (prev.get("answer_evaluation") or {}).get("score", 0) or 0
-    current_answer = (current.get("answer_evaluation") or {}).get("score", 0) or 0
-    
-    prev_overall = prev.get("overall_score", 0) or 0
-    current_overall = current.get("overall_score", 0) or 0
-    
-    
-    grammar_diff = round(current_grammar - prev_grammar, 1)
-    vocab_diff = round(current_vocab - prev_vocab, 1)
-    pron_diff = round(current_pron - prev_pron, 1)
-    fluency_diff = round(current_fluency - prev_fluency, 1)
-    answer_diff = round(current_answer - prev_answer, 1)
-    overall_diff = round(current_overall - prev_overall, 1)
-    
-    
-    if overall_diff > 10:
-        trend = "significantly_improved"
-    elif overall_diff > 0:
-        trend = "improved"
-    elif overall_diff < -10:
-        trend = "declined"
-    elif overall_diff < 0:
-        trend = "slightly_declined"
-    else:
-        trend = "no_change"
-    
-    prompt = f"""You are an expert interview coach comparing TWO attempts at the SAME question.
-Respond in the target language: {target_language}.
-Provide DETAILED, ELABORATIVE feedback on improvement or decline in ALL areas.
-
-PREVIOUS ATTEMPT:
-- Overall Score: {prev_overall}%
-- Grammar: {prev_grammar}%
-- Vocabulary: {prev_vocab}%
-- Pronunciation: {prev_pron}%
-- Fluency: {prev_fluency}%
-- Answer Quality: {prev_answer}%
-- What they said: "{prev.get('transcription', '')[:200]}"
-
-CURRENT ATTEMPT:
-- Overall Score: {current_overall}%
-- Grammar: {current_grammar}% ({'+' if grammar_diff > 0 else ''}{grammar_diff}%)
-- Vocabulary: {current_vocab}% ({'+' if vocab_diff > 0 else ''}{vocab_diff}%)
-- Pronunciation: {current_pron}% ({'+' if pron_diff > 0 else ''}{pron_diff}%)
-- Fluency: {current_fluency}% ({'+' if fluency_diff > 0 else ''}{fluency_diff}%)
-- Answer Quality: {current_answer}% ({'+' if answer_diff > 0 else ''}{answer_diff}%)
-- What they said: "{current.get('transcription', '')[:200]}"
-
-USER CONTEXT:
-- Level: {level}
-- User Type: {user_type}
-
-Analyze EACH category's improvement and provide detailed, professional feedback.
-
-Return STRICTLY valid JSON:
-{{
-    "overall_summary": "3-4 sentences summarizing the overall improvement journey in a professional tone.",
-    "grammar_analysis": {{
-        "previous_score": {prev_grammar}, "current_score": {current_grammar}, "difference": {grammar_diff},
-        "improved": {str(grammar_diff > 0).lower()},
-        "feedback": "Specific feedback about grammar improvement."
-    }},
-    "vocabulary_analysis": {{
-        "previous_score": {prev_vocab}, "current_score": {current_vocab}, "difference": {vocab_diff},
-        "improved": {str(vocab_diff > 0).lower()},
-        "feedback": "Specific feedback about vocabulary usage."
-    }},
-    "pronunciation_analysis": {{
-        "previous_score": {prev_pron}, "current_score": {current_pron}, "difference": {pron_diff},
-        "improved": {str(pron_diff > 0).lower()},
-        "feedback": "Specific feedback about pronunciation."
-    }},
-    "fluency_analysis": {{
-        "previous_score": {prev_fluency}, "current_score": {current_fluency}, "difference": {fluency_diff},
-        "improved": {str(fluency_diff > 0).lower()},
-        "feedback": "Specific feedback about speaking pace."
-    }},
-    "answer_analysis": {{
-        "previous_score": {prev_answer}, "current_score": {current_answer}, "difference": {answer_diff},
-        "improved": {str(answer_diff > 0).lower()},
-        "feedback": "Specific feedback about answer quality, structure, and relevance."
-    }},
-    "biggest_improvement": "Which area improved the most",
-    "area_needing_focus": "Which area still needs work",
-    "encouragement": "Professional, encouraging message",
-    "next_step_tip": "One specific tip for continued improvement"
-}}"""
-
-    try:
-        llm_response = await call_llm(prompt, mode="strict_json", timeout=30, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', llm_response)
-        if json_match:
-            llm_data = json.loads(json_match.group())
-        else:
-            raise ValueError("No JSON")
-    except Exception as e:
-        logger.debug(f"LLM compare_attempts fallback: {e}")
-        if overall_diff > 0:
-            summary = f"Great progress! Your overall score improved from {prev_overall}% to {current_overall}% (+{overall_diff}%)."
-        elif overall_diff < 0:
-            summary = f"Your score changed from {prev_overall}% to {current_overall}% ({overall_diff}%). Let's work on consistency."
-        else:
-            summary = f"Consistent performance at {current_overall}%. Try varying your approach for improvement."
-        
-        llm_data = {
-            "overall_summary": summary,
-            "grammar_analysis": {"previous_score": prev_grammar, "current_score": current_grammar, "difference": grammar_diff, "improved": grammar_diff > 0, "feedback": f"Grammar {'improved' if grammar_diff > 0 else 'needs focus'}"},
-            "vocabulary_analysis": {"previous_score": prev_vocab, "current_score": current_vocab, "difference": vocab_diff, "improved": vocab_diff > 0, "feedback": f"Vocabulary {'improved' if vocab_diff > 0 else 'needs focus'}"},
-            "pronunciation_analysis": {"previous_score": prev_pron, "current_score": current_pron, "difference": pron_diff, "improved": pron_diff > 0, "feedback": f"Pronunciation {'improved' if pron_diff > 0 else 'needs focus'}"},
-            "fluency_analysis": {"previous_score": prev_fluency, "current_score": current_fluency, "difference": fluency_diff, "improved": fluency_diff > 0, "feedback": f"Fluency {'improved' if fluency_diff > 0 else 'needs focus'}"},
-            "answer_analysis": {"previous_score": prev_answer, "current_score": current_answer, "difference": answer_diff, "improved": answer_diff > 0, "feedback": f"Answer quality {'improved' if answer_diff > 0 else 'needs focus'}"},
-            "biggest_improvement": "grammar" if grammar_diff == max(grammar_diff, vocab_diff, pron_diff, fluency_diff, answer_diff) else "answer quality",
-            "area_needing_focus": "grammar" if grammar_diff == min(grammar_diff, vocab_diff, pron_diff, fluency_diff, answer_diff) else "answer quality",
-            "encouragement": f"Keep practicing! Your overall score {'improved' if overall_diff > 0 else 'stayed consistent'}.",
-            "next_step_tip": "Focus on structuring your answers clearly."
-        }
-        if target_language and target_language.lower() not in ["en", "english"]:
-            llm_data = await translate_values(llm_data, target_language)
-    
-    return {
-        "previous_overall_score": prev_overall,
-        "current_overall_score": current_overall,
-        "overall_improvement": overall_diff,
-        "trend": trend,
-        "overall_summary": llm_data.get("overall_summary", ""),
-        "grammar_analysis": llm_data.get("grammar_analysis", {}),
-        "vocabulary_analysis": llm_data.get("vocabulary_analysis", {}),
-        "pronunciation_analysis": llm_data.get("pronunciation_analysis", {}),
-        "fluency_analysis": llm_data.get("fluency_analysis", {}),
-        "answer_analysis": llm_data.get("answer_analysis", {}),
-        "biggest_improvement": llm_data.get("biggest_improvement", ""),
-        "area_needing_focus": llm_data.get("area_needing_focus", ""),
-        "encouragement": llm_data.get("encouragement", ""),
-        "next_step_tip": llm_data.get("next_step_tip", "")
+async def generate_sentences_llm(word: str, target_lang: str, num_sentences: int = 3, model: str = "gpt") -> list:
+    """generate sentences for a word using llm"""
+    lang_names = {
+        "hi": "Hindi", "es": "Spanish", "fr": "French", "de": "German",
+        "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "ar": "Arabic",
+        "pt": "Portuguese", "ru": "Russian", "it": "Italian", "en": "English"
     }
+    target_lang_name = lang_names.get(target_lang, target_lang)
+    prompt = f"""
+Generate exactly {num_sentences} short spoken {target_lang_name} sentences using the word "{word}".
+The {target_lang_name} sentence MUST contain the word exactly.
+Provide an English translation for each sentence.
 
-
-async def generate_interactive_follow_up(user_response: str, chat_history: list, role: str, scenario: str, model: str = "gpt", target_language: str = "en") -> tuple:
-    """Generate interactive follow-up question with natural transitions"""
-    
-    recent_history = chat_history[-6:] if len(chat_history) > 6 else chat_history
-    
-    prompt = f"""You are {BOT_NAME}, a warm and engaging interview coach conducting a {scenario} interview for a {role} position.
-
-Respond in the target language: {target_language}.
-
-The candidate just said: "{user_response}"
-
-Recent conversation context:
-{[msg.get('content', '')[:100] for msg in recent_history[-4:]]}
-
-CRITICAL RULES for your follow-up:
-1. NEVER start with generic phrases like "That's interesting", "Great answer", "I see"
-2. START by referencing something SPECIFIC they said (a keyword, example, or detail)
-3. Ask a PROBING follow-up that digs deeper or explores a new angle
-4. Include ONE encouraging word naturally (e.g., "I love that you mentioned...", "It's impressive how...")
-5. Make it conversational - like a real interview, not a quiz
-
-VARIETY - Use different question types:
-- "Building on what you said about X, how would you..."
-- "You mentioned X - can you walk me through a specific time when..."
-- "That's a thoughtful approach to X. What challenges did you face with..."
-- "I'm curious about the X you mentioned. How did that experience shape..."
-
-Return STRICTLY valid JSON:
-{{"question": "Your engaging, specific follow-up (reference their answer!)", "hint": "One practical tip for answering"}}"""
-
-    fallback_question, fallback_hint, fallback_question_alt, fallback_hint_alt = await asyncio.gather(
-        translate_if_needed("Tell me more about that.", target_language),
-        translate_if_needed("Share more details.", target_language),
-        translate_if_needed("Tell me more about that experience.", target_language),
-        translate_if_needed("Elaborate on a specific example.", target_language)
-    )
-    try:
-        raw = await call_llm(prompt, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data.get("question", fallback_question), data.get("hint", fallback_hint)
-    except:
-        pass
-    return fallback_question_alt, fallback_hint_alt
-
-async def generate_interview_question(scenario: str, role: str, level: str, user_name: str, model: str = "gpt", target_language: str = "en", turn_number: int = 0) -> tuple:
-    """generate interview question with hint - first question is always an opener"""
-    scenario_name = INTERVIEW_SCENARIOS.get(scenario, scenario)
-    
-    # First question should always be a standard opener
-    if turn_number == 0:
-        prompt = f"""You are {BOT_NAME}, a warm interview coach.
-
-Respond in the target language: {target_language}.
-
-Interview scenario: {scenario_name}
-Role: {role}
-Candidate: {user_name}
-
-This is the FIRST question of the interview. Ask a classic opening question like:
-- "Tell me about yourself"
-- "Walk me through your background"
-- "What brings you here today?"
-
-Make it warm and welcoming. Keep it short and natural.
-
-Return STRICTLY valid JSON:
-{{"question": "your opening question", "hint": "suggested answer approach - mention key experiences and why you're interested in this role"}}
-"""
-    else:
-        # Later questions should be type-specific
-        prompt = f"""You are {BOT_NAME}, a warm interview coach.
-
-Respond in the target language: {target_language}.
-
-Interview scenario: {scenario_name}
-Role: {role}
-Level: {level}
-Candidate: {user_name}
-Question Number: {turn_number + 1}
-
-Ask ONE natural interview question appropriate for this {scenario_name}.
-- For HR interviews: Ask about motivation, career goals, cultural fit, salary expectations
-- For Technical interviews: Ask about technical skills, problem-solving, coding concepts relevant to {role}
-- For Behavioral interviews: Ask situational questions (STAR method) about past experiences
-- For other types: Ask relevant domain-specific questions
-
-Provide ONE short hint for the candidate.
-
-Return STRICTLY valid JSON:
-{{"question": "your interview question", "hint": "suggested answer approach"}}
-"""
-    fallback_question, fallback_hint, fallback_question_alt, fallback_hint_alt = await asyncio.gather(
-        translate_if_needed("Tell me about yourself.", target_language),
-        translate_if_needed("Share your background briefly.", target_language),
-        translate_if_needed("Can you tell me about yourself?", target_language),
-        translate_if_needed("Share your background and key experiences.", target_language)
-    )
-    try:
-        raw = await call_llm(prompt, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data.get("question", fallback_question), data.get("hint", fallback_hint)
-    except Exception as e:
-        logger.debug(f"Question generation fallback: {e}")
-    return fallback_question_alt, fallback_hint_alt
-
-
-async def evaluate_answer(question: str, answer: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """evaluate interview answer quality"""
-    prompt = f"""Evaluate this interview answer:
-
-Question: {question}
-Answer: {answer}
-Level: {level}
-
-Respond in the target language: {target_language}.
-
-Return STRICTLY valid JSON:
+Return ONLY strict JSON in this format:
 {{
-  "clarity": "Clear | Somewhat Clear | Vague",
-  "structure": "Well Structured | Needs Improvement | Disorganized",
-  "relevance": "Relevant | Partially Relevant | Off-topic",
-  "confidence": "Confident | Neutral | Hesitant",
-  "issue_summary": "brief specific feedback about the answer",
-  "improved_answer": "a better version of their answer",
-  "score": 0-100
+  "sentences": [
+    {{"{target_lang}": "...", "en": "..."}},
+    {{"{target_lang}": "...", "en": "..."}},
+    {{"{target_lang}": "...", "en": "..."}}
+  ]
 }}
 """
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            return data
-    except Exception as e:
-        logger.debug(f"Answer evaluation fallback: {e}")
-    fallback = {
-        "clarity": "Clear",
-        "structure": "Well Structured",
-        "relevance": "Relevant",
-        "confidence": "Neutral",
-        "issue_summary": "Good answer overall.",
-        "improved_answer": answer,
-        "score": 50
-    }
-    if target_language and target_language != "en":
+    
+    retries = 2
+    for attempt in range(retries + 1):
         try:
-            for key in ["clarity", "structure", "relevance", "confidence", "issue_summary"]:
-                fallback[key] = await translate_text(fallback[key], "en", target_language)
+            raw = await call_llm(prompt, model=model)
+            parsed = safe_json_loads(raw)
+            
+            if "sentences" in parsed and len(parsed["sentences"]) >= num_sentences:
+                return parsed["sentences"][:num_sentences]
+            
         except Exception as e:
-            logger.debug(f"Answer evaluation fallback translation failed: {e}")
+            logger.error(f"sentence generation error for '{word}' (attempt {attempt+1}): {e}")
+    
+    
+    fallback_en = [
+        f"I use the word {word}.",
+        f"This is an example with {word}.",
+        f"{word} is easy to remember."
+    ]
+    sentences = []
+    for en_sent in fallback_en:
+        target_sent = en_sent if target_lang == "en" else await translate_text(en_sent, "en", target_lang)
+        sentences.append({"en": en_sent, target_lang: target_sent})
+    return sentences
+
+
+def safe_get_sentence_text(sentence, key: str, fallback: str = "") -> str:
+    """Safely get text from a sentence that could be a string or dict.
+    This fixes the 'str' object has no attribute 'get' error."""
+    if isinstance(sentence, str):
+        return sentence
+    elif isinstance(sentence, dict):
+        return sentence.get(key, "") or sentence.get("en", "") or fallback
     return fallback
 
 
-async def detect_emotion(user_text: str, model: str = "gpt", target_language: str = "en") -> dict:
-    """detect emotion from user response"""
-    prompt = f"""Analyze the emotional tone of this interview answer:
-
-Answer: "{user_text}"
-Target Language: "{target_language}"
-
-Return STRICTLY valid JSON with the explanation written in the Target Language:
-{{
-  "emotion": "confident | hesitant | nervous | neutral | excited",
-  "confidence_level": "high | medium | low",
-  "explanation": "brief reason in target language"
-}}
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            return json.loads(json_match.group())
-    except Exception as e:
-        logger.debug(f"Emotion detection fallback: {e}")
-    explanation = await translate_if_needed("Tone appears neutral.", target_language)
-    return {"emotion": "neutral", "confidence_level": "medium", "explanation": explanation}
-
-
-# async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-#     """llm-based grammar analysis for spoken interview answers"""
-#     prompt = f"""You are an expert English grammar coach analyzing SPOKEN interview responses.
-# 
-# Respond in the target language: {target_language}.
-# 
-# SPOKEN TEXT: "{user_text}"
-# USER LEVEL: {level}
-# 
-# IMPORTANT RULES:
-# 1. This is TRANSCRIBED SPEECH - IGNORE punctuation, capitalization, and minor spelling
-# 2. Focus ONLY on grammatical structure and word choice
-# 3. Be encouraging but honest
-# 
-# ANALYZE FOR:
-# 
-# 1. FILLER WORDS (detect ALL of these if present):
-#    - um, uh, uhh, er, err, ah, ahh
-#    - like (when not used correctly), you know, I mean, basically, actually, literally
-#    - so, well (when used as fillers at start)
-#    - kind of, sort of (when overused)
-# 
-# 2. GRAMMAR ERRORS (check each carefully):
-#    - VERB TENSE: "I go yesterday" → "I went yesterday"
-#    - SUBJECT-VERB AGREEMENT: "He don't know" → "He doesn't know"
-#    - ARTICLES: "I am engineer" → "I am an engineer"
-#    - PREPOSITIONS: "I am good in coding" → "I am good at coding"
-#    - WORD ORDER: "Always I work hard" → "I always work hard"
-#    - PRONOUNS: "Me and him went" → "He and I went"
-#    - PLURALS: "I have many experience" → "I have much experience"
-#    - COMPARATIVES: "more better" → "better"
-# 
-# 3. WORD SUGGESTIONS:
-#    - Find weak/basic words and suggest stronger alternatives
-#    - Example: "good" → "excellent/outstanding"
-#    - Example: "bad" → "challenging/difficult"
-#    - Example: "thing" → "aspect/factor/element"
-#    - Example: "do" → "accomplish/execute/perform"
-# 
-# CRITICAL: 
-# - "corrected_sentence" = Fix ONLY grammar errors
-# - "improved_sentence" = Fix grammar errors AND USE all word suggestions to make it professional
-# 
-# SCORING GUIDE (CRITICAL - follow exactly):
-# - 95-100: Perfect grammar, no errors, no filler words
-# - 85-94: Minor issues only (1-2 fillers OR 1 minor error)
-# - 70-84: Some issues (2-3 errors or multiple fillers)
-# - 50-69: Significant issues (4+ errors)
-# - Below 50: Major problems throughout
-# 
-# Return STRICTLY valid JSON (no extra text):
-# {{
-#   "score": <0-100 integer based on SCORING GUIDE above>,
-#   "is_correct": <true if no major errors, false otherwise>,
-#   
-#   "filler_words": ["list", "of", "detected", "fillers"],
-#   "filler_count": <number>,
-#   "filler_feedback": "<specific advice on reducing fillers>",
-#   
-#   "errors": [
-#     {{
-#       "type": "verb_tense | article | subject_verb | preposition | word_order | pronoun | plural | comparative",
-#       "you_said": "<exact phrase user said>",
-#       "should_be": "<corrected phrase>",
-#       "better_word": "<if applicable, show better word IN CONTEXT: 'I have excellent skills' instead of just 'excellent'>",
-#       "explanation": "<brief, friendly explanation>"
-#     }}
-#   ],
-#   
-#   "word_suggestions": [
-#     {{
-#       "weak_word": "<basic word user used>",
-#       "better_options": ["option1", "option2"],
-#       "example": "<show how to use in THEIR sentence with better word>"
-#     }}
-#   ],
-#   
-#   "corrected_sentence": "<grammatically correct version - fix errors only>",
-#   "improved_sentence": "<USE ALL word_suggestions to make it professional and polished>",
-#   
-#   "strengths": ["<what they did well grammatically>"],
-#   "feedback": "<2-3 sentences: acknowledge positives, then specific improvement tips>"
-# }}
-# """
-#     try:
-#         raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             data = json.loads(json_match.group())
-#             
-#             data.setdefault("filler_words", [])
-#             data.setdefault("filler_count", len(data.get("filler_words", [])))
-#             data.setdefault("filler_feedback", "")
-#             data.setdefault("errors", [])
-#             data.setdefault("word_suggestions", [])
-#             data.setdefault("strengths", [])
-#             if not data.get("improved_sentence"):
-#                 data["improved_sentence"] = data.get("corrected_sentence", user_text)
-#             
-#             
-#             error_count = len(data.get("errors", []))
-#             filler_count = len(data.get("filler_words", []))
-#             current_score = data.get("score", 75)
-#             
-#             
-#             if error_count == 0 and filler_count <= 1 and current_score < 90:
-#                 data["score"] = 95 - (filler_count * 3)  
-#             elif error_count == 1 and current_score < 80:
-#                 data["score"] = 85 - (filler_count * 2)
-#             elif error_count >= 4 and current_score > 70:
-#                 data["score"] = min(current_score, 65)
-#             
-#             return data
-#     except Exception as e:
-#         logger.debug(f"Grammar analysis fallback: {e}")
-#     return {
-#         "score": 90, "is_correct": True, "filler_words": [], "filler_count": 0,
-#         "filler_feedback": "", "errors": [], "word_suggestions": [],
-#         "corrected_sentence": user_text, "improved_sentence": user_text,
-#         "strengths": ["Good sentence structure"], "feedback": "No major grammatical issues detected. Keep up the good work!"
-#     }
-
-
-
-# async def analyze_vocab_llm(user_text: str, level: str = "Intermediate", model: str = "gpt") -> dict:
-#     """llm-based vocabulary analysis with cefr levels"""
-#     prompt = f"""Analyze vocabulary CEFR levels for this interview answer: "{user_text}"
- 
-# Level: {level}
- 
-# CRITICAL - SPELLING ERRORS:
-# If a word is MISSPELLED (e.g., "awareded", "recieved", "definately"):
-# - Do NOT assign it a high CEFR level like C2
-# - Include it in "suggestions" with the CORRECT SPELLING as "better_word"
- 
-# Calculate percentage of words at each CEFR level. Percentages should sum to 100.
- 
-# IMPORTANT: In the "feedback" field, DO NOT mention "A1", "A2", "B1", "B2", "C1", "C2" directly.
-# Instead use:
-# - A1/A2 words = "basic words" or "simple vocabulary"
-# - B1/B2 words = "intermediate words" or "good vocabulary"
-# - C1/C2 words = "advanced words" or "sophisticated vocabulary"
- 
-# CRITICAL FOR SUGGESTIONS:
-# - "original_sentence": Extract the EXACT phrase from the user's transcription that contains the weak word
-# - "improved_sentence": Show the SAME phrase with the better word substituted
- 
-# Return STRICTLY valid JSON:
-# {{
-#   "score": 0-100,
-#   "overall_level": "A1/A2/B1/B2/C1/C2",
-#   "total_words": <word count>,
-#   "cefr_distribution": {{
-#     "A1": {{"percentage": 20, "words": ["I", "is"]}},
-#     "A2": {{"percentage": 30, "words": ["work", "name"]}},
-#     "B1": {{"percentage": 40, "words": ["experience"]}},
-#     "B2": {{"percentage": 10, "words": ["sophisticated"]}},
-#     "C1": {{"percentage": 0, "words": []}},
-#     "C2": {{"percentage": 0, "words": []}}
-#   }},
-#   "professional_words_used": ["list", "of", "professional", "terms"],
-#   "suggestions": [
-#     {{"word": "good", "current_level": "A2", "better_word": "excellent", "suggested_level": "B1", "original_sentence": "<extract from user's actual text>", "improved_sentence": "<same phrase with better word>"}}
-#   ],
-#   "feedback": "Feedback using 'basic', 'intermediate', 'advanced' - NOT A1/B1/C1 labels"
-# }}
- 
-# IMPORTANT: For MISSPELLED words, set current_level = "spelling_error" and better_word = correct spelling
-# """
-#     try:
-#         raw = await call_llm(prompt, mode="strict_json", model=model)
-#         json_match = re.search(r'\{[\s\S]*\}', raw)
-#         if json_match:
-#             return json.loads(json_match.group())
-#     except Exception as e:
-#         logger.debug(f"Vocabulary analysis fallback: {e}")
-#     return {
-#         "score": 80, "overall_level": "B1", "total_words": len(user_text.split()),
-#         "cefr_distribution": {
-#             "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-#             "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-#             "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-#         },
-#         "professional_words_used": [], "suggestions": [],
-#         "feedback": "Vocabulary analysis could not be completed."
-#     }
-
-
-
-
-async def analyze_grammar_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """llm-based grammar analysis for spoken interview answers"""
-    prompt = f"""You are an expert English grammar coach analyzing SPOKEN interview responses.
-
-Respond in the target language: {target_language}.
-
-SPOKEN TEXT: "{user_text}"
-USER LEVEL: {level}
-
-IMPORTANT RULES:
-1. This is TRANSCRIBED SPEECH - IGNORE punctuation, capitalization, and minor spelling
-2. Focus ONLY on grammatical structure and word choice
-3. Be encouraging but honest
-
-ANALYZE FOR:
-
-1. FILLER WORDS (detect ALL of these if present):
-   - um, uh, uhh, er, err, ah, ahh
-   - like (when not used correctly), you know, I mean, basically, actually, literally
-   - so, well (when used as fillers at start)
-   - kind of, sort of (when overused)
-
-2. GRAMMAR ERRORS (check each carefully):
-   - VERB TENSE: "I go yesterday" → "I went yesterday"
-   - SUBJECT-VERB AGREEMENT: "He don't know" → "He doesn't know"
-   - ARTICLES: "I am engineer" → "I am an engineer"
-   - PREPOSITIONS: "I am good in coding" → "I am good at coding"
-   - WORD ORDER: "Always I work hard" → "I always work hard"
-   - PRONOUNS: "Me and him went" → "He and I went"
-   - PLURALS: "I have many experience" → "I have much experience"
-   - COMPARATIVES: "more better" → "better"
-
-3. WORD SUGGESTIONS:
-   - Find weak/basic words and suggest stronger alternatives
-   - Example: "good" → "excellent/outstanding"
-   - Example: "bad" → "challenging/difficult"
-   - Example: "thing" → "aspect/factor/element"
-   - Example: "do" → "accomplish/execute/perform"
-
-CRITICAL: 
-- "corrected_sentence" = Fix ONLY grammar errors
-- "improved_sentence" = Fix grammar errors AND USE all word suggestions to make it professional
-
-SCORING GUIDE (CRITICAL - follow exactly):
-- 95-100: Perfect grammar, no errors, no filler words
-- 85-94: Minor issues only (1-2 fillers OR 1 minor error)
-- 70-84: Some issues (2-3 errors or multiple fillers)
-- 50-69: Significant issues (4+ errors)
-- Below 50: Major problems throughout
-
-Return STRICTLY valid JSON (no extra text):
-{{
-  "score": <0-100 integer based on SCORING GUIDE above>,
-  "is_correct": <true if no major errors, false otherwise>,
-
-  "filler_words": ["list", "of", "detected", "fillers"],
-  "filler_count": <number>,
-  "filler_feedback": "<specific advice on reducing fillers>",
-
-  "errors": [
-    {{
-      "type": "verb_tense | article | subject_verb | preposition | word_order | pronoun | plural | comparative",
-      "you_said": "I #goed# to store",
-      "should_be": "I #went# to the store",
-      "wrong_word": "goed",
-      "correct_word": "went",
-      "explanation": "Go is irregular - past tense is went, not goed",
-      "example_sentence": "Yesterday, I went to the park with my friends."
-    }}
-  ],
-
-  "word_suggestions": [
-    {{
-      "you_used": "good",
-      "use_instead": "excellent",
-      "why": "more impactful for professional context",
-      "original_sentence": "The results were #good#",
-      "improved_sentence": "The results were #excellent#",
-      "example_sentence": "The project outcomes were excellent."
-    }}
-  ],
-
-  "corrected_sentence": "<THE WHOLE TRANSCRIPTION with ONLY grammar errors fixed>",
-  "improved_sentence": "<THE WHOLE TRANSCRIPTION with grammar fixed + vocabulary enhanced>",
-
-  "strengths": ["<what they did well grammatically>"],
-  "feedback": "<2-3 sentences: acknowledge positives, then specific improvement tips>"
-}}
-
-CRITICAL FORMATTING RULES:
-- For errors: you_said and should_be are ONLY the specific sentence/line from transcription containing the error
-- Mark the wrong word with #word# in you_said
-- Mark the correct word with #word# in should_be
-- For word_suggestions: original_sentence and improved_sentence are ONLY the specific phrase containing the weak word
-- Mark weak word with #word# in original_sentence, better word with #word# in improved_sentence
-- example_sentence is a NEW sentence showing correct usage (not from transcription)
-- corrected_sentence = THE WHOLE TRANSCRIPTION with all grammar fixes applied
-- improved_sentence = THE WHOLE TRANSCRIPTION with grammar fixed AND vocabulary enhanced
-- Empty arrays [] if no issues
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-
-            # Normalize word_suggestions keys for consistent API response
-            for item in data.get("word_suggestions", []):
-                if not isinstance(item, dict):
-                    continue
-                if not item.get("weak_word"):
-                    item["weak_word"] = item.get("you_used") or item.get("word") or ""
-                if not item.get("better_options"):
-                    better = item.get("use_instead") or item.get("better_word")
-                    item["better_options"] = [better] if better else []
-
-            data.setdefault("filler_words", [])
-            data.setdefault("filler_count", len(data.get("filler_words", [])))
-            data.setdefault("filler_feedback", "")
-            data.setdefault("errors", [])
-            data.setdefault("word_suggestions", [])
-            data.setdefault("strengths", [])
-            if not data.get("improved_sentence"):
-                data["improved_sentence"] = data.get("corrected_sentence", user_text)
-
-
-            error_count = len(data.get("errors", []))
-            filler_count = len(data.get("filler_words", []))
-            current_score = data.get("score", 75)
-
-
-            if error_count == 0 and filler_count <= 1 and current_score < 90:
-                data["score"] = 95 - (filler_count * 3)  
-            elif error_count == 1 and current_score < 80:
-                data["score"] = 85 - (filler_count * 2)
-            elif error_count >= 4 and current_score > 70:
-                data["score"] = min(current_score, 65)
-
-            return data
-    except Exception as e:
-        logger.debug(f"Grammar analysis fallback: {e}")
-    fallback_strengths = ["Good sentence structure"]
-    fallback_feedback = "No major grammatical issues detected. Keep up the good work!"
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback_strengths = await translate_values(fallback_strengths, target_language)
-        fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-    return {
-        "score": 90, "is_correct": True, "filler_words": [], "filler_count": 0,
-        "filler_feedback": "", "errors": [], "word_suggestions": [],
-        "corrected_sentence": user_text, "improved_sentence": user_text,
-        "strengths": fallback_strengths, "feedback": fallback_feedback
-    }
-
-
-async def analyze_vocab_llm(user_text: str, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """llm-based vocabulary analysis with cefr levels"""
-    prompt = f"""Analyze vocabulary CEFR levels for this interview answer: "{user_text}"
-
-Respond in the target language: {target_language}.
-
-Level: {level}
-
-CRITICAL - VOCABULARY SUGGESTIONS ARE MANDATORY:
-You MUST find and suggest improvements for weak/basic words like:
-- good → excellent/outstanding
-- bad → challenging/difficult  
-- thing → aspect/factor/element
-- do → accomplish/execute/perform
-- get → obtain/acquire/receive
-- make → create/develop/establish
-- very → extremely/highly/remarkably
-- nice → pleasant/wonderful/delightful
-- big → substantial/significant
-- small → minor/minimal
-
-SPELLING ERRORS:
-If a word is MISSPELLED (e.g., "awareded", "recieved", "definately"):
-- Set current_level = "spelling_error"
-- Set better_word = correct spelling
-
-Calculate percentage of words at each CEFR level. Percentages should sum to 100.
-Count ALL words in the text for total_words.
-
-IMPORTANT: In the "feedback" field, DO NOT mention "A1", "A2", "B1", "B2", "C1", "C2" directly.
-Instead use:
-- A1/A2 words = "basic words" or "simple vocabulary"
-- B1/B2 words = "intermediate words" or "good vocabulary"
-- C1/C2 words = "advanced words" or "sophisticated vocabulary"
-
-Return STRICTLY valid JSON:
-{{
-  "score": 0-100,
-  "overall_level": "A1/A2/B1/B2/C1/C2",
-  "total_words": <actual word count>,
-  "cefr_distribution": {{
-    "A1": {{"percentage": 20, "words": ["I", "is", "the"]}},
-    "A2": {{"percentage": 30, "words": ["work", "name", "good"]}},
-    "B1": {{"percentage": 40, "words": ["experience", "actually"]}},
-    "B2": {{"percentage": 10, "words": ["sophisticated"]}},
-    "C1": {{"percentage": 0, "words": []}},
-    "C2": {{"percentage": 0, "words": []}}
-  }},
-  "professional_words_used": ["list", "of", "professional", "terms"],
-  "suggestions": [
-    {{
-      "word": "good",
-      "current_level": "A2",
-      "better_word": "excellent",
-      "suggested_level": "B1",
-      "context": "appropriate for professional interview",
-      "original_sentence": "I had a #good# experience",
-      "improved_sentence": "I had an #excellent# experience",
-      "example_sentence": "The results of the project were excellent."
-    }}
-  ],
-  "feedback": "Feedback using 'basic', 'intermediate', 'advanced' - NOT A1/B1/C1 labels"
-}}
-
-CRITICAL FORMATTING RULES:
-- original_sentence: Extract ONLY the specific sentence/line from user's transcription containing the weak word (NOT the whole transcription)
-- Mark the weak word with #word# in original_sentence
-- improved_sentence: Same sentence/line with the better word substituted
-- Mark the better word with #word# in improved_sentence
-- example_sentence: A NEW sentence showing correct usage (not from transcription, no # needed)
-- ALWAYS include suggestions if any weak/basic words (A1/A2 level) are found
-- For MISSPELLED words: current_level = "spelling_error", better_word = correct spelling
-- Provide at least 2-3 suggestions if weak words exist
-"""
-    try:
-        raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            data = json.loads(json_match.group())
-            # Ensure CEFR distribution has all levels
-            default_cefr = {
-                "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-                "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-                "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-            }
-            if "cefr_distribution" not in data or not isinstance(data.get("cefr_distribution"), dict):
-                data["cefr_distribution"] = default_cefr
-            else:
-                for level_key in default_cefr:
-                    if level_key not in data["cefr_distribution"]:
-                        data["cefr_distribution"][level_key] = default_cefr[level_key]
-            return data
-    except Exception as e:
-        logger.debug(f"Vocabulary analysis fallback: {e}")
-    fallback_feedback = "Vocabulary analysis could not be completed."
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-    return {
-        "score": 80, "overall_level": "B1", "total_words": len(user_text.split()),
-        "cefr_distribution": {
-            "A1": {"percentage": 0, "words": []}, "A2": {"percentage": 0, "words": []},
-            "B1": {"percentage": 0, "words": []}, "B2": {"percentage": 0, "words": []},
-            "C1": {"percentage": 0, "words": []}, "C2": {"percentage": 0, "words": []}
-        },
-        "professional_words_used": [], "suggestions": [],
-        "feedback": fallback_feedback
-    }
-
-
-async def analyze_pronunciation_llm(audio_path: str = None, spoken_text: str = None, level: str = "Intermediate", model: str = "gpt", target_language: str = "en") -> dict:
-    """pronunciation analysis using whisper word-level confidence"""
+async def build_lesson_strict(target_lang: str, num_words: int = DEFAULT_NUM_WORDS, set_number: int = None, model: str = "gpt") -> list:
+    """Build lesson from vocab file for strict mode - uses num_words from input, filtered by set if specified"""
+    vocab = await load_vocab_file(set_number=set_number)
     
-    if not audio_path:
-        fallback_feedback = "No audio provided for pronunciation analysis"
-        fallback_tips = ["Record audio for pronunciation feedback"]
-        if target_language and target_language.lower() not in ["en", "english"]:
-            fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-            fallback_tips = await translate_values(fallback_tips, target_language)
-        return {
-            "accuracy": 75, "transcription": spoken_text or "",
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": spoken_text.split() if spoken_text else [],
-            "feedback": fallback_feedback,
-            "tips": fallback_tips,
-            "mispronounced_count": 0
-        }
+    if not vocab:
+        error_msg = f"No vocabulary found in database for set {set_number}." if set_number else "No vocabulary found in database. Please run seed_tables.py first."
+        raise HTTPException(status_code=500, detail=error_msg)
+
+    selected = sample_vocab(vocab, num_words)
     
-    try:
-        normalized_target = normalize_language_code(target_language, default="en")
-
-        async def _transcribe_pronunciation(lang_hint: str = None):
-            kwargs = {"word_timestamps": True}
-            if lang_hint:
-                kwargs["language"] = lang_hint
-            segments, info = await asyncio.to_thread(_whisper_model.transcribe, audio_path, **kwargs)
-            detected = info.language if info else (lang_hint or "en")
-            words = []
-            text = ""
-            for seg in segments:
-                text += seg.text + " "
-                if seg.words:
-                    for w in seg.words:
-                        words.append({
-                            "word": w.word.strip().lower(),
-                            "confidence": w.probability,
-                            "start": w.start,
-                            "end": w.end
-                        })
-            return text.strip(), words, detected
-
-        transcription, words_data, detected_lang = await _transcribe_pronunciation(normalized_target)
-        display_transcription = transcription
-
-        if not words_data:
-            fallback_feedback = "No speech detected in audio"
-            fallback_tips = ["Speak clearly into the microphone"]
-            if target_language and target_language.lower() not in ["en", "english"]:
-                fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-                fallback_tips = await translate_values(fallback_tips, target_language)
-            return {
-                "accuracy": 0, "transcription": display_transcription,
-                "word_pronunciation_scores": [],
-                "words_to_practice": [], "well_pronounced_words": [],
-                "feedback": fallback_feedback,
-                "tips": fallback_tips,
-                "mispronounced_count": 0
-            }
+    async def normalize_sentence(s, target_lang):
+        """Convert sentence to dict format if it's a string and ensure target translation."""
+        if isinstance(s, str):
+            target_text = s if target_lang == "en" else await translate_text(s, "en", target_lang)
+            return {"en": s, target_lang: target_text}
+        elif isinstance(s, dict):
+            if target_lang not in s and s.get("en"):
+                target_text = s["en"] if target_lang == "en" else await translate_text(s["en"], "en", target_lang)
+                s = {**s, target_lang: target_text}
+            return s
+        return {"en": "", target_lang: ""}
+    
+    lesson = []
+    for item in selected:
+        word_source = item["word"]
+        word_target = word_source if target_lang == "en" else await translate_text(word_source, "en", target_lang)
+        meaning_en = item.get("meaning_en", "")
+        meaning_target = item.get(f"meaning_{target_lang}")
+        if not meaning_target:
+            meaning_target = meaning_en if target_lang == "en" else await translate_text(meaning_en, "en", target_lang)
         
-        CONFIDENCE_THRESHOLD = 0.70
-        mispronounced_words = []
-        well_pronounced = []
-        word_pronunciation_scores = []
+        existing_sentences_raw = item.get("sentences", [])
         
-        for wd in words_data:
-            word = wd["word"].strip(".,!?")
-            if len(word) < 2:
-                continue
+        # Normalize sentences to dict format
+        existing_sentences = []
+        for s in existing_sentences_raw:
+            existing_sentences.append(await normalize_sentence(s, target_lang))
+        
+        
+        if len(existing_sentences) >= SENTENCES_PER_WORD_STRICT:
+            sentences = existing_sentences[:SENTENCES_PER_WORD_STRICT]
+        elif existing_sentences:
             
-            pronunciation_percentage = round(wd["confidence"] * 100, 1)
+            needed = SENTENCES_PER_WORD_STRICT - len(existing_sentences)
+            extra = await generate_sentences_llm(word_target, target_lang, needed, model=model)
+            sentences = existing_sentences + extra
+        else:
             
-            if pronunciation_percentage >= 90:
-                status = "excellent"
-            elif pronunciation_percentage >= 70:
-                status = "good"
-            elif pronunciation_percentage >= 50:
-                status = "needs_improvement"
-            else:
-                status = "poor"
-            
-            word_pronunciation_scores.append({
-                "word": word,
-                "pronunciation_match_percentage": pronunciation_percentage,
-                "status": status
-            })
-            
-            if wd["confidence"] < CONFIDENCE_THRESHOLD:
-                mispronounced_words.append({
-                    "word": word,
-                    "confidence": pronunciation_percentage,
-                    "issue": "unclear pronunciation" if wd["confidence"] < 0.5 else "slight pronunciation issue"
+            sentences = await generate_sentences_llm(word_target, target_lang, SENTENCES_PER_WORD_STRICT, model=model)
+        
+        lesson.append({
+            "word": word_target,
+            "meaning_en": meaning_en,
+            f"meaning_{target_lang}": meaning_target,
+            "sentences": sentences[:SENTENCES_PER_WORD_STRICT]
+        })
+    
+    return lesson
+
+
+
+
+async def analyze_pronunciation_detailed(audio_path: str, expected_text: str, spoken_text: str, level: str = "Intermediate", target_lang: str = "en") -> dict:
+    """detailed pronunciation analysis combining wer and word confidence"""
+    
+    
+    transcription_data = await transcribe_audio_with_words(audio_path, target_lang)
+    
+    
+    base_score = pronunciation_score_wer(expected_text, spoken_text)
+    
+    
+    mispronounced = []
+    if transcription_data.get("words"):
+        for word_data in transcription_data["words"]:
+            if word_data.get("probability", 1.0) < 0.7:
+                mispronounced.append({
+                    "word": word_data["word"],
+                    "confidence": round(word_data["probability"] * 100, 1),
+                    "suggestion": "speak more clearly"
                 })
-            else:
-                well_pronounced.append(word)
-        
-        avg_confidence = sum(w["confidence"] for w in words_data) / len(words_data) if words_data else 0.7
-        accuracy = int(avg_confidence * 100)
-        
-        
-        llm_prompt = f"""You are a pronunciation coach for interview preparation.
-
-Respond in the target language: {normalized_target}.
-
-TRANSCRIPTION: "{display_transcription}"
-MISPRONOUNCED WORDS: {mispronounced_words if mispronounced_words else "None - all words were clear!"}
-WELL PRONOUNCED: {well_pronounced[:10]}
-ACCURACY: {accuracy}%
-
-Return STRICTLY valid JSON:
-{{
-    "words_to_practice": [
-        {{"word": "the word", "how_to_say": "syllable breakdown: ex-AM-ple", "tip": "specific tip"}}
-    ],
-    "feedback": "2-3 encouraging sentences about their pronunciation for interview",
-    "tips": ["general pronunciation tip 1", "general tip 2"]
-}}
-"""
-        try:
-            llm_response = await call_llm(llm_prompt, mode="strict_json", timeout=30, model=model, target_language=target_language)
-            llm_data = json.loads(re.search(r'\{[\s\S]*\}', llm_response).group())
-        except Exception as llm_error:
-            logger.debug(f"LLM pronunciation tips fallback: {llm_error}")
-            llm_data = {
-                "words_to_practice": [{"word": w["word"], "how_to_say": f"Say '{w['word']}' clearly", "tip": "Speak slower"} for w in mispronounced_words[:5]],
-                "feedback": f"Pronunciation accuracy: {accuracy}%.",
-                "tips": ["Speak slowly and clearly", "Practice word stress"]
-            }
-            if target_language and target_language.lower() not in ["en", "english"]:
-                llm_data["feedback"] = await translate_if_needed(llm_data.get("feedback", ""), target_language)
-                llm_data["tips"] = await translate_values(llm_data.get("tips", []), target_language)
-                translated_words = []
-                for item in llm_data.get("words_to_practice", []):
-                    if isinstance(item, dict):
-                        item = item.copy()
-                        item["how_to_say"] = await translate_if_needed(item.get("how_to_say", ""), target_language)
-                        item["tip"] = await translate_if_needed(item.get("tip", ""), target_language)
-                    translated_words.append(item)
-                llm_data["words_to_practice"] = translated_words
-        
-        default_feedback = await translate_if_needed("Analysis complete.", target_language)
-        return {
-            "accuracy": accuracy,
-            "transcription": display_transcription,
-            "word_pronunciation_scores": word_pronunciation_scores,
-            "words_to_practice": llm_data.get("words_to_practice", []),
-            "well_pronounced_words": well_pronounced,
-            "feedback": llm_data.get("feedback", default_feedback),
-            "tips": llm_data.get("tips", []),
-            "mispronounced_count": len(mispronounced_words)
-        }
-        
-    except Exception as e:
-        logger.error(f"Pronunciation error: {e}")
-        fallback_feedback = f"Could not analyze pronunciation: {str(e)}"
-        fallback_tips = ["Ensure clear audio recording"]
-        if target_language and target_language.lower() not in ["en", "english"]:
-            fallback_feedback = await translate_if_needed(fallback_feedback, target_language)
-            fallback_tips = await translate_values(fallback_tips, target_language)
-        return {
-            "accuracy": 75, "transcription": spoken_text or "",
-            "word_pronunciation_scores": [],
-            "words_to_practice": [], "well_pronounced_words": [],
-            "feedback": fallback_feedback,
-            "tips": fallback_tips,
-            "mispronounced_count": 0
-        }
-
-
-def calculate_fluency(word_count: int, audio_duration: float) -> dict:
-    """calculate fluency metrics"""
-    wpm = int((word_count / audio_duration) * 60) if audio_duration > 0 else 100
     
-    if wpm < 80:
-        score = max(40, 60 - (80 - wpm))
-        speed_status = "too_slow"
-    elif wpm < 110:
-        score = 70 + (wpm - 80)
-        speed_status = "slow"
-    elif wpm <= 160:
-        score = 90 + min(10, (wpm - 110) // 5)
-        speed_status = "normal"
-    elif wpm <= 180:
-        score = 85
-        speed_status = "fast"
-    else:
-        score = max(60, 85 - (wpm - 180) // 2)
-        speed_status = "too_fast"
+    
+    duration = transcription_data.get("duration", 5)
+    word_count = len(spoken_text.split())
+    wpm = int((word_count / duration) * 60) if duration > 0 else 0
     
     return {
-        "score": min(100, score),
-        "wpm": wpm,
-        "speed_status": speed_status,
-        "audio_duration_seconds": round(audio_duration, 1)
+        "score": base_score,
+        "mispronounced_words": mispronounced,
+        "fluency": {
+            "wpm": wpm,
+            "speed_status": "slow" if wpm < 100 else "normal" if wpm < 160 else "fast",
+            "duration": round(duration, 2)
+        },
+        "transcription": spoken_text
     }
 
 
-async def analyze_fluency_metrics(user_text: str, audio_duration: float) -> dict:
-    """async wrapper for fluency metrics from text and duration"""
-    word_count = len(re.findall(r"\b\w+\b", user_text or ""))
-    return calculate_fluency(word_count, audio_duration)
 
 
-async def generate_personalized_feedback(overall_score: float, scores: dict, emotion: dict, user_name: str,
-                                          grammar: dict = None, vocabulary: dict = None, 
-                                          pronunciation: dict = None, answer_eval: dict = None, model: str = "gpt",
-                                          target_language: str = "en") -> dict:
-    """Generate personalized interview feedback using LLM based on actual errors"""
+
+
+async def generate_word_feedback(expected: str, spoken: str, score: int, attempt: int, word_analysis: dict = None, model: str = "gpt") -> dict:
+    """Generate LLM-based feedback for word practice with specific tips"""
+    
+    if score >= PASSING_SCORE:
+        return {
+            "status": "success",
+            "message": f"Awesome! 🎉 You nailed '{expected}'! That sounded really clear. Now let's try it in a sentence!",
+            "next_action": "next_phase"
+        }
+    elif attempt >= MAX_ATTEMPTS:
+        return {
+            "status": "max_attempts",
+            "message": f"Hey, don't worry! '{expected}' is tricky. You gave it {MAX_ATTEMPTS} good tries - let's move on to sentences and come back to it!",
+            "next_action": "next_phase"
+        }
+    else:
+        
+        confidence = word_analysis.get("confidence", 0) if word_analysis else 0
+        detected = word_analysis.get("detected", False) if word_analysis else False
+        
+        prompt = f"""You are a super friendly pronunciation buddy (like a supportive friend, NOT a teacher). Give casual, encouraging feedback.
+
+Word to pronounce: "{expected}"
+User said: "{spoken}"
+Score: {score}%
+Word detected: {detected}
+Confidence: {confidence}%
+Attempt: {attempt} of {MAX_ATTEMPTS}
+
+Generate a response that feels like a friend helping out:
+1. START with a warm one-liner reaction (like "Almost there!" or "You're so close!" or "Nice try!")
+2. Then 1 sentence of encouragement + ONE specific tip for "{expected}"
+3. Mention it's attempt {attempt} of {MAX_ATTEMPTS} naturally
+
+Return JSON: {{"message": "your friendly feedback here", "tip": "quick pronunciation tip"}}"""
+
+        try:
+            raw = await call_llm(prompt, timeout=10, model=model)
+            data = safe_json_loads(raw)
+            message = data.get("message", f"Attempt {attempt}/{MAX_ATTEMPTS}. Try saying '{expected}' more clearly.")
+            tip = data.get("tip", "Speak slowly and clearly")
+        except:
+            message = f"Attempt {attempt}/{MAX_ATTEMPTS}. Focus on pronouncing '{expected}' clearly."
+            tip = "Try breaking the word into syllables"
+        
+        return {
+            "status": "retry",
+            "message": message,
+            "tip": tip,
+            "next_action": "retry"
+        }
+
+
+async def generate_sentence_feedback(expected: str, spoken: str, score: int, analysis: dict, model: str = "gpt") -> dict:
+    """Generate LLM-based feedback for sentence practice with mismatch details"""
+    pron_analysis = analysis.get("pronunciation", {})
+    mismatches = pron_analysis.get("mismatches", [])
+    mispronounced = pron_analysis.get("mispronounced_words", [])
+    fluency = pron_analysis.get("fluency", {})
+    wpm = fluency.get("wpm", 0)
+    speed_status = fluency.get("speed_status", "normal")
+    
+    if score >= PASSING_SCORE:
+        
+        prompt = f"""You are a super friendly pronunciation buddy (like a supportive friend). Give casual, celebratory feedback!
+
+Expected: "{expected}"
+User said: "{spoken}"
+Score: {score}%
+Speaking speed: {wpm} WPM ({speed_status})
+
+Generate a warm, friendly response:
+1. START with an excited one-liner ("Nice! 🔥", "You're on fire!", "That was great!")
+2. Then 1 sentence mentioning their good pronunciation
+3. Optionally mention their speaking pace
+
+Return JSON: {{"message": "your excited feedback", "fluency_note": "speed observation"}}"""
+
+        try:
+            raw = await call_llm(prompt, timeout=10, model=model)
+            data = safe_json_loads(raw)
+            message = data.get("message", "Great pronunciation! That sounded natural.")
+            fluency_note = data.get("fluency_note", f"Your pace was {speed_status}.")
+        except:
+            message = "That sounded great! Well done."
+            fluency_note = f"Speaking speed: {speed_status}"
+        
+        return {
+            "status": "success",
+            "message": message,
+            "fluency_note": fluency_note,
+            "pronunciation_feedback": pron_analysis,
+            "next_action": "next_sentence"
+        }
+    else:
+        
+        mismatch_info = ", ".join([f"'{m['expected']}' vs '{m['spoken']}'" for m in mismatches[:3]]) if mismatches else "some words unclear"
+        low_conf_words = [w["word"] for w in mispronounced[:3]] if mispronounced else []
+        
+        prompt = f"""You are a super friendly pronunciation buddy (like a supportive friend). Give casual, motivating feedback.
+
+Expected: "{expected}"
+User said: "{spoken}"
+Score: {score}%
+Mismatched words: {mismatch_info}
+Low confidence words: {low_conf_words}
+Speaking speed: {wpm} WPM ({speed_status})
+
+Generate a response like a friend would:
+1. START with a warm one-liner ("You're getting there!", "Almost!", "Good try!")
+2. Then 1 sentence focusing on ONE word they should practice
+3. Keep it encouraging and casual!
+
+Return JSON: {{"message": "your friendly feedback", "focus_word": "word to practice", "tip": "quick tip"}}"""
+
+        try:
+            raw = await call_llm(prompt, timeout=10, model=model)
+            data = safe_json_loads(raw)
+            message = data.get("message", "Good effort! Focus on speaking more clearly.")
+            focus_word = data.get("focus_word", "")
+            tip = data.get("tip", "Speak slowly and clearly")
+        except:
+            message = "Good effort! Try to match the sentence more closely."
+            focus_word = mismatches[0]["expected"] if mismatches else ""
+            tip = "Focus on each word clearly"
+        
+        return {
+            "status": "needs_improvement",
+            "message": message,
+            "focus_word": focus_word,
+            "tip": tip,
+            "pronunciation_feedback": pron_analysis,
+            "next_action": "next_sentence"
+        }
+
+
+async def generate_session_summary(session: dict, model: str = "gpt") -> dict:
+    """Generate comprehensive end of session summary with per-turn WPM analysis - aligned with interview/fluent APIs"""
+    history = session.get("history", [])
+    
+    total_attempts = len(history)
+    successful_attempts = sum(1 for h in history if h.get("score", 0) >= PASSING_SCORE)
+    
+    avg_score = sum(h.get("score", 0) for h in history) / total_attempts if total_attempts > 0 else 0
     
     
-    grammar_errors = grammar.get("errors", []) if grammar else []
-    filler_words = grammar.get("filler_words", []) if grammar else []
-    word_suggestions = [
-        w for w in (grammar.get("word_suggestions", []) if grammar else [])
-        if isinstance(w, dict)
-    ]
-    vocab_suggestions = [
-        v for v in (vocabulary.get("suggestions", []) if vocabulary else [])
-        if isinstance(v, dict)
-    ]
-    mispronounced = pronunciation.get("words_to_practice", []) if pronunciation else []
-    answer_issues = answer_eval.get("issue_summary", "") if answer_eval else ""
+    turn_history = []
+    total_wpm = 0
+    for i, h in enumerate(history, 1):
+        wpm = h.get("wpm", 0)
+        total_wpm += wpm
+        # Extract word properly - could be string or dict
+        word_data = h.get("word", "")
+        if isinstance(word_data, dict):
+            word_str = word_data.get("target", word_data.get("word", ""))
+        else:
+            word_str = str(word_data)
+        
+        turn_history.append({
+            "turn": i,
+            "word": word_str,
+            "score": h.get("score", 0),
+            "wpm": wpm,
+            "passed": h.get("score", 0) >= PASSING_SCORE
+        })
+    
+    average_wpm = int(total_wpm / total_attempts) if total_attempts > 0 else 0
+    wpm_status = "slow" if average_wpm < 100 else "normal" if average_wpm <= 150 else "fast"
     
     
-    errors_context = []
-    if grammar_errors:
-        errors_context.append(f"Grammar errors: {[e.get('you_said', '') + ' → ' + e.get('should_be', '') for e in grammar_errors[:3]]}")
-    if filler_words:
-        errors_context.append(f"Filler words used: {filler_words[:5]}")
-    if word_suggestions:
-        errors_context.append(f"Weak words: {[w.get('weak_word', '') for w in word_suggestions[:3]]}")
-    if vocab_suggestions:
-        errors_context.append(f"Vocabulary improvements: {[v.get('word', '') + ' → ' + v.get('better_word', '') for v in vocab_suggestions[:3]]}")
-    if mispronounced:
-        errors_context.append(f"Pronunciation to practice: {[w.get('word', '') if isinstance(w, dict) else w for w in mispronounced[:3]]}")
-    if answer_issues:
-        errors_context.append(f"Answer feedback: {answer_issues}")
-    
-    
-    improvement_areas = []
     strengths = []
-    for area, score in scores.items():
-        if score is None:  
-            continue
-        if score >= 75:
-            strengths.append(area)
-        elif score < 65:
-            improvement_areas.append(area)
+    improvement_areas = []
+    if avg_score >= 80:
+        strengths.append("pronunciation accuracy")
+    elif avg_score < 60:
+        improvement_areas.append("pronunciation accuracy")
     
-    improvement_areas_display = improvement_areas
-    strengths_display = strengths
-    if target_language and target_language != "en":
-        try:
-            if improvement_areas:
-                improvement_areas_display = list(await asyncio.gather(
-                    *[translate_text(a, "en", target_language) for a in improvement_areas]
-                ))
-            if strengths:
-                strengths_display = list(await asyncio.gather(
-                    *[translate_text(s, "en", target_language) for s in strengths]
-                ))
-        except Exception as e:
-            logger.debug(f"Personalized feedback list translation failed: {e}")
-
-    if errors_context:
-        prompt = f"""You are a professional interview coach providing constructive feedback to candidate {user_name}.
-
-Respond in the target language: {target_language}.
-
-SCORES:
-- Grammar: {scores.get('grammar', 0)}%
-- Vocabulary: {scores.get('vocabulary', 0)}%
-- Pronunciation: {scores.get('pronunciation', 0)}%
-- Fluency: {scores.get('fluency', 0)}%
-- Answer Quality: {scores.get('answer_evaluation', 0)}%
-- Overall: {overall_score}%
-
-ACTUAL ERRORS/ISSUES FOUND:
-{chr(10).join(errors_context)}
-
-EMOTION DETECTED: {emotion.get('emotion', 'neutral')}
-
-Generate PROFESSIONAL but ENGAGING feedback. Be encouraging yet constructive.
-
-Return STRICTLY valid JSON:
-{{
-    "message": "Start with a polished, professional one-liner that acknowledges their performance (like 'That was a well-structured response.' or 'Good points raised there.' or 'I can see you're putting thought into this.'). THEN 1-2 sentences of specific, constructive feedback about their ACTUAL errors. Keep it professional but warm.",
-    "improvement_areas": {json.dumps(improvement_areas_display)},
-    "strengths": {json.dumps(strengths_display)},
-    "emotion": "{emotion.get('emotion', 'neutral')}",
-    "quick_tip": "ONE specific, actionable tip - professional tone"
-}}
-
-TONE EXAMPLES for "message" based on score:
-- Score >= 85: "That was an excellent response. Your articulation was clear and..."
-- Score 70-84: "Good effort on that answer. I noticed some strong points, though..."
-- Score 50-69: "You're on the right track. Let's work on..."
-- Score < 50: "I appreciate your attempt. Here's how we can strengthen..."
-
-RULES:
-- Professional tone (like a supportive hiring manager)
-- NOT overly formal or stiff - be human and warm
-- Reference ACTUAL errors constructively
-- Acknowledge good attempts even when score is low"""
-        
-        try:
-            raw = await call_llm(prompt, mode="strict_json", timeout=15, model=model, target_language=target_language)
-            json_match = re.search(r'\{[\s\S]*\}', raw)
-            if json_match:
-                result = json.loads(json_match.group())
-                
-                result.setdefault("improvement_areas", improvement_areas_display)
-                result.setdefault("strengths", strengths_display)
-                result.setdefault("emotion", emotion.get("emotion", "neutral"))
-                return result
-        except Exception as e:
-            logger.debug(f"LLM personalized feedback fallback: {e}")
+    if average_wpm >= 100 and average_wpm <= 150:
+        strengths.append("speaking pace")
+    elif average_wpm < 100:
+        improvement_areas.append("speaking pace - try to speak faster")
+    elif average_wpm > 150:
+        improvement_areas.append("speaking pace - slow down for clarity")
+    
+    # Helper to extract word string from history item
+    def get_word_str(h):
+        word_data = h.get("word", "")
+        if isinstance(word_data, dict):
+            return word_data.get("target", word_data.get("word", ""))
+        return str(word_data)
+    
+    difficult_words = [get_word_str(h) for h in history if h.get("score", 0) < 70][:5]
+    well_pronounced = [get_word_str(h) for h in history if h.get("score", 0) >= 85][:5]
     
     
-    if overall_score >= 95:
-        message = f"🌟 Outstanding interview performance, {user_name}! You're interview-ready!"
-    elif overall_score >= 85:
-        message = f"Excellent job, {user_name}! Your communication skills are impressive."
-    elif overall_score >= 70:
-        message = f"Good effort, {user_name}! Focus on {', '.join(improvement_areas) if improvement_areas else 'minor details'} to improve."
-    else:
-        message = f"Keep practicing, {user_name}! Work on: {', '.join(improvement_areas) if improvement_areas else 'overall delivery'}."
-    
-    if emotion.get("confidence_level") == "low" or emotion.get("emotion") == "nervous":
-        message += " Remember to take a breath and project confidence."
-    
-    quick_tip = f"Practice your {improvement_areas[0] if improvement_areas else 'interview skills'} regularly."
-    if target_language and target_language != "en":
-        try:
-            message = await translate_text(message, "en", target_language)
-            quick_tip = await translate_text(quick_tip, "en", target_language)
-        except Exception as e:
-            logger.debug(f"Personalized feedback fallback translation failed: {e}")
+    prompt = f"""You are an expert pronunciation coach providing a detailed session summary.
 
-    return {
-        "message": message,
-        "improvement_areas": improvement_areas_display,
-        "strengths": strengths_display,
-        "emotion": emotion.get("emotion", "neutral"),
-        "quick_tip": quick_tip
-    }
-
-
-async def generate_session_summary_llm(user_name: str, scenario: str, final_scores: dict, 
-                                        chat_history: list, total_turns: int, average_wpm: int, 
-                                        turn_history: list = None, model: str = "gpt",
-                                        target_language: str = "en") -> dict:
-    """Generate elaborative LLM-based session summary with per-turn WPM analysis"""
-    
-    
-    conversation_summary = []
-    for i, msg in enumerate(chat_history[-10:]):  
-        role = "Clara" if msg["role"] == "assistant" else user_name
-        conversation_summary.append(f"{role}: {msg['content'][:100]}...")
-    
-    
-    turn_wpm_summary = ""
-    if turn_history:
-        turn_entries = [f"Turn {t.get('turn', i+1)}: {t.get('wpm', 0)} WPM, Score: {t.get('overall_score', 0)}%" 
-                       for i, t in enumerate(turn_history)]
-        turn_wpm_summary = "\n".join(turn_entries)
-    
-    prompt = f"""You are an expert interview coach providing a detailed session summary.
-
-Respond in the target language: {target_language}.
-
-CANDIDATE: {user_name}
-SCENARIO: {scenario}
-TOTAL QUESTIONS: {total_turns}
-AVERAGE SPEAKING SPEED: {average_wpm} words per minute
-
-FINAL SCORES:
-- Grammar: {final_scores.get('grammar', 0)}%
-- Vocabulary: {final_scores.get('vocabulary', 0)}%  
-- Pronunciation: {final_scores.get('pronunciation', 0)}%
-- Fluency: {final_scores.get('fluency', 0)}%
+SESSION DATA:
+- Student: {session.get('user_name', 'User')}
+- Level: {session.get('level', 'B1')}
+- Total Words Practiced: {session.get('total_words', 0)}
+- Success Rate: {successful_attempts}/{total_attempts} ({round(successful_attempts/total_attempts*100, 1) if total_attempts > 0 else 0}%)
+- Average Score: {round(avg_score, 1)}%
+- Average WPM: {average_wpm}
 
 PER-TURN PERFORMANCE:
-{turn_wpm_summary if turn_wpm_summary else "No turn data available"}
+{json.dumps(turn_history, indent=2)}
 
-RECENT CONVERSATION:
-{chr(10).join(conversation_summary)}
+DIFFICULT WORDS: {difficult_words}
+WELL PRONOUNCED: {well_pronounced}
 
-Generate a detailed, personalized, and encouraging session summary. Analyze WPM trend across turns.
+Generate a detailed, personalized, and encouraging session summary analyzing WPM trends.
 
 Return STRICTLY valid JSON:
 {{
-    "overall_assessment": "3-4 sentences summarizing the candidate's overall interview performance, mentioning WPM trends",
-    "grammar_feedback": {{
-        "score": {final_scores.get('grammar', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip",
-        "example": "example of correct usage or common mistake to avoid"
-    }},
-    "vocabulary_feedback": {{
-        "score": {final_scores.get('vocabulary', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip",
-        "suggested_words": ["professional word 1", "professional word 2", "professional word 3"]
-    }},
+    "overall_assessment": "3-4 sentences summarizing their pronunciation practice, mentioning WPM trends",
     "pronunciation_feedback": {{
-        "score": {final_scores.get('pronunciation', 0)},
+        "score": {round(avg_score, 1)},
         "status": "Excellent/Good/Needs Work",
         "what_went_well": "specific positive observation",
         "improvement_tip": "specific actionable tip",
-        "practice_words": ["word to practice 1", "word to practice 2"]
+        "practice_words": {json.dumps(difficult_words[:3])}
     }},
     "fluency_feedback": {{
-        "score": {final_scores.get('fluency', 0)},
-        "status": "Excellent/Good/Needs Work",
-        "what_went_well": "specific positive observation",
-        "improvement_tip": "specific actionable tip for speaking pace",
-        "wpm_trend": "analysis of WPM across turns - improving/declining/stable"
-    }},
-    "interview_skills": {{
-        "confidence": "observation about confidence level",
-        "structure": "observation about answer structure",
-        "relevance": "observation about answer relevance"
+        "score": {average_wpm},
+        "wpm_status": "{wpm_status}",
+        "trend": "analysis of WPM across turns - improving/declining/stable",
+        "tip": "specific tip for speaking pace"
     }},
     "action_plan": [
-        "specific action item 1 for next week",
-        "specific action item 2 for next week",
-        "specific action item 3 for next week"
+        "specific action item 1",
+        "specific action item 2",
+        "specific action item 3"
     ],
-    "encouragement": "2-3 encouraging sentences personalized for the candidate",
-    "next_practice_topics": ["topic 1", "topic 2", "topic 3"]
+    "encouragement": "2-3 encouraging sentences personalized for the student",
+    "next_practice_words": ["word1", "word2", "word3"]
 }}
 """
+    
     try:
-        raw = await call_llm(prompt, mode="strict_json", timeout=25, model=model, target_language=target_language)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
-        if json_match:
-            return json.loads(json_match.group())
+        raw = await call_llm(prompt, model=model, timeout=20)
+        data = safe_json_loads(raw)
+        
+        return {
+            "overall_score": int(avg_score),  
+            "total_words": session.get("total_words", 0),
+            "average_score": round(avg_score, 1),
+            "successful_attempts": successful_attempts,
+            "total_attempts": total_attempts,
+            "average_wpm": average_wpm,
+            "wpm_status": wpm_status,
+            "turn_history": turn_history,
+            "strengths": strengths,
+            "improvement_areas": improvement_areas,
+            "difficult_words": difficult_words,
+            "well_pronounced": well_pronounced,
+            
+            "overall_assessment": data.get("overall_assessment", f"Great practice session with {total_attempts} words!"),
+            "pronunciation_feedback": data.get("pronunciation_feedback", {"score": round(avg_score, 1), "status": "Good"}),
+            "fluency_feedback": data.get("fluency_feedback", {"score": average_wpm, "wpm_status": wpm_status}),
+            "action_plan": data.get("action_plan", ["Keep practicing daily"]),
+            "encouragement": data.get("encouragement", "Keep up the great work!"),
+            "next_practice_words": data.get("next_practice_words", difficult_words[:3])
+        }
     except Exception as e:
-        logger.debug(f"Session summary LLM fallback: {e}")
-    
-    
-    fallback = {
-        "overall_assessment": f"Great effort, {user_name}! You completed {total_turns} questions in your {scenario} practice.",
-        "grammar_feedback": {"score": final_scores.get("grammar", 0), "status": "Good", "what_went_well": "Good sentence structure", "improvement_tip": "Practice complex sentences", "example": "Use varied sentence structures"},
-        "vocabulary_feedback": {"score": final_scores.get("vocabulary", 0), "status": "Good", "what_went_well": "Used relevant terms", "improvement_tip": "Expand professional vocabulary", "suggested_words": ["synergy", "leverage", "optimize"]},
-        "pronunciation_feedback": {"score": final_scores.get("pronunciation", 0), "status": "Good", "what_went_well": "Clear articulation", "improvement_tip": "Practice difficult words", "practice_words": ["particularly", "specifically"]},
-        "fluency_feedback": {"score": final_scores.get("fluency", 0), "status": "Good", "what_went_well": "Consistent pace", "improvement_tip": "Maintain steady rhythm", "wpm_trend": "stable"},
-        "interview_skills": {"confidence": "Showed good confidence", "structure": "Answers were organized", "relevance": "Stayed on topic"},
-        "action_plan": ["Practice speaking for 10 mins daily", "Record and review your answers", "Prepare examples for common questions"],
-        "encouragement": f"Keep up the great work, {user_name}! Regular practice will help you ace your interviews.",
-        "next_practice_topics": ["Tell me about yourself", "Why should we hire you?", "Describe a challenge you overcame"]
-    }
-    if target_language and target_language.lower() not in ["en", "english"]:
-        fallback = await translate_values(fallback, target_language)
-    return fallback
-async def handle_session_termination(session: dict, session_id: str, model: str = "gpt") -> dict:
-    """
-    Helper function to handle session termination - eliminates duplicate code.
-    Returns the termination response with LLM-generated summary.
-    """
-    count = max(1, session["scores"]["count"])
-    audio_count = session["scores"].get("audio_count", 0)
-    if not audio_count and (
-        session["scores"].get("pronunciation", 0) > 0 or session["scores"].get("fluency", 0) > 0
-    ):
-        audio_count = count
-    
-    
-    has_audio_turns = session["scores"].get("pronunciation", 0) > 0 or session["scores"].get("fluency", 0) > 0
-    
-    if has_audio_turns:
-        pronunciation_avg = int(session["scores"]["pronunciation"] / audio_count) if audio_count > 0 else 0
-        fluency_avg = int(session["scores"]["fluency"] / audio_count) if audio_count > 0 else 0
-        final_scores = {
-            "grammar": int(session["scores"]["grammar"] / count),
-            "vocabulary": int(session["scores"]["vocabulary"] / count),
-            "pronunciation": pronunciation_avg,
-            "fluency": fluency_avg
+        logger.error(f"summary generation error: {e}")
+        return {
+            "overall_score": int(avg_score),  
+            "total_words": session.get("total_words", 0),
+            "average_score": round(avg_score, 1),
+            "successful_attempts": successful_attempts,
+            "total_attempts": total_attempts,
+            "average_wpm": average_wpm,
+            "wpm_status": wpm_status,
+            "turn_history": turn_history,
+            "strengths": strengths,
+            "improvement_areas": improvement_areas,
+            "difficult_words": difficult_words,
+            "well_pronounced": well_pronounced,
+            "overall_assessment": "Great practice session! Keep up the good work.",
+            "pronunciation_feedback": {"score": round(avg_score, 1), "status": "Good", "improvement_tip": "Practice difficult words slowly"},
+            "fluency_feedback": {"score": average_wpm, "wpm_status": wpm_status, "trend": "stable"},
+            "action_plan": ["Practice daily for best results", "Focus on difficult words"],
+            "encouragement": "You're making progress! Keep practicing.",
+            "next_practice_words": difficult_words[:3]
         }
-        avg_answer_score = int(session["scores"].get("answer", 50 * count) / count)
-        overall = int(
-            final_scores["grammar"] * 0.25 +
-            final_scores["vocabulary"] * 0.25 +
-            avg_answer_score * 0.25 +
-            final_scores["pronunciation"] * 0.15 +
-            final_scores["fluency"] * 0.10
-        )
-        average_wpm = int(session["scores"].get("total_wpm", 0) / audio_count) if audio_count > 0 else 0
-    else:
-        
-        final_scores = {
-            "grammar": int(session["scores"]["grammar"] / count),
-            "vocabulary": int(session["scores"]["vocabulary"] / count),
-            "pronunciation": None,
-            "fluency": None
-        }
-        avg_answer_score = int(session["scores"].get("answer", 50 * count) / count)
-        
-        overall = int(
-            final_scores["grammar"] * 0.33 +
-            final_scores["vocabulary"] * 0.33 +
-            avg_answer_score * 0.34
-        )
-        average_wpm = 0
-
-    
-    improvement_areas = [area for area, score in final_scores.items() if score is not None and score < 70]
-    strengths = [area for area, score in final_scores.items() if score is not None and score >= 80]
-    
-    
-    turn_history = session.get("turn_history", [])
-    
-    # Aggregate vocab CEFR words and WPM per turn
-    wpm_per_turn = []
-    vocab_overall = {
-        "A1": {"count": 0, "words": []},
-        "A2": {"count": 0, "words": []},
-        "B1": {"count": 0, "words": []},
-        "B2": {"count": 0, "words": []},
-        "C1": {"count": 0, "words": []},
-        "C2": {"count": 0, "words": []}
-    }
-    
-    for attempt in session.get("attempts", []):
-        # Track WPM per turn
-        fluency_data = attempt.get("fluency") or {}
-        turn_wpm = fluency_data.get("wpm", 0) if fluency_data else 0
-        wpm_per_turn.append({"turn": len(wpm_per_turn) + 1, "wpm": turn_wpm})
-        
-        # Aggregate CEFR vocabulary words
-        vocab_data = attempt.get("vocabulary") or {}
-        cefr_dist = vocab_data.get("cefr_distribution", {}) if vocab_data else {}
-        for level in ["A1", "A2", "B1", "B2", "C1", "C2"]:
-            level_data = cefr_dist.get(level, {})
-            if isinstance(level_data, dict):
-                words = level_data.get("words", [])
-                if isinstance(words, list):
-                    vocab_overall[level]["words"].extend(words)
-                    vocab_overall[level]["count"] = len(set(vocab_overall[level]["words"]))
-    
-    # Deduplicate vocab words and calculate percentages
-    total_vocab_words = sum(len(set(vocab_overall[level]["words"])) for level in vocab_overall)
-    for level in vocab_overall:
-        vocab_overall[level]["words"] = list(set(vocab_overall[level]["words"]))
-        vocab_overall[level]["count"] = len(vocab_overall[level]["words"])
-        vocab_overall[level]["percentage"] = round((vocab_overall[level]["count"] / total_vocab_words * 100), 1) if total_vocab_words > 0 else 0
-    
-    
-    llm_summary = await generate_session_summary_llm(
-        user_name=session["name"],
-        scenario=session.get("scenario", "interview"),
-        final_scores=final_scores,
-        chat_history=session["chat_history"],
-        total_turns=session.get("turn_number", 0),
-        average_wpm=average_wpm,
-        turn_history=turn_history,
-        model=model,
-        target_language=session.get("target_language", "en")
-    )
-    
-    # Build turn_feedback for termination response (same format as /interview_feedback)
-    turn_feedback = []
-    # Aggregate grammar mistakes and vocabulary suggestions from all turns
-    grammar_mistakes = []
-    vocab_suggestions = []
-    pronunciation_issues = []
-    
-    for i, attempt in enumerate(session.get("attempts", []), 1):
-        turn_feedback.append({
-            "turn": i,
-            "transcription": attempt.get("transcription", ""),
-            "grammar": attempt.get("grammar", {}),
-            "vocabulary": attempt.get("vocabulary", {}),
-            "pronunciation": attempt.get("pronunciation"),
-            "fluency": attempt.get("fluency"),
-            "answer_evaluation": attempt.get("answer_evaluation", {}),
-            "personalized_feedback": attempt.get("personalized_feedback", {}),
-            "improvement": attempt.get("improvement"),
-            "overall_score": attempt.get("overall_score", 0)
-        })
-        
-        # Collect grammar errors (wrong → correct)
-        gram = attempt.get("grammar") or {}
-        if isinstance(gram, dict):
-            for err in gram.get("errors", []):
-                if isinstance(err, dict):
-                    grammar_mistakes.append({
-                        "wrong": err.get("you_said", err.get("wrong_word", "")),
-                        "correct": err.get("should_be", err.get("correct_word", ""))
-                    })
-        
-        # Collect vocabulary suggestions (weak word → better word)
-        vocab = attempt.get("vocabulary") or {}
-        if isinstance(vocab, dict):
-            for sug in vocab.get("suggestions", []):
-                if isinstance(sug, dict):
-                    better = sug.get("better_word", "")
-                    if isinstance(better, list):
-                        better_options = better
-                    elif better:
-                        better_options = [better]
-                    else:
-                        better_options = []
-                    vocab_suggestions.append({
-                        "weak_word": sug.get("word", ""),
-                        "better_options": better_options
-                    })
-        
-        # Collect pronunciation issues
-        pron = attempt.get("pronunciation") or {}
-        if isinstance(pron, dict):
-            for word_issue in pron.get("words_to_practice", []):
-                if isinstance(word_issue, dict):
-                    pronunciation_issues.append({
-                        "word": word_issue.get("word", ""),
-                        "issue": word_issue.get("issue", ""),
-                        "how_to_say": word_issue.get("how_to_say", "")
-                    })
-    
-    # Build summary of all mistakes
-    summary = {
-        "grammar": {
-            "total_errors": len(grammar_mistakes),
-            "errors": grammar_mistakes
-        },
-        "vocabulary": {
-            "total_suggestions": len(vocab_suggestions),
-            "suggestions": vocab_suggestions
-        },
-        "pronunciation": {
-            "total_issues": len(pronunciation_issues),
-            "issues": pronunciation_issues
-        }
-    }
-
-    termination_response = {
-        "status": "conversation_ended", 
-        "session_id": session_id,
-        "target_lang": session.get("target_language", "en"),
-        "native_lang": session.get("native_language", "hi"),
-        "final_scores": final_scores, 
-        "overall_score": overall, 
-        "passing_score": PASSING_SCORE,
-        "average_wpm": average_wpm,
-        "wpm_per_turn": wpm_per_turn,
-        "wpm_status": "slow" if average_wpm < 110 else "normal" if average_wpm <= 160 else "fast",
-        "vocab_overall": vocab_overall,
-        "strengths": strengths, 
-        "improvement_areas": improvement_areas,
-        "total_turns": session.get("turn_number", 0),
-        "turn_history": turn_history,  
-        "turn_feedback": turn_feedback,
-        "summary": summary,
-        "overall_assessment": llm_summary.get("overall_assessment", ""),
-        "grammar_feedback": llm_summary.get("grammar_feedback", {}),
-        "vocabulary_feedback": llm_summary.get("vocabulary_feedback", {}),
-        "pronunciation_feedback": llm_summary.get("pronunciation_feedback", {}),
-        "fluency_feedback": llm_summary.get("fluency_feedback", {}),
-        "interview_skills": llm_summary.get("interview_skills", {}),
-        "action_plan": llm_summary.get("action_plan", []),
-        "encouragement": llm_summary.get("encouragement", ""),
-        "next_practice_topics": llm_summary.get("next_practice_topics", [])
-    }
-    await db.complete_session(session_id, final_feedback=termination_response)
-
-    return termination_response
 
 
-@router.post("/practice")
-async def practice_interview(
-    request: Request,
-    name: str = Form(...),
-    native_language: str = Form(default="hi"),
-    target_language: str = Form(default="en"),
+
+
+
+
+@router.post("/practice_pronunciation")
+async def practice_pronunciation(
+    name: str = Form(default="User"),
     level: str = Form(default="B1"),
+    mode: str = Form(default="normal"),
+    native_language: str = Form(...),  
+    target_lang: str = Form(default="en"),  
+    topic: str = Form(default="daily life"),
+    num_words: int = Form(default=5),
+    set_number: int = Form(default=None),  
     audio_file: Optional[UploadFile] = File(default=None),
-    text_input: Optional[str] = Form(default=None),
     session_id: Optional[str] = Form(default=None),
-    action: Optional[str] = Form(default=None),  
-    model: Optional[str] = Form(default="gpt"),  
+    action: Optional[str] = Form(default=None),
+    model: Optional[str] = Form(default="gpt"),
     voice_id: Optional[str] = Form(default=None),
+    request: Request = None,
     current_user: User = Depends(get_current_user),
-
 ):
+
     """
-    interview practice api - CONVERSATIONAL ONBOARDING
+    pronunciation practice api - handles word and sentence practice
+    
+    modes:
+    - normal: llm-generated lessons with full analysis
+    - strict: vocab file based with 15 words, 3 sentences each
     
     flow:
-    1. first call (no audio/text): Clara greets and asks for role
-    2. user provides role: Clara asks for interview type
-    3. user provides type: interview begins with first question
-    4. subsequent calls: normal interview with analysis
-    5. action="end" or termination phrase: ends session
+    1. first call (no audio): creates session, returns first word
+    2. with audio: analyzes pronunciation, returns feedback
+    3. action="next": skip to next word/sentence
+    4. action="end": end session early
     """
+    
     try:
-        user_text = ""
-        audio_path = None
-
-        if not session_id or session_id.strip() == "" or session_id == "string":
+        
+        if action == "end" and session_id:
+            session = await db.get_user_session(session_id)
+            if session:
+                summary = await generate_session_summary(session, model=model)
+                native_lang = session.get("native_language", "en")
+                summary_bilingual = await make_bilingual(summary, "en", native_lang)
+                msg_en = "Session ended. Great practice!"
+                msg_target = msg_en if session.get("target_lang", "en") == "en" else await translate_text(msg_en, "en", session.get("target_lang", "en"))
+                msg_native = msg_target if native_lang == session.get("target_lang", "en") else await translate_text(msg_en, "en", native_lang)
+                
+                # Build response first, then save it
+                response = {
+                    "status": "complete",
+                    "session_id": session_id,
+                    "target_lang": session.get("target_lang", "en"),
+                    "native_lang": native_lang,
+                    "is_session_complete": True,
+                    "session_summary": summary_bilingual,
+                    "message": {"target": msg_target, "native": msg_native}
+                }
+                
+                await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
+                
+                return response
+            else:
+                
+                return {
+                    "status": "error",
+                    "session_id": session_id,
+                    "error": "Session not found or already expired. Cannot end a non-existent session."
+                }
+        
+        
+        session = None
+        if session_id:
+            session = await db.get_user_session(session_id)
+        
+        
+        if session and session.get("status") == "completed":
+            return {"status": "error", "session_id": session_id, "error": "This session has ended. Please start a new session."}
+        
+        if not session:
             session_id = str(uuid.uuid4())
-        
-        
-        session = await db.get_user_session(session_id)
-        session_exists = session is not None
-        native_language = session.get("native_language", native_language) if session else native_language
-        target_language = session.get("target_language", target_language) if session else target_language
-
-        native_language = normalize_language_code(native_language, default="en")
-        target_language = normalize_language_code(target_language, default="en")
-
-        if session_exists:
-            if session.get("native_language") != native_language or session.get("target_language") != target_language:
-                session["native_language"] = native_language
-                session["target_language"] = target_language
-                await db.update_session(session_id, session)
-        
-        
-        if session_exists and session.get("status") == "completed":
-            error_msg = await translate_text("This session has ended. Please start a new session.", "en", native_language)
-            return {"status": "error", "session_id": session_id, "error": error_msg} 
-        
-        if not session_exists:
+            
+            
+            if mode == "strict":
+                lesson = await build_lesson_strict(target_lang, num_words, set_number=set_number, model=model)
+            else:
+                lesson = await generate_lesson_llm(topic, num_words, target_lang, model=model)
+            
+            if not lesson:
+                return {
+                    "status": "error",
+                    "message": "failed to generate lesson. please try again."
+                }
+            
             
             session = {
-                "state": "welcome",  
-                "name": name, 
-                "scenario": None,  
-                "role": None,      
+                "user_name": name,
+                "mode": mode,
                 "level": level,
-                "native_language": native_language, 
-                "target_language": target_language,
-                "chat_history": [],
-                "scores": {"grammar": 0, "vocabulary": 0, "pronunciation": 0, "fluency": 0, "total_wpm": 0, "count": 0, "audio_count": 0},
-                "current_question": None, "current_hint": None, "turn_number": 0,
-                "last_overall_score": None, "retry_count": 0, "attempts": [],
-                "turn_history": [],  
-                "onboarding_retry": 0  
+                "native_language": native_language,  
+                "target_lang": target_lang,
+                "topic": topic,
+                "lesson": lesson,
+                "current_word_index": 0,
+                "current_phase": "word",
+                "current_sentence_index": 0,
+                "attempt_count": 0,
+                "history": [],
+                "scores": {"pronunciation": []},
+                "total_words": len(lesson),
+                "turn_history": []
             }
             await db.create_session(
                 session_id=session_id,
-                session_type="interview",
+                session_type="pronunciation",
                 data=session,
                 user_id=current_user.id if current_user else None,
                 user_name=name
             )
-        
-        
-        current_state = session.get("state", "interviewing") 
-        
-        
-        if current_state == "welcome" and not audio_file and not text_input:
-            greeting = f"Hi {name}! I'm {BOT_NAME}, your interview coach 🙂 So, which role are you ready for?"
             
-            greeting_target, greeting_native = await asyncio.gather(
-                translate_text(greeting, "en", target_language),
-                translate_text(greeting, "en", native_language)
-            )
             
-            session["state"] = "collecting_role"
-            session["chat_history"].append({"role": "assistant", "content": greeting})
-            await db.update_session(session_id, session)
+            first_word = lesson[0]
             
-            greeting_audio = await generate_tts_url(request, greeting_target, target_language, api_type="interview", voice_id=voice_id)
+            
+            greeting_en = f"Hi {name}! I'm Sara. Let's practice pronunciation together. Relax and speak naturally."
+            instruction_en = f"Listen carefully and repeat after me: {first_word['word']}"
+            greeting_target = greeting_en if target_lang == "en" else await translate_text(greeting_en, "en", target_lang)
+            instruction_target = instruction_en if target_lang == "en" else await translate_text(instruction_en, "en", target_lang)
+            greeting_native = greeting_target if native_language == target_lang else await translate_text(greeting_en, "en", native_language)
+            instruction_native = instruction_target if native_language == target_lang else await translate_text(instruction_en, "en", native_language)
+            
+            # Generate TTS audio URLs for greeting
+            greeting_audio = ""
+            if request:
+                greeting_audio = await generate_tts_url(request, greeting_target, target_lang, voice_id=voice_id)
+            
+            meaning_target = first_word.get(f"meaning_{target_lang}", first_word.get("meaning_en", ""))
+            meaning_native = first_word.get(f"meaning_{native_language}", "")
+            if not meaning_native:
+                source_lang = target_lang if first_word.get(f"meaning_{target_lang}") else "en"
+                meaning_native = await translate_text(meaning_target, source_lang, native_language)
             
             return {
-                "status": "onboarding",
-                "step": "collecting_role",
+                "status": "new_session",
                 "session_id": session_id,
-                "target_lang": target_language,
+                "target_lang": target_lang,
                 "native_lang": native_language,
-                "transcription": user_text,
-                "message": {"target": greeting_target, "native": greeting_native},
-                "audio_url": greeting_audio
+                "mode": mode,
+                "greeting": {"target": greeting_target, "native": greeting_native, "audio_url": greeting_audio},
+                "current_word": {
+                    "word": first_word["word"],
+                    "meaning": {
+                        "target": meaning_target,
+                        "native": meaning_native
+                    },
+                    "instruction": {"target": instruction_target, "native": instruction_native}
+                },
+                "phase": "word",
+                "attempt_number": 1,
+                "max_attempts": MAX_ATTEMPTS,
+                "progress": {
+                    "current_word_index": 1,
+                    "total_words": len(lesson),
+                    "completed_words": []
+                }
             }
         
         
-        if current_state == "collecting_role":
-            user_text = text_input or ""
-            if audio_file:
-                
-                user_text = await transcribe_audio_file(audio_file, target_language)
-            
-            if not user_text.strip():
-                error_msg = await translate_text("No speech detected. Please tell me which role you're preparing for.", "en", native_language)
-                return {"status": "error", "session_id": session_id, "error": error_msg}
-            
-            session["chat_history"].append({"role": "user", "content": user_text})
-            
-            
-            extraction = await extract_role_from_text(user_text, model=model)
-            
-            if extraction.get("success") and extraction.get("role"):
-                role = extraction["role"]
-                session["role"] = role
-                session["state"] = "collecting_type"
-                session["onboarding_retry"] = 0
-                
-                
-                ask_type = f"Great, {role}! Is this more of an HR interview, or would you prefer something else like behavioral or technical?"
-                ask_type_target, ask_type_native = await asyncio.gather(
-                    translate_text(ask_type, "en", target_language),
-                    translate_text(ask_type, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": ask_type})
-                await db.update_session(session_id, session)
-                
-                ask_type_audio = await generate_tts_url(request, ask_type_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_type", 
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "role": role,
-                    "message": {"target": ask_type_target, "native": ask_type_native},
-                    "audio_url": ask_type_audio
-                }
-            else:
-                
-                session["onboarding_retry"] = session.get("onboarding_retry", 0) + 1
-                retry_msg = "Could you be more specific about the role? For example: Software Engineer, Marketing Manager, Business Analyst, etc."
-                retry_target, retry_native = await asyncio.gather(
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": retry_msg})
-                await db.update_session(session_id, session)
-                
-                retry_audio = await generate_tts_url(request, retry_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_role",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "retry": True,
-                    "message": {"target": retry_target, "native": retry_native},
-                    "audio_url": retry_audio
-                }
-        
-        if current_state == "collecting_type":
-            user_text = text_input or ""
-            if audio_file:
-                
-                user_text = await transcribe_audio_file(audio_file, target_language)
-            
-            if not user_text.strip():
-                error_msg = await translate_text("No speech detected. Please tell me the interview type.", "en", native_language)
-                return {"status": "error", "session_id": session_id, "error": error_msg}
-            
-            session["chat_history"].append({"role": "user", "content": user_text})
-            
-            
-            extraction = await extract_interview_type_from_text(user_text, model=model)
-            
-            if extraction.get("success") and extraction.get("type"):
-                interview_type = extraction["type"]
-                session["scenario"] = interview_type
-                session["state"] = "interviewing"
-                session["onboarding_retry"] = 0
-                
-                
-                role = session.get("role", "Professional")
-                scenario_name = INTERVIEW_SCENARIOS.get(interview_type, interview_type.title() + " Interview")
-                
-                question, hint = await generate_interview_question(
-                    interview_type, role, level, name, model=model, target_language=target_language, turn_number=0
-                )
-                
-                start_msg = f"Perfect! Let's start your {scenario_name} practice for {role}."
-                start_target, start_native, q_native, h_native = await asyncio.gather(
-                    translate_text(start_msg, "en", target_language),
-                    translate_text(start_msg, "en", native_language),
-                    translate_text(question, target_language, native_language),
-                    translate_text(hint, target_language, native_language)
-                )
-                
-                session["current_question"] = question
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": question})
-                await db.update_session(session_id, session)
-                
-                question_audio = await generate_tts_url(request, question, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "interview_started",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "role": role,
-                    "scenario": interview_type,
-                    "greeting": {"target": start_target, "native": start_native},
-                    "next_question": {"target": question, "native": q_native},
-                    "hint": {"target": hint, "native": h_native},
-                    "turn_number": 0,
-                    "audio_url": question_audio
-                }
-            else:
-                
-                session["onboarding_retry"] = session.get("onboarding_retry", 0) + 1
-                retry_msg = "What type of interview would you like to practice? For example: HR, Technical, Sales, Marketing, Customer Service, or any other type?"
-                retry_target, retry_native = await asyncio.gather(
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                session["chat_history"].append({"role": "assistant", "content": retry_msg})
-                await db.update_session(session_id, session)
-                
-                retry_audio = await generate_tts_url(request, retry_target, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "onboarding",
-                    "step": "collecting_type",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "retry": True,
-                    "message": {"target": retry_target, "native": retry_native},
-                    "audio_url": retry_audio
-                }
+        lesson = session["lesson"]
+        current_idx = session["current_word_index"]
+        current_phase = session["current_phase"]
+        current_word = lesson[current_idx]
         
         
-        role = session.get("role", "Professional")
-        scenario = session.get("scenario", "general")
+        
+        native_lang = session.get("native_language", "en")
         
         if action == "next":
-            follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-            session["current_question"] = follow_up
-            session["current_hint"] = hint
-            session["chat_history"].append({"role": "assistant", "content": follow_up})
             
-            session["retry_count"] = 0
-            session["waiting_retry_decision"] = False  
-            session["retry_clarify_count"] = 0  
+            session_mode = session.get("mode", "normal")
             
-            
-            await db.update_session(session_id, session)
-            
-            follow_up_audio = await generate_tts_url(request, follow_up, target_language, api_type="interview", voice_id=voice_id)
-            
-            skipped_msg = await translate_text("Skipped", "en", target_language) if target_language != "en" else "Skipped"
-            skipped_next_msg = await translate_text("Skipped. Let's try this question!", "en", target_language) if target_language != "en" else "Skipped. Let's try this question!"
-
-            return {
-                "status": "continue", "session_id": session_id,
-                "target_lang": target_language, "native_lang": native_language,
-                "transcription": "(skipped)",
-                "next_question": {"target": follow_up, "native": await translate_text(follow_up, target_language, native_language)},
-                "hint": {"target": hint, "native": await translate_text(hint, target_language, native_language)},
-                "grammar": {"score": 0, "is_correct": True, "errors": [], "feedback": skipped_msg},
-                "vocabulary": {"score": 0, "overall_level": "skipped", "feedback": skipped_msg},
-                "pronunciation": {"accuracy": 0, "word_pronunciation_scores": [], "feedback": skipped_msg},
-                "fluency": {"score": 0, "wpm": 0, "speed_status": "skipped"},
-                "answer_evaluation": {"clarity": "", "structure": "", "relevance": "", "improved_answer": ""},
-                "personalized_feedback": {"message": skipped_next_msg, "improvement_areas": [], "strengths": []},
-                "overall_score": 0, "passing_score": PASSING_SCORE, "should_retry": False, "turn_number": session["turn_number"],
-                "audio_url": follow_up_audio
-            }
-        
-        if action == "end":
-            return await handle_session_termination(session, session_id, model)
-        
-        if not audio_file and not text_input:
-            
-            current_q = session.get("current_question")
-            current_h = session.get("current_hint", "")
-            
-            if current_q:
+            if current_phase == "word":
                 
-                q_native = await translate_text(current_q, target_language, native_language)
-                h_native = await translate_text(current_h, target_language, native_language)
+                session["current_phase"] = "sentence"
+                session["current_sentence_index"] = 0
+                session["attempt_count"] = 0
                 
-                current_q_audio = await generate_tts_url(request, current_q, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    "turn_number": session.get("turn_number", 0),
-                    "audio_url": current_q_audio
-                }
-            else:
-                
-                question, hint = await generate_interview_question(
-                    scenario, role, session.get("level", level), name, model=model, target_language=target_language, turn_number=session.get("turn_number", 0)
-                )
-                session["current_question"] = question
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": question})
-                await db.update_session(session_id, session)
-                
-                q_native = await translate_text(question, target_language, native_language)
-                h_native = await translate_text(hint, target_language, native_language)
-                
-                question_audio = await generate_tts_url(request, question, target_language, api_type="interview", voice_id=voice_id)
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": question, "native": q_native},
-                    "hint": {"target": hint, "native": h_native},
-                    "turn_number": session.get("turn_number", 0),
-                    "audio_url": question_audio
-                }
-        
-        user_text = text_input or ""
-        audio_path = None
-        audio_duration = 5.0
-        is_audio_input = audio_file is not None  
-        
-        if audio_file:
-            try:
-                audio_file.file.seek(0)
-            except Exception:
-                pass
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp:
-                shutil.copyfileobj(audio_file.file, tmp)
-                temp_upload = tmp.name
-            
-            try:
-                
-                def convert_audio():
-                    audio = AudioSegment.from_file(temp_upload)
-                    audio = audio.set_frame_rate(16000).set_channels(1)
-                    converted_path = temp_upload.replace('.tmp', '_converted.wav')
-                    audio.export(converted_path, format="wav")
-                    return converted_path, len(audio) / 1000
-                
-                audio_path, audio_duration = await asyncio.to_thread(convert_audio)
-                os.unlink(temp_upload)  
-            except Exception as e:
-                logger.debug(f"Audio conversion fallback: {e}")
-                audio_path = temp_upload
-            finally:
+                instruction_en = "Now practice this sentence."
+                instruction_target = instruction_en if target_lang == "en" else await translate_text(instruction_en, "en", target_lang)
+                instruction_native = instruction_target if native_lang == target_lang else await translate_text(instruction_en, "en", native_lang)
                 
                 
-                if audio_path != temp_upload and os.path.exists(temp_upload):
-                    try:
-                        os.unlink(temp_upload)
-                    except:
-                        pass
-        
-        if is_audio_input:
-            pronunciation = await analyze_pronunciation_llm(audio_path=audio_path, spoken_text=user_text, level=session.get("level", level), model=model, target_language=target_language)
-            
-            if pronunciation and pronunciation.get("transcription"):
-                user_text = pronunciation["transcription"]
-        else:
-            pronunciation = None   
-        
-        if audio_path:
-            try:
-                os.unlink(audio_path)
-            except Exception:
-                pass
-        
-        if not user_text or not user_text.strip():
-            error_msg = await translate_text("No speech detected. Please try again.", "en", native_language)
-            return {"status": "error", "session_id": session_id, "error": error_msg}
-        
-        user_text = user_text.strip()
-        session["chat_history"].append({"role": "user", "content": user_text})
-        
-        if session.get("waiting_retry_decision"):
-            user_choice = user_text.lower().strip()
-            
-            
-            cleaned_choice = user_choice.rstrip('.,!?')
-            if cleaned_choice in TERMINATION_PHRASES:
-                
-                session["waiting_retry_decision"] = False
-                return await handle_session_termination(session, session_id, model)
-            
-            retry_keywords = ["yes", "retry", "practice", "again", "try", "redo", "repeat", "once more", "one more"]
-            skip_keywords = ["no", "skip", "next", "move", "forward", "pass", "don't want", "not now", "let's move", "move on", "go ahead"]
-            
-            wants_retry = any(keyword in user_choice for keyword in retry_keywords)
-            wants_skip = any(keyword in user_choice for keyword in skip_keywords)
-            
-            if wants_retry:
-                
-                session["waiting_retry_decision"] = False  
-                session["retry_clarify_count"] = 0  
-                current_q = session.get("current_question", "")
-                current_h = session.get("current_hint", "")
-                session["chat_history"].append({"role": "assistant", "content": current_q})
-                await db.update_session(session_id, session)
-                
-                retry_msg = "Let's try this again! Take your time."
-                q_native, h_native, retry_msg_target, retry_msg_native = await asyncio.gather(
-                    translate_text(current_q, target_language, native_language),
-                    translate_text(current_h, target_language, native_language),
-                    translate_text(retry_msg, "en", target_language),
-                    translate_text(retry_msg, "en", native_language)
-                )
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    "message": {"target": retry_msg_target, "native": retry_msg_native},
-                    "turn_number": session.get("turn_number", 0)
-                }
-            elif wants_skip:
-                
-                session["waiting_retry_decision"] = False  
-                session["retry_clarify_count"] = 0  
-                follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-                session["current_question"] = follow_up
-                session["current_hint"] = hint
-                session["chat_history"].append({"role": "assistant", "content": follow_up})
-                session["retry_count"] = 0
-                
-                await db.update_session(session_id, session)
-                
-                follow_up_native, hint_native = await asyncio.gather(
-                    translate_text(follow_up, target_language, native_language),
-                    translate_text(hint, target_language, native_language)
-                )
-                
-                return {
-                    "status": "continue",
-                    "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "next_question": {"target": follow_up, "native": follow_up_native},
-                    "hint": {"target": hint, "native": hint_native},
-                    "turn_number": session["turn_number"]
-                }
-            else:
-                
-                clarify_count = session.get("retry_clarify_count", 0) + 1
-                session["retry_clarify_count"] = clarify_count
-                
-                
-                if clarify_count >= 3:
-                    session["waiting_retry_decision"] = False
-                    session["retry_clarify_count"] = 0
-                    
-                    auto_skip_msg = "I see you're having trouble deciding. Let's move on to the next question!"
-                    follow_up, hint = await generate_interactive_follow_up("", session["chat_history"], role, scenario, model=model, target_language=target_language)
-                    session["current_question"] = follow_up
-                    session["current_hint"] = hint
-                    session["chat_history"].append({"role": "assistant", "content": auto_skip_msg})
-                    session["chat_history"].append({"role": "assistant", "content": follow_up})
-                    session["retry_count"] = 0
-                    
-                    await db.update_session(session_id, session)
-                    
-                    auto_skip_target, auto_skip_native, follow_up_native, hint_native = await asyncio.gather(
-                        translate_text(auto_skip_msg, "en", target_language),
-                        translate_text(auto_skip_msg, "en", native_language),
-                        translate_text(follow_up, target_language, native_language),
-                        translate_text(hint, target_language, native_language)
-                    )
-                    
-                    return {
-                        "status": "auto_skipped",
-                        "session_id": session_id,
-                        "target_lang": target_language,
-                        "native_lang": native_language,
-                        "message": {"target": auto_skip_target, "native": auto_skip_native},
-                        "next_question": {"target": follow_up, "native": follow_up_native},
-                        "hint": {"target": hint, "native": hint_native},
-                        "turn_number": session["turn_number"],
-                        
-                        "grammar": None,
-                        "vocabulary": None,
-                        "pronunciation": None,
-                        "fluency": None,
-                        "answer_evaluation": None,
-                        "emotion": None,
-                        "personalized_feedback": None,
-                        "overall_score": None,
-                        "improvement": None
-                    }
-                else:
-                    
-                    current_q = session.get("current_question", "")
-                    current_h = session.get("current_hint", "")
-                    level = session.get("level", "B1")
-                    
-                    if is_audio_input:
-                        word_count = len(user_text.split())
-                        estimated_duration = max(1, word_count / 2.5)  
-                        grammar, vocabulary, answer_eval, pronunciation, fluency = await asyncio.gather(
-                            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-                            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-                            evaluate_answer(current_q, user_text, level, model=model, target_language=target_language),
-                            analyze_pronunciation_llm(audio_path=audio_path, spoken_text=user_text, level=level, model=model, target_language=target_language),
-                            analyze_fluency_metrics(user_text, estimated_duration)
-                        )
-                    else:
-                        
-                        grammar, vocabulary, answer_eval = await asyncio.gather(
-                            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-                            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-                            evaluate_answer(current_q, user_text, level, model=model, target_language=target_language)
-                        )
-                        pronunciation = None
-                        fluency = None
-                    
-                    
-                    if is_audio_input:
-                        scores = {
-                            "grammar": grammar.get("score", 70),
-                            "vocabulary": vocabulary.get("score", 70),
-                            "pronunciation": pronunciation.get("score", pronunciation.get("accuracy", 70)) if pronunciation else 0,
-                            "fluency": fluency.get("score", 70) if fluency else 0,
-                            "answer_evaluation": answer_eval.get("score", 50)
-                        }
-                        
-                        overall_score = int(
-                            scores["grammar"] * 0.25 +
-                            scores["vocabulary"] * 0.25 +
-                            scores["answer_evaluation"] * 0.25 +
-                            scores["pronunciation"] * 0.15 +
-                            scores["fluency"] * 0.10
-                        )
-                    else:
-                        scores = {
-                            "grammar": grammar.get("score", 70),
-                            "vocabulary": vocabulary.get("score", 70),
-                            "pronunciation": None,
-                            "fluency": None,
-                            "answer_evaluation": answer_eval.get("score", 50)
-                        }
-                        
-                        overall_score = int(
-                            scores["grammar"] * 0.33 +
-                            scores["vocabulary"] * 0.33 +
-                            scores["answer_evaluation"] * 0.34
-                        )
-
-                    
-                    
-                    emotion = {"emotion": "neutral", "confidence_level": "medium", "explanation": ""}
-                    personalized_feedback = await generate_personalized_feedback(
-                        overall_score, scores, emotion, session.get("name", "User"),
-                        grammar=grammar, vocabulary=vocabulary, 
-                        pronunciation=pronunciation, answer_eval=answer_eval, model=model,
-                        target_language=target_language
-                    )
-                    
-                    
-                    if clarify_count == 1:
-                        clarify_msg = "I heard you say something, but I'm not sure if you want to practice again or move on. Just say 'retry' or 'skip' - or you can try answering the question again!"
-                    else:
-                        clarify_msg = "Still not quite sure what you'd like to do. Say 'yes' to practice the same question, or 'skip' to get a new one. One more unclear response and I'll move you to the next question."
+                if "sentences" in current_word and current_word["sentences"]:
+                    sentence = current_word["sentences"][0]
+                    sentence_target = safe_get_sentence_text(sentence, target_lang)
+                    source_lang = target_lang if isinstance(sentence, dict) and sentence.get(target_lang) else "en"
+                    sentence_native = safe_get_sentence_text(sentence, native_lang) or await translate_text(sentence_target, source_lang, native_lang)
                     
                     
                     await db.update_session(session_id, session)
                     
+                    return {
+                        "status": "next_phase",
+                        "session_id": session_id,
+                        "target_lang": session.get("target_lang", "en"),
+                        "native_lang": native_lang,
+                        "current_word": {"word": current_word["word"]},
+                        "current_sentence": {
+                            "text": {"target": sentence_target, "native": sentence_native}
+                        },
+                        "phase": "sentence",
+                        "sentence_number": 1,
+                        "total_sentences": len(current_word["sentences"]),
+                        "instruction": {"target": instruction_target, "native": instruction_native},
+                        "progress": {
+                            "current_word_index": current_idx + 1,
+                            "total_words": len(lesson)
+                        }
+                    }
+                else:
                     
-                    if is_audio_input and pronunciation and fluency:
-                        (clarify_target, clarify_native, q_native, h_native, grammar_t, vocab_t, 
-                         pron_t, fluency_t, eval_t, personal_t) = await asyncio.gather(
-                            translate_text(clarify_msg, "en", target_language),
-                            translate_text(clarify_msg, "en", native_language),
-                            translate_text(current_q, target_language, native_language),
-                            translate_text(current_h, target_language, native_language),
-                            translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                            translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                            translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS),
-                            translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS),
-                            translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS),
-                            translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                        )
-                    else:
-                        (clarify_target, clarify_native, q_native, h_native, grammar_t, vocab_t, 
-                         eval_t, personal_t) = await asyncio.gather(
-                            translate_text(clarify_msg, "en", target_language),
-                            translate_text(clarify_msg, "en", native_language),
-                            translate_text(current_q, target_language, native_language),
-                            translate_text(current_h, target_language, native_language),
-                            translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                            translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                            translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS),
-                            translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                        )
-                        pron_t = None
-                        fluency_t = None
+                    sentence_en = current_word.get("sentence", f"Practice saying {current_word['word']}.")
+                    sentence_target = sentence_en if target_lang == "en" else await translate_text(sentence_en, "en", target_lang)
+                    sentence_native = await translate_text(sentence_target, target_lang if target_lang != "en" else "en", native_lang)
+                    
+                    
+                    await db.update_session(session_id, session)
                     
                     return {
-                        "status": "clarify_retry",
+                        "status": "next_phase",
                         "session_id": session_id,
-                        "target_lang": target_language,
-                        "native_lang": native_language,
-                        "transcription": user_text,
-                        "message": {"target": clarify_target, "native": clarify_native},
-                        "next_question": {"target": current_q, "native": q_native},
-                        "hint": {"target": current_h, "native": h_native},
-                        "grammar": grammar_t,
-                        "vocabulary": vocab_t,
-                        "pronunciation": pron_t,
-                        "fluency": fluency_t,
-                        "answer_evaluation": eval_t,
-                        "emotion": emotion,
-                        "personalized_feedback": personal_t,
-                        "overall_score": overall_score,
-                        "clarify_count": clarify_count,
-                        "turn_number": session.get("turn_number", 0)
+                        "target_lang": session.get("target_lang", "en"),
+                        "native_lang": native_lang,
+                        "current_word": {"word": current_word["word"]},
+                        "current_sentence": {
+                            "text": {"target": sentence_target, "native": sentence_native}
+                        },
+                        "phase": "sentence",
+                        "sentence_number": 1,
+                        "total_sentences": 1,
+                        "instruction": {"target": instruction_target, "native": instruction_native},
+                        "progress": {
+                            "current_word_index": current_idx + 1,
+                            "total_words": len(lesson)
+                        }
                     }
-
-        
-        
-        cleaned_text = user_text.lower().strip().rstrip('.,!?')
-        is_termination = cleaned_text in TERMINATION_PHRASES or action == "end"
-        
-        grammar, vocabulary, answer_eval = await asyncio.gather(
-            analyze_grammar_llm(user_text, level=level, model=model, target_language=target_language),
-            analyze_vocab_llm(user_text, level=level, model=model, target_language=target_language),
-            evaluate_answer(session.get("current_question", ""), user_text, level, model=model, target_language=target_language)
-        )
-        
-        
-        emotion = {"emotion": "neutral", "confidence_level": "medium", "explanation": ""}
-        
-        
-        if is_audio_input:
-            word_count = len(user_text.split())
-            fluency = calculate_fluency(word_count, audio_duration)
-        else:
-            fluency = None  
-
-        
-        
-        
-        
-        if not is_termination and session.get("current_question"):
-            relevance_check = await check_answer_relevance(session["current_question"], user_text, model=model, target_language=target_language)
-            
-            if not relevance_check.get("relevant", True):
+            else:
                 
-                redirect_msg = relevance_check.get("redirect")
-                if not redirect_msg:
-                    redirect_msg = "Let's stay on track! ????"
-                    if target_language != "en":
-                        redirect_msg = await translate_text(redirect_msg, "en", target_language)
-                current_q = session["current_question"]
-                current_h = session.get("current_hint", "")
+                sentence_idx = session.get("current_sentence_index", 0)
                 
                 
-                full_response = f"{redirect_msg}\n\n{current_q}"
-                session["chat_history"].append({"role": "assistant", "content": full_response})
+                if "sentences" in current_word and sentence_idx + 1 < len(current_word["sentences"]):
+                    
+                    session["current_sentence_index"] = sentence_idx + 1
+                    next_sentence = current_word["sentences"][session["current_sentence_index"]]
+                    next_sentence_target = safe_get_sentence_text(next_sentence, target_lang)
+                    source_lang = target_lang if isinstance(next_sentence, dict) and next_sentence.get(target_lang) else "en"
+                    sentence_native = safe_get_sentence_text(next_sentence, native_lang) or await translate_text(next_sentence_target, source_lang, native_lang)
+                    
+                    
+                    await db.update_session(session_id, session)
+                    
+                    return {
+                        "status": "next_sentence",
+                        "session_id": session_id,
+                        "target_lang": session.get("target_lang", "en"),
+                        "native_lang": native_lang,
+                        "current_word": {"word": current_word["word"]},
+                        "current_sentence": {
+                            "text": {"target": next_sentence_target, "native": sentence_native}
+                        },
+                        "phase": "sentence",
+                        "sentence_number": session["current_sentence_index"] + 1,
+                        "total_sentences": len(current_word["sentences"]),
+                        "progress": {
+                            "current_word_index": current_idx + 1,
+                            "total_words": len(lesson)
+                        }
+                    }
+                
+                
+                session["current_word_index"] += 1
+                session["current_phase"] = "word"
+                session["current_sentence_index"] = 0
+                session["attempt_count"] = 0
+                
+                if session["current_word_index"] >= len(lesson):
+                    
+                    summary = await generate_session_summary(session)
+                    
+                    summary_bilingual = await make_bilingual(summary, "en", native_lang)
+                    msg_en = "Excellent work! You've completed all words."
+                    msg_native = await translate_text(msg_en, "en", native_lang)
+                    
+                    # Build response first, then save it
+                    response = {
+                        "status": "complete",
+                        "session_id": session_id,
+                        "target_lang": session.get("target_lang", "en"),
+                        "native_lang": native_lang,
+                        "is_session_complete": True,
+                        "session_summary": summary_bilingual,
+                        "message": {"target": msg_en, "native": msg_native}
+                    }
+                    
+                    await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
+                    
+                    return response
+                
+                next_word = lesson[session["current_word_index"]]
+                instruction_en = f"Next word: {next_word['word']}"
+                instruction_target = instruction_en if target_lang == "en" else await translate_text(instruction_en, "en", target_lang)
+                instruction_native = instruction_target if native_lang == target_lang else await translate_text(instruction_en, "en", native_lang)
+                
+                
+                meaning_target = next_word.get(f"meaning_{target_lang}", next_word.get("meaning_en", ""))
+                meaning_native = next_word.get(f"meaning_{native_lang}", "")
+                if not meaning_native:
+                    source_lang = target_lang if next_word.get(f"meaning_{target_lang}") else "en"
+                    meaning_native = await translate_text(meaning_target, source_lang, native_lang)
+                
+                
                 await db.update_session(session_id, session)
                 
-                redirect_native, q_native, h_native, grammar_t, vocab_t, eval_t = await asyncio.gather(
-                    translate_text(redirect_msg, target_language, native_language),
-                    translate_text(current_q, target_language, native_language),
-                    translate_text(current_h, target_language, native_language),
-                    translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                    translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                    translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-                )
-                
-                
-                if is_audio_input and pronunciation and fluency:
-                    pron_t, fluency_t = await asyncio.gather(
-                        translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS),
-                        translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS)
-                    )
-                    scores = {
-                        "grammar": grammar.get("score", 75),
-                        "vocabulary": vocabulary.get("score", 75),
-                        "pronunciation": pronunciation.get("accuracy", 75),
-                        "fluency": fluency.get("score", 75)
-                    }
-                    answer_score = answer_eval.get("score", 50)
-                    overall_score = int(
-                        scores["grammar"] * 0.25 +
-                        scores["vocabulary"] * 0.25 +
-                        answer_score * 0.25 +
-                        scores["pronunciation"] * 0.15 +
-                        scores["fluency"] * 0.10
-                    )
-                else:
-                    pron_t = None
-                    fluency_t = None
-                    scores = {
-                        "grammar": grammar.get("score", 75),
-                        "vocabulary": vocabulary.get("score", 75),
-                        "pronunciation": None,
-                        "fluency": None
-                    }
-                    answer_score = answer_eval.get("score", 50)
-                    
-                    overall_score = int(
-                        scores["grammar"] * 0.33 +
-                        scores["vocabulary"] * 0.33 +
-                        answer_score * 0.34
-                    )
-
-                personalized_feedback = await generate_personalized_feedback(overall_score, scores, emotion, session["name"], model=model, target_language=target_language)
-                
-                
-                personal_t = await translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS)
-                
                 return {
-                    "status": "redirect",
+                    "status": "next_word",
                     "session_id": session_id,
-                    "target_lang": target_language,
-                    "native_lang": native_language,
-                    "transcription": user_text,
-                    "message": {"target": redirect_msg, "native": redirect_native},
-                    "next_question": {"target": current_q, "native": q_native},
-                    "hint": {"target": current_h, "native": h_native},
-                    
-                    "grammar": grammar_t,
-                    "vocabulary": vocab_t,
-                    "pronunciation": pron_t,
-                    "fluency": fluency_t,
-                    "answer_evaluation": eval_t,
-                    "emotion": emotion,
-                    "personalized_feedback": personal_t,
-                    "overall_score": overall_score,
-                    "passing_score": PASSING_SCORE,
-                    "improvement": None,  
-                    "turn_number": session.get("turn_number", 0)
+                    "target_lang": session.get("target_lang", "en"),
+                    "native_lang": native_lang,
+                    "current_word": {
+                        "word": next_word["word"],
+                        "meaning": {
+                            "target": meaning_target,
+                            "native": meaning_native
+                        },
+                        "instruction": {"target": instruction_target, "native": instruction_native}
+                    },
+                    "phase": "word",
+                    "attempt_number": 1,
+                    "max_attempts": MAX_ATTEMPTS,
+                    "progress": {
+                        "current_word_index": session["current_word_index"] + 1,
+                        "total_words": len(lesson)
+                    }
                 }
         
         
-        if is_termination:
-            return await handle_session_termination(session, session_id, model)
-
-        
-        
-        if is_audio_input:
-            scores = {
-                "grammar": grammar.get("score", 75),
-                "vocabulary": vocabulary.get("score", 75),
-                "pronunciation": pronunciation.get("accuracy", 75) if pronunciation else 0,
-                "fluency": fluency.get("score", 75) if fluency else 0
-            }
-        else:
-            scores = {
-                "grammar": grammar.get("score", 75),
-                "vocabulary": vocabulary.get("score", 75),
-                "pronunciation": None,  
-                "fluency": None  
-            }
-        
-        
-        answer_score = answer_eval.get("score", 50)
-        if is_audio_input:
-            
-            overall_score = int(
-                scores["grammar"] * 0.25 +
-                scores["vocabulary"] * 0.25 +
-                answer_score * 0.25 +
-                scores["pronunciation"] * 0.15 +
-                scores["fluency"] * 0.10
-            )
-        else:
-            
-            overall_score = int(
-                scores["grammar"] * 0.33 +
-                scores["vocabulary"] * 0.33 +
-                answer_score * 0.34
-            )
-        
-        
-        session["scores"]["grammar"] += scores["grammar"]
-        session["scores"]["vocabulary"] += scores["vocabulary"]
-        if is_audio_input:
-            session["scores"]["pronunciation"] += scores["pronunciation"]
-            session["scores"]["fluency"] += scores["fluency"]
-            session["scores"]["total_wpm"] += fluency.get("wpm", 100) if fluency else 100
-            session["scores"]["audio_count"] = session["scores"].get("audio_count", 0) + 1  
-        session["scores"]["answer"] = session["scores"].get("answer", 0) + answer_score  
-        session["scores"]["count"] += 1
-
-        session["turn_number"] += 1
-        
-
-        
-        
-        personalized_feedback, (follow_up_question, follow_up_hint) = await asyncio.gather(
-            generate_personalized_feedback(
-                overall_score, scores, emotion, session["name"],
-                grammar=grammar, vocabulary=vocabulary, 
-                pronunciation=pronunciation, answer_eval=answer_eval, model=model,
-                target_language=target_language
-            ),
-            generate_interactive_follow_up(user_text, session["chat_history"], role, scenario, model=model, target_language=target_language)
-        )
-        
-        
-        improvement = {}
-        is_retrying = session.get("retry_count", 0) > 0
-        prev_overall = session.get("last_overall_score")
-        
-        
-        if is_retrying and prev_overall is not None:
-            
-            current_attempt = {
-                "transcription": user_text,
-                "grammar": grammar,
-                "vocabulary": vocabulary,
-                "pronunciation": pronunciation,
-                "fluency": fluency,
-                "answer_evaluation": answer_eval,
-                "overall_score": overall_score
-            }
-            session.setdefault("attempts", []).append(current_attempt)
-            
-            
-            improvement = await compare_attempts(
-                session["attempts"], 
-                level="B1",  
-                user_type="professional", 
-                model=model,
-                target_language=target_language
-            )
-        else:
-            
-            current_attempt = {
-                "transcription": user_text,
-                "grammar": grammar,
-                "vocabulary": vocabulary,
-                "pronunciation": pronunciation,
-                "fluency": fluency,
-                "answer_evaluation": answer_eval,
-                "overall_score": overall_score
-            }
-            session.setdefault("attempts", []).append(current_attempt)
-        
-        
-        
-        session["last_scores"] = scores.copy()
-        session["last_overall_score"] = overall_score
-        
-        
-        if "turn_history" not in session:
-            session["turn_history"] = []
-        
-        turn_data = {
-            "turn_number": session["turn_number"],
-            "turn": session["turn_number"],  
-            "transcription": user_text,
-            "question": session.get("current_question", ""),
-            "scores": scores.copy(),
-            "overall_score": overall_score,
-            "wpm": fluency.get("wpm", 0) if fluency else 0,  
-            "grammar": grammar,
-            "vocabulary": vocabulary,
-            "pronunciation": pronunciation,
-            "fluency": fluency,
-            "answer_evaluation": answer_eval,
-            "emotion": emotion,
-            "personalized_feedback": personalized_feedback,
-            "improvement": improvement
-        }
-        session["turn_history"].append(turn_data)
-        
-        
-        should_retry = (overall_score < PASSING_SCORE or action == "practice")
-        
-        if should_retry:
-            session["retry_count"] = session.get("retry_count", 0) + 1
-            session["waiting_retry_decision"] = True  
-            current_q = session.get("current_question", "")
-            current_h = session.get("current_hint", "")
-            
-            
-            retry_ask = "I see your answer, but it could be stronger. Would you like to practice this question again?"
-            
-            
-            base_tasks = [
-                translate_text(retry_ask, "en", target_language),
-                translate_text(retry_ask, "en", native_language),
-                translate_text(current_q, target_language, native_language),
-                translate_text(current_h, target_language, native_language),
-                translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-            ]
-            base_results = await asyncio.gather(*base_tasks)
-            retry_ask_target, retry_ask_native, q_native, h_native, grammar_t, vocab_t, eval_t = base_results
-            
-            
-            pron_t = await translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS) if pronunciation else None
-            fluency_t = await translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS) if fluency else None
-            
-            await db.update_session(session_id, session, overall_score=overall_score)
-            
-            retry_ask_audio = await generate_tts_url(request, retry_ask_target, target_language, api_type="interview")
-            
+        if not audio_file:
+            msg_en = "please provide audio to continue"
+            msg_native = await translate_text(msg_en, "en", native_lang)
             return {
-                "status": "feedback",
+                "status": "waiting_audio",
                 "session_id": session_id,
-                "target_lang": target_language,
-                "native_lang": native_language,
-                "transcription": user_text,
-                "message": {"target": retry_ask_target, "native": retry_ask_native},
-                "next_question": {"target": current_q, "native": q_native},
-                "hint": {"target": current_h, "native": h_native},
-                "grammar": grammar_t,
-                "vocabulary": vocab_t,
-                "pronunciation": pron_t,
-                "fluency": fluency_t,
-                "answer_evaluation": eval_t,
-                "emotion": emotion,
-                "personalized_feedback": personalized_feedback,
-                "overall_score": overall_score,
-                "passing_score": PASSING_SCORE,
-                "should_retry": True,
-                "retry_count": session.get("retry_count", 1),
-                "improvement": improvement,
-                "turn_number": session["turn_number"],
-                "audio_url": retry_ask_audio
+                "target_lang": session.get("target_lang", "en"),
+                "native_lang": native_lang,
+                "message": {"target": msg_en, "native": msg_native},
+                "current_word": {"word": current_word["word"]},
+                "phase": current_phase
             }
-        else:
+        
+        temp_dir = tempfile.mkdtemp()
+        audio_path = os.path.join(temp_dir, f"audio_{session_id}.wav")
+        
+        try:
             
-            session["current_question"] = follow_up_question
-            session["current_hint"] = follow_up_hint
-            session["chat_history"].append({"role": "assistant", "content": follow_up_question})
-            session["retry_count"] = 0
+            content = await audio_file.read()
+            original_filename = audio_file.filename or "audio.wav"
+            original_ext = os.path.splitext(original_filename)[1].lower()
+            temp_input_path = os.path.join(temp_dir, f"input_{session_id}{original_ext or '.wav'}")
             
-            
-            base_tasks = [
-                translate_text(follow_up_question, target_language, native_language),
-                translate_text(follow_up_hint, target_language, native_language),
-                translate_analysis(grammar, target_language, native_language, GRAMMAR_FIELDS),
-                translate_analysis(vocabulary, target_language, native_language, VOCAB_FIELDS),
-                translate_analysis(personalized_feedback, target_language, native_language, PERSONAL_FIELDS),
-                translate_analysis(answer_eval, target_language, native_language, EVAL_FIELDS)
-            ]
-            base_results = await asyncio.gather(*base_tasks)
-            follow_up_native, hint_native, grammar_t, vocab_t, personal_t, eval_t = base_results
+            with open(temp_input_path, "wb") as f:
+                f.write(content)
             
             
-            pron_t = await translate_analysis(pronunciation, target_language, native_language, PRON_FIELDS) if pronunciation else None
-            fluency_t = await translate_analysis(fluency, target_language, native_language, FLUENCY_FIELDS) if fluency else None
+            if original_ext in ['.mp3', '.m4a', '.ogg', '.flac', '.aac', '.webm']:
+                try:
+                    from pydub import AudioSegment
+                    audio = AudioSegment.from_file(temp_input_path)
+                    audio.export(audio_path, format="wav")
+                except Exception as conv_err:
+                    logger.warning(f"Audio conversion failed, using original: {conv_err}")
+                    shutil.copy(temp_input_path, audio_path)
+            else:
+                
+                shutil.copy(temp_input_path, audio_path)
             
-            await db.update_session(session_id, session, overall_score=overall_score)
             
-            follow_up_audio = await generate_tts_url(request, follow_up_question, target_language, api_type="interview")
+            target_lang_for_audio = session.get("target_lang", "en")
+            transcription = await transcribe_audio(audio_path, target_lang_for_audio)
             
-            return {
-                "status": "continue", "session_id": session_id, 
-                "target_lang": target_language, "native_lang": native_language,
-                "transcription": user_text,
-                "next_question": {"target": follow_up_question, "native": follow_up_native},
-                "hint": {"target": follow_up_hint, "native": hint_native},
-                "grammar": grammar_t, "vocabulary": vocab_t, "pronunciation": pron_t, "fluency": fluency_t,
-                "answer_evaluation": eval_t, "emotion": emotion,
-                "personalized_feedback": personal_t,
-                "overall_score": overall_score, "passing_score": PASSING_SCORE,
-                "improvement": improvement,  
-                "should_retry": False, "turn_number": session["turn_number"],
-                "audio_url": follow_up_audio
-            }
+            if not transcription:
+                
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return {
+                    "status": "transcription_failed",
+                    "session_id": session_id,
+                    "message": "could not understand audio. please try again.",
+                    "phase": current_phase
+                }
+
+            
+            
+            if current_phase == "word":
+                expected = current_word["word"]
+                
+                
+                word_analysis = await analyze_word_pronunciation(audio_path, expected, target_lang_for_audio)
+                score = word_analysis["score"]
+                transcription = word_analysis["transcription"] or transcription
+                
+                
+                try:
+                    from pydub import AudioSegment
+                    audio_for_wpm = AudioSegment.from_file(audio_path)
+                    audio_duration_seconds = len(audio_for_wpm) / 1000
+                    word_count = len(transcription.split()) if transcription else 1
+                    word_wpm = int((word_count / audio_duration_seconds) * 60) if audio_duration_seconds > 0 else 120
+                except:
+                    word_wpm = 120  
+                
+                # Calculate speed_status for word
+                if word_wpm < 100:
+                    word_speed_status = "slow"
+                elif word_wpm <= 150:
+                    word_speed_status = "normal"
+                else:
+                    word_speed_status = "fast"
+                
+                session["attempt_count"] += 1
+                
+                feedback = await generate_word_feedback(expected, transcription, score, session["attempt_count"], word_analysis, model=model)
+                
+                session["history"].append({
+                    "phase": "word",
+                    "word": {  
+                        "target": current_word["word"],
+                        "meaning_en": current_word.get("meaning_en", ""),
+                        "meaning_native": current_word.get(f"meaning_{session.get('native_language', 'hi')}", current_word.get("meaning_native", ""))
+                    },
+                    "expected": expected,
+                    "spoken": transcription,
+                    "score": score,
+                    "attempt": session["attempt_count"],
+                    "confidence": word_analysis.get("confidence", 0),
+                    "wpm": word_wpm,
+                    "speed_status": word_speed_status,
+                    "pronunciation_analysis": word_analysis,
+                    # Store feedback text for /feedback endpoint
+                    "feedback_message": feedback.get("message", ""),
+                    "feedback_tip": feedback.get("tip", ""),
+                    "feedback_status": feedback.get("status", "")
+                })
+                session["scores"]["pronunciation"].append(score)
+                
+                syllable_guide = None
+                if word_analysis.get("needs_practice"):
+                    
+                    syllable_cache = session.get("syllable_cache", {})
+                    if expected.lower() in syllable_cache:
+                        syllable_guide = syllable_cache[expected.lower()]
+                    else:
+                        syllable_guide = await generate_syllable_guide(expected, model=model)
+                        
+                        if "syllable_cache" not in session:
+                            session["syllable_cache"] = {}
+                        session["syllable_cache"][expected.lower()] = syllable_guide
+                
+                
+                current_attempt = session["attempt_count"]
+                
+                
+                if feedback["next_action"] == "next_phase":
+                    session["current_phase"] = "sentence"
+                    session["current_sentence_index"] = 0
+                    session["attempt_count"] = 0
+                
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                
+                
+                await db.update_session(session_id, session)
+                
+                
+                feedback_target = feedback["message"] if target_lang_for_audio == "en" else await translate_text(feedback["message"], "en", target_lang_for_audio)
+                feedback_native = feedback_target if native_lang == target_lang_for_audio else await translate_text(feedback["message"], "en", native_lang)
+                
+                # Generate TTS audio URL for feedback
+                feedback_audio = ""
+                if request:
+                    feedback_audio = await generate_tts_url(request, feedback_target, session.get("target_lang", "en"), voice_id=voice_id)
+                
+                response = {
+                    "status": feedback["status"],
+                    "session_id": session_id,
+                    "target_lang": session.get("target_lang", "en"),
+                    "native_lang": native_lang,
+                    "transcription": transcription,
+                    "pronunciation_score": score,
+                    "feedback": {"target": feedback_target, "native": feedback_native, "audio_url": feedback_audio},
+                    "current_word": {"word": current_word["word"]},
+                    "phase": "word" if feedback["next_action"] == "retry" else "sentence",
+                    "attempt_number": current_attempt,
+                    "max_attempts": MAX_ATTEMPTS,
+                    "next_action": feedback["next_action"],
+                    "progress": {
+                        "current_word_index": current_idx + 1,
+                        "total_words": len(lesson)
+                    },
+                    
+                    "analysis": {
+                        "pronunciation": {
+                            "score": score,
+                            "confidence": word_analysis.get("confidence", 0),
+                            "expected": expected,
+                            "spoken": transcription,
+                            "detected": word_analysis.get("detected", False),
+                            "match_type": word_analysis.get("match_type", "unknown")
+                        }
+                    }
+                }
+                
+                
+                if syllable_guide:
+                    response["syllable_guide"] = syllable_guide
+                
+                
+                if feedback["next_action"] == "next_phase":
+                    
+                    if "sentences" in current_word and current_word["sentences"]:
+                        sentence = current_word["sentences"][0]
+                        sentence_target = safe_get_sentence_text(sentence, target_lang)
+                        source_lang = target_lang if isinstance(sentence, dict) and sentence.get(target_lang) else "en"
+                        sentence_native = safe_get_sentence_text(sentence, native_lang) or await translate_text(sentence_target, source_lang, native_lang)
+                        response["current_sentence"] = {
+                            "text": {"target": sentence_target, "native": sentence_native}
+                        }
+                        response["sentence_number"] = 1
+                        response["total_sentences"] = len(current_word["sentences"])
+                    else:
+                        
+                        sentence_en = current_word.get("sentence", "")
+                        sentence_target = sentence_en if target_lang == "en" else await translate_text(sentence_en, "en", target_lang) if sentence_en else ""
+                        sentence_native = current_word.get(f"sentence_{native_lang}", "") or await translate_text(sentence_target, target_lang if target_lang != "en" else "en", native_lang) if sentence_target else ""
+                        response["current_sentence"] = {
+                            "text": {"target": sentence_target, "native": sentence_native},
+                            "example": current_word.get("example", "")
+                        }
+                        response["sentence_number"] = 1
+                        response["total_sentences"] = 1
+                
+                return response
+            
+            
+            else:
+                
+                sentence_idx = session.get("current_sentence_index", 0)
+                if "sentences" in current_word and current_word["sentences"]:
+                    sentences = current_word["sentences"]
+                    current_sentence = sentences[sentence_idx]
+                    expected = safe_get_sentence_text(current_sentence, target_lang)
+                else:
+                    
+                    expected = current_word.get("sentence", "")
+                
+                
+                sentence_analysis = await analyze_sentence_pronunciation(audio_path, expected, transcription, target_lang_for_audio)
+                score = sentence_analysis["score"]
+                
+                analysis = {
+                    "pronunciation": {
+                        "score": score,
+                        "expected": expected,
+                        "spoken": transcription,
+                        "mismatches": sentence_analysis.get("mismatches", []),
+                        "mismatch_count": sentence_analysis.get("mismatch_count", 0),
+                        "mispronounced_words": sentence_analysis.get("mispronounced_words", []),
+                        "well_pronounced_words": sentence_analysis.get("well_pronounced_words", []),
+                        "fluency": sentence_analysis.get("fluency", {}),
+                        "accuracy_percentage": sentence_analysis.get("accuracy_percentage", 0)
+                    }
+                }
+                
+                # Get speed_status from fluency analysis
+                sentence_speed_status = sentence_analysis.get("fluency", {}).get("speed_status", "normal")
+                
+                feedback = await generate_sentence_feedback(expected, transcription, score, analysis, model=model)
+                
+                session["history"].append({
+                    "phase": "sentence",
+                    "word": {  
+                        "target": current_word["word"],
+                        "meaning_en": current_word.get("meaning_en", ""),
+                        "meaning_native": current_word.get(f"meaning_{session.get('native_language', 'hi')}", current_word.get("meaning_native", ""))
+                    },
+                    "expected": expected,
+                    "spoken": transcription,
+                    "score": score,
+                    "mismatches": sentence_analysis.get("mismatches", []),
+                    "wpm": sentence_analysis.get("fluency", {}).get("wpm", 120),
+                    "speed_status": sentence_speed_status,
+                    "pronunciation_analysis": sentence_analysis,
+                    # Store feedback text for /feedback endpointttttt
+                    "feedback_message": feedback.get("message", ""),
+                    "feedback_tip": feedback.get("tip", ""),
+                    "feedback_status": feedback.get("status", ""),
+                    "focus_word": feedback.get("focus_word", ""),
+                    "fluency_note": feedback.get("fluency_note", "")
+                })
+                session["scores"]["pronunciation"].append(score)
+                
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                
+                
+                next_action = "next_word"
+                is_complete = False
+                
+                
+                if "sentences" in current_word and current_word["sentences"]:
+                    sentence_idx = session.get("current_sentence_index", 0)
+                    if sentence_idx + 1 < len(current_word["sentences"]):
+                        session["current_sentence_index"] = sentence_idx + 1
+                        next_action = "next_sentence"
+                    else:
+                        
+                        session["current_word_index"] += 1
+                        session["current_phase"] = "word"
+                        session["current_sentence_index"] = 0
+                        session["attempt_count"] = 0
+                        
+                        if session["current_word_index"] >= len(lesson):
+                            is_complete = True
+                            next_action = "complete"
+                else:
+                    
+                    session["current_word_index"] += 1
+                    session["current_phase"] = "word"
+                    session["attempt_count"] = 0
+                    
+                    if session["current_word_index"] >= len(lesson):
+                        is_complete = True
+                        next_action = "complete"
+                
+                
+                feedback_target = feedback["message"] if target_lang_for_audio == "en" else await translate_text(feedback["message"], "en", target_lang_for_audio)
+                feedback_native = feedback_target if native_lang == target_lang_for_audio else await translate_text(feedback["message"], "en", native_lang)
+                
+                # Generate TTS audio URL for feedback
+                feedback_audio = ""
+                if request:
+                    feedback_audio = await generate_tts_url(request, feedback_target, session.get("target_lang", "en"), voice_id=voice_id)
+                
+                response_status = "complete" if is_complete else feedback["status"]
+                
+                response = {
+                    "status": response_status,
+                    "session_id": session_id,
+                    "target_lang": session.get("target_lang", "en"),
+                    "native_lang": native_lang,
+                    "transcription": transcription,
+                    "pronunciation_score": score,
+                    "feedback": {"target": feedback_target, "native": feedback_native, "audio_url": feedback_audio},
+                    "analysis": analysis,
+                    "current_word": {"word": current_word["word"]},
+                    "phase": "sentence",
+                    "next_action": next_action,
+                    "is_session_complete": is_complete,
+                    "progress": {
+                        "current_word_index": session["current_word_index"] + 1 if not is_complete else len(lesson),
+                        "total_words": len(lesson)
+                    }
+                }
+                
+                
+                if is_complete:
+                    summary = await generate_session_summary(session, model=model)
+                    
+                    summary_bilingual = await make_bilingual(summary, "en", native_lang)
+                    msg_en = "Excellent work! You've completed the session."
+                    msg_target = msg_en if session.get("target_lang", "en") == "en" else await translate_text(msg_en, "en", session.get("target_lang", "en"))
+                    msg_native = msg_target if native_lang == session.get("target_lang", "en") else await translate_text(msg_en, "en", native_lang)
+                    
+                    response = {
+                        "status": "complete",
+                        "session_id": session_id,
+                        "target_lang": session.get("target_lang", "en"),
+                        "native_lang": native_lang,
+                        "is_session_complete": True,
+                        "session_summary": summary_bilingual,
+                        "message": {"target": msg_target, "native": msg_native}
+                    }
+                    
+                    await db.complete_session(session_id, final_feedback=summary_bilingual, termination_response=response)
+                    return response
+                    
+                elif next_action == "next_sentence" and "sentences" in current_word:
+                    next_sentence = current_word["sentences"][session["current_sentence_index"]]
+                    next_sentence_target = safe_get_sentence_text(next_sentence, target_lang)
+                    source_lang = target_lang if isinstance(next_sentence, dict) and next_sentence.get(target_lang) else "en"
+                    sentence_native = safe_get_sentence_text(next_sentence, native_lang) or await translate_text(next_sentence_target, source_lang, native_lang)
+                    response["current_sentence"] = {
+                        "text": {"target": next_sentence_target, "native": sentence_native}
+                    }
+                    response["sentence_number"] = session["current_sentence_index"] + 1
+                    response["total_sentences"] = len(current_word["sentences"])
+                elif next_action == "next_word" and session["current_word_index"] < len(lesson):
+                    next_word = lesson[session["current_word_index"]]
+                    
+                    meaning_target = next_word.get(f"meaning_{target_lang}", next_word.get("meaning_en", ""))
+                    meaning_native = next_word.get(f"meaning_{native_lang}", "")
+                    if not meaning_native:
+                        source_lang = target_lang if next_word.get(f"meaning_{target_lang}") else "en"
+                        meaning_native = await translate_text(meaning_target, source_lang, native_lang)
+                    response["next_word"] = {
+                        "word": next_word["word"],
+                        "meaning": {
+                            "target": meaning_target,
+                            "native": meaning_native
+                        }
+                    }
+                
+                
+                await db.update_session(session_id, session)
+                
+                return response
+        
+        except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise e
     
     except Exception as e:
-        logger.exception(f"Error in practice_interview: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.get("/sessions")
-async def list_sessions():
-    """list active interview sessions from database"""
-    sessions_list = await db.list_sessions(session_type="interview")
-    return {"active_sessions": len(sessions_list), "sessions": sessions_list}
+        logger.error(f"pronunciation api error: {e}")
+        return {
+            "status": "error",
+            "message": f"an error occurred: {str(e)}"
+        }
 
 
-@router.get("/sessions/{session_id}")
-async def get_session_data(session_id: str):
-    """get complete session history including all responses, feedback, and analysis"""
+
+
+
+
+@router.get("/list_pronunciation_sessions")
+async def list_pronunciation_sessions():
+    """list active pronunciation sessions from database"""
+    sessions_list = await db.list_sessions(session_type="pronunciation")
+    return {"sessions": sessions_list}
+
+
+@router.get("/pronunciation_session/{session_id}")
+async def get_pronunciation_session(session_id: str):
+    """get pronunciation session data from database"""
     session_data = await db.get_user_session(session_id)
     if session_data:
-        
-        count = max(1, session_data.get("scores", {}).get("count", 1))
-        raw_scores = session_data.get("scores", {})
-        audio_count = raw_scores.get("audio_count", 0)
-        if not audio_count and (raw_scores.get("pronunciation", 0) > 0 or raw_scores.get("fluency", 0) > 0):
-            audio_count = count
-        
-        average_scores = {
-            "grammar": int(raw_scores.get("grammar", 0) / count),
-            "vocabulary": int(raw_scores.get("vocabulary", 0) / count),
-            "pronunciation": int(raw_scores.get("pronunciation", 0) / audio_count) if audio_count > 0 else None,
-            "fluency": int(raw_scores.get("fluency", 0) / audio_count) if audio_count > 0 else None,
-        }
-        
-        if audio_count > 0:
-            overall_average = int(sum(v for v in average_scores.values() if v is not None) / 4)
-        else:
-            overall_average = int((average_scores["grammar"] + average_scores["vocabulary"]) / 2)
-        average_wpm = int(raw_scores.get("total_wpm", 0) / audio_count) if audio_count > 0 else 0
-        
-        
-        session_status = session_data.get("status", "active")
-        is_completed = session_status == "completed"
-        
-        response = {
-            "status": "success",
-            "session_id": session_id,
-            "session_status": session_status,  
-            "can_continue": not is_completed,  
-            "user_name": session_data.get("name", ""),
-            "scenario": session_data.get("scenario", ""),
-            "role": session_data.get("role", ""),
-            "level": session_data.get("level", ""),
-            "current_state": session_data.get("state", "interviewing"),
-            "turns_completed": session_data.get("turn_number", 0),
-            "average_scores": average_scores,
-            "overall_score": overall_average,
-            "average_wpm": average_wpm,
-            "last_score": session_data.get("last_overall_score"),
-            "last_scores": session_data.get("last_scores", {}),
+        return {"status": "success", "session_id": session_id, "data": session_data}
+    return {"status": "not_found", "session_id": session_id}
 
-            "chat_history": session_data.get("chat_history", []),
-            
-            "turn_history": session_data.get("turn_history", []),
-        }
-        
-        
-        if is_completed and session_data.get("final_feedback"):
-            response["final_feedback"] = session_data["final_feedback"]
-        
-        return response
+
+@router.get("/get_practice_modes")
+async def get_practice_modes():
+    """get available practice modes with feature details"""
     
-    raise HTTPException(status_code=404, detail="Session not found")
-
-
-@router.get("/scenarios")
-async def get_scenarios():
-    """get available interview scenarios"""
-    return {"scenarios": INTERVIEW_SCENARIOS}
-
-
-@router.get("/final_feedback/{session_id}")
-async def get_interview_feedback(session_id: str):
-    """
-    Get the exact same response as session termination.
-    Returns the stored final_feedback from DB with keys in the same order as termination response.
-    """
-    session = await db.get_user_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Session not completed yet")
-    final_feedback = session.get("final_feedback")
-    if not final_feedback:
-        raise HTTPException(status_code=404, detail="Final feedback not found")
-    
-    ordered_response = {
-        "status": final_feedback.get("status", "conversation_ended"),
-        "session_id": final_feedback.get("session_id", session_id),
-        "target_lang": final_feedback.get("target_lang", session.get("target_language", "en")),
-        "native_lang": final_feedback.get("native_lang", session.get("native_language", "hi")),
-        "final_scores": final_feedback.get("final_scores", {}),
-        "overall_score": final_feedback.get("overall_score", 0),
-        "passing_score": final_feedback.get("passing_score", PASSING_SCORE),
-        "average_wpm": final_feedback.get("average_wpm", 0),
-        "wpm_per_turn": final_feedback.get("wpm_per_turn", []),
-        "wpm_status": final_feedback.get("wpm_status", "normal"),
-        "vocab_overall": final_feedback.get("vocab_overall", {}),
-        "strengths": final_feedback.get("strengths", []),
-        "improvement_areas": final_feedback.get("improvement_areas", []),
-        "total_turns": final_feedback.get("total_turns", 0),
-        "turn_history": final_feedback.get("turn_history", []),
-        "turn_feedback": final_feedback.get("turn_feedback", []),
-        "summary": final_feedback.get("summary", {}),
-        "overall_assessment": final_feedback.get("overall_assessment", ""),
-        "grammar_feedback": final_feedback.get("grammar_feedback", {}),
-        "vocabulary_feedback": final_feedback.get("vocabulary_feedback", {}),
-        "pronunciation_feedback": final_feedback.get("pronunciation_feedback", {}),
-        "fluency_feedback": final_feedback.get("fluency_feedback", {}),
-        "interview_skills": final_feedback.get("interview_skills", {}),
-        "action_plan": final_feedback.get("action_plan", []),
-        "encouragement": final_feedback.get("encouragement", ""),
-        "next_practice_topics": final_feedback.get("next_practice_topics", [])
+    common_features = {
+        "wer_score": True,
+        "word_level_confidence": True,
+        "mispronounced_words_list": True,
+        "wpm_tracking": True,
+        "pause_detection": True,
+        "detailed_feedback": True
     }
-    
-    return ordered_response
-@router.get("/user_sessions")
-async def get_interview_sessions_by_user(
-    role: Optional[str] = None,
-    current_user: User = Depends(get_current_user)
-):
-    """
-    Get all Interview sessions for the authenticated user.
-    
-    Optionally filter by role (e.g., 'software', 'marketing', 'sales').
-    Returns sessions with session_ids included.
-    """
-    user_id = current_user.id
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-    
-    
-    if role:
-        filtered_sessions = []
-        for session in sessions:
-            session_data = await db.get_user_session(session.get("session_id"))
-            if session_data and session_data.get("role") == role:
-                session["role"] = role
-                filtered_sessions.append(session)
-        sessions = filtered_sessions
-    else:
-        
-        for session in sessions:
-            session_data = await db.get_user_session(session.get("session_id"))
-            if session_data:
-                session["role"] = session_data.get("role", "unknown")
-    
-    for idx, session in enumerate(sessions, 1):
-        session["session_number"] = f"Session {idx}"
-    
-    session_ids = [s.get("session_id") for s in sessions]
     
     return {
-        "user_id": user_id,
-        "total_sessions": len(sessions),
-        "filter": {"role": role} if role else None,
-        "session_ids": session_ids,
-        "sessions": sessions
+        "modes": [
+            {
+                "id": "normal",
+                "name": "Normal Mode",
+                "description": "LLM-generated lessons based on topic. Full pronunciation analysis.",
+                "words_per_session": "configurable via num_words",
+                "sentences_per_word": SENTENCES_PER_WORD_NORMAL,
+                "features": common_features
+            },
+            {
+                "id": "strict",
+                "name": "Strict Mode",
+                "description": "Vocabulary file-based lessons with configurable word count. Full pronunciation analysis.",
+                "words_per_session": "configurable via num_words",
+                "sentences_per_word": SENTENCES_PER_WORD_STRICT,
+                "features": common_features
+            }
+        ],
+        "feature_descriptions": {
+            "wer_score": "Word Error Rate based pronunciation score (0-100%)",
+            "word_level_confidence": "Per-word pronunciation confidence from speech recognition",
+            "mispronounced_words_list": "List of words with low confidence that need practice",
+            "wpm_tracking": "Words per minute speaking speed analysis",
+            "pause_detection": "Detection of speaking speed (slow/normal/fast)",
+            "detailed_feedback": "AI-generated feedback with improvement tips"
+        }
     }
+
+
+@router.get("/pronunciation_vocab")
+async def get_pronunciation_vocab():
+    """Get all pronunciation vocabulary from database"""
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("SELECT id, word, meaning_en, sentences, set_number, created_at FROM pronunciation_vocab ORDER BY id")
+        )
+        rows = result.fetchall()
+        vocab_list = []
+        for row in rows:
+            vocab_list.append({
+                "id": row[0],
+                "word": row[1],
+                "meaning_en": row[2],
+                "sentences": row[3] if isinstance(row[3], list) else json.loads(row[3]) if row[3] else [],
+                "set_number": row[4],
+                "created_at": str(row[5]) if row[5] else None
+            })
+        return {
+            "status": "success",
+            "total": len(vocab_list),
+            "vocabulary": vocab_list
+        }
+
+
+@router.post("/pronunciation_vocab/upload")
+async def upload_pronunciation_vocab(
+    file: UploadFile = File(...),
+    replace_all: bool = Form(default=False),
+    default_set_number: int = Form(default=None)  
+):
+    """
+    Upload pronunciation vocabulary from Excel file.
+    
+    Excel format (with optional set_number column):
+    | set_number | word | meaning_en | sentence_1 | sentence_2 | sentence_3 |
+    
+    Or:
+    | word | meaning_en | sentences (comma-separated) |
+    
+    If set_number column not in Excel, uses default_set_number param.
+    """
+    import pandas as pd
+    import io
+    
+    
+    content = await file.read()
+    
+    try:
+        
+        if file.filename.endswith('.xlsx') or file.filename.endswith('.xls'):
+            df = pd.read_excel(io.BytesIO(content))
+        elif file.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(content))
+        else:
+            return {"status": "error", "message": "Unsupported file format. Use .xlsx, .xls, or .csv"}
+        
+        
+        required_cols = ['word', 'meaning_en']
+        if not all(col in df.columns for col in required_cols):
+            return {"status": "error", "message": f"Missing required columns: {required_cols}"}
+        
+        
+        vocab_items = []
+        for _, row in df.iterrows():
+            word = str(row['word']).strip()
+            meaning_en = str(row['meaning_en']).strip()
+            
+            
+            sentences = []
+            
+            
+            for col in df.columns:
+                if col.startswith('sentence_') and pd.notna(row.get(col)):
+                    sentences.append(str(row[col]).strip())
+            
+            
+            if not sentences and 'sentences' in df.columns and pd.notna(row.get('sentences')):
+                sentences_str = str(row['sentences'])
+                sentences = [s.strip() for s in sentences_str.split(',') if s.strip()]
+            
+            
+            if not sentences:
+                sentences = [f"I use the word {word} every day."]
+            
+            
+            row_set_number = None
+            if 'set_number' in df.columns and pd.notna(row.get('set_number')):
+                row_set_number = int(row['set_number'])
+            elif default_set_number is not None:
+                row_set_number = default_set_number
+            
+            vocab_items.append({
+                "word": word,
+                "meaning_en": meaning_en,
+                "sentences": sentences,
+                "set_number": row_set_number
+            })
+        
+        
+        async with async_session() as sess:
+            
+            if replace_all:
+                await sess.execute(text("DELETE FROM pronunciation_vocab"))
+            
+            inserted = 0
+            skipped = 0
+            
+            for item in vocab_items:
+                try:
+                    await sess.execute(
+                        text("INSERT INTO pronunciation_vocab (word, meaning_en, sentences, set_number, created_at) VALUES (:word, :meaning_en, cast(:sentences as jsonb), :set_number, NOW()) ON CONFLICT (word) DO UPDATE SET meaning_en = :meaning_en, sentences = cast(:sentences as jsonb), set_number = :set_number"),
+                        {"word": item["word"], "meaning_en": item["meaning_en"], "sentences": json.dumps(item["sentences"]), "set_number": item.get("set_number")}
+                    )
+                    inserted += 1
+                except Exception as e:
+                    logger.error(f"Error inserting {item['word']}: {e}")
+                    skipped += 1
+            
+            await sess.commit()
+        
+        return {
+            "status": "success",
+            "message": f"Uploaded vocabulary successfully",
+            "inserted": inserted,
+            "skipped": skipped,
+            "total_in_file": len(vocab_items)
+        }
+        
+    except Exception as e:
+        logger.error(f"Upload error: {e}")
+        return {"status": "error", "message": str(e)}
 
 
 @router.get("/completed_sessions")
-async def get_completed_interview_sessions(current_user: User = Depends(get_current_user)):
+async def get_completed_pronunciation_sessions(current_user: User = Depends(get_current_user)):
     """
-    Get only completed interview sessions for the authenticated user.
-    Returns session_ids and session metadata for completed sessions.
+    Get only completed pronunciation sessions for the current user.
+    Returns sessions where status='completed' and termination_response exists.
     """
-    user_id = current_user.id
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
+    user_id = current_user.id if current_user else None
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="pronunciation")
+    
     completed_sessions = []
     for s in sessions:
         session_data = await db.get_user_session(s.get("session_id"))
@@ -6307,100 +2136,379 @@ async def get_completed_interview_sessions(current_user: User = Depends(get_curr
             continue
         if session_data.get("status") != "completed":
             continue
-        if not session_data.get("final_feedback"):
+        if not session_data.get("termination_response"):
             continue
+        
         completed_sessions.append({
             "session_id": s.get("session_id"),
             "created_at": s.get("created_at"),
-            "role": session_data.get("role", ""),
-            "scenario": session_data.get("scenario", ""),
-            "target_lang": session_data.get("target_language", "en"),
-            "native_lang": session_data.get("native_language", "hi")
+            "target_lang": session_data.get("target_lang", "en"),
+            "native_lang": session_data.get("native_language", "en"),
+            "mode": session_data.get("mode", "normal")
         })
+    
     return {
         "status": "success",
-        "total_sessions": len(completed_sessions),
-        "session_ids": [s.get("session_id") for s in completed_sessions],
+        "user_id": user_id,
+        "total_completed": len(completed_sessions),
         "sessions": completed_sessions
     }
 
+
+@router.get("/feedback/{session_id}")
+async def get_pronunciation_feedback(session_id: str):
+    """
+    Get detailed per-turn feedback for a pronunciation session.
     
-
- 
-
-
-
-
-
-
-@router.get("/roles")
-async def get_user_roles_from_db(current_user: User = Depends(get_current_user)):
+    Returns the same response that was returned when the session ended.
+    Falls back to structured per-turn feedback if termination_response not available.
     """
-    Get distinct job roles practiced by the current user from DB session data.
-    """
-    user_id = current_user.id if current_user else None
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_roles": len(roles),
-        "roles": roles
-    }
-
-@router.get("/roles_with_session_ids")
-async def get_roles_and_session_ids(current_user: User = Depends(get_current_user)):
-    """
-    Get all roles, their corresponding session IDs, and the total session counts for each role for the current user.
-    """
-    user_id = current_user.id if current_user else None
-
-    # Get distinct roles
-    roles = await db.get_distinct_roles_by_user(user_id, session_type="interview")
-
-    # List to hold roles with session info
-    roles_with_session_ids = []
-
-    # Get all sessions for the user once
-    sessions = await db.get_sessions_by_user_id(user_id, session_type="interview")
-
-    for role in roles:
-        session_ids_for_role = []
-
-        for s in sessions:
-            session_data = await db.get_user_session(s.get("session_id"))
-            if session_data and session_data.get("role") == role and session_data.get("status") == "completed":
-                session_ids_for_role.append(s.get("session_id"))
-
-        if session_ids_for_role:
-            roles_with_session_ids.append({
-                "role": role,
-                "session_ids": session_ids_for_role,
-                "total_sessions": len(session_ids_for_role)
-            })
-
-    return {
-        "status": "success",
-        "user_id": user_id,
-        "total_roles": len(roles_with_session_ids),
-        "roles_with_session_ids": roles_with_session_ids
-    }
-
-
-
-
-@router.get("/final_feedback/sessions/{session_id}")
-async def get_interview_feedback_sessions(session_id: str):
-    """
-    Get the exact same response as session termination.
-    Simply returns the stored final_feedback from DB - exactly as it was when session ended.
-    """
-    session = await db.get_user_session(session_id)
-    if not session:
+    # First try to get the stored termination response
+    session_data = await db.get_user_session(session_id)
+    if not session_data:
         raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("status") != "completed":
-        raise HTTPException(status_code=400, detail="Session not completed yet")
-    final_feedback = session.get("final_feedback")
-    if not final_feedback:
-        raise HTTPException(status_code=404, detail="Final feedback not found")
-     
-    return final_feedback
+    
+    # Return the stored termination response if available (same as session end response)
+    if "termination_response" in session_data:
+        return session_data["termination_response"]
+    
+    # Fall back to get_session_feedback for older sessions without termination_response
+    feedback = await db.get_session_feedback(session_id)
+    if not feedback:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if feedback["session_type"] != "pronunciation":
+        raise HTTPException(status_code=400, detail="Not a pronunciation session")
+    return feedback
+
+
+async def init_pronunciation_tables():
+    """
+    Create/sync pronunciation tables - call at app startup.
+    Adds missing columns to existing tables.
+    """
+    async with async_session() as sess:
+        # Create pronunciation_vocab table if not exists
+        await sess.execute(text("""
+            CREATE TABLE IF NOT EXISTS pronunciation_vocab (
+                id SERIAL PRIMARY KEY,
+                word VARCHAR(255) UNIQUE NOT NULL,
+                meaning_en TEXT,
+                sentences JSONB,
+                set_number INTEGER,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        
+        # Add missing columns to pronunciation_vocab (safe - ignores if exists)
+        migration_queries = [
+            "ALTER TABLE pronunciation_vocab ADD COLUMN IF NOT EXISTS meaning_en TEXT",
+            "ALTER TABLE pronunciation_vocab ADD COLUMN IF NOT EXISTS sentences JSONB",
+            "ALTER TABLE pronunciation_vocab ADD COLUMN IF NOT EXISTS set_number INTEGER",
+            "ALTER TABLE pronunciation_vocab ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+        ]
+        for query in migration_queries:
+            try:
+                await sess.execute(text(query))
+            except Exception as e:
+                logger.debug(f"Migration note: {e}")
+        
+        await sess.commit()
+    logger.info("pronunciation_vocab table ready")
+
+
+async def init_bookmarks_table():
+    """Create/sync user_bookmarks table - call at app startup"""
+    async with async_session() as sess:
+        await sess.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_bookmarks (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                word VARCHAR(255) NOT NULL,
+                meaning_target TEXT,
+                meaning_native TEXT,
+                target_lang VARCHAR(10) DEFAULT 'en',
+                native_lang VARCHAR(10) DEFAULT 'hi',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(user_id, word)
+            )
+        """))
+        
+        # Add missing columns (safe - ignores if exists)
+        migration_queries = [
+            "ALTER TABLE user_bookmarks ADD COLUMN IF NOT EXISTS meaning_target TEXT",
+            "ALTER TABLE user_bookmarks ADD COLUMN IF NOT EXISTS meaning_native TEXT",
+            "ALTER TABLE user_bookmarks ADD COLUMN IF NOT EXISTS target_lang VARCHAR(10) DEFAULT 'en'",
+            "ALTER TABLE user_bookmarks ADD COLUMN IF NOT EXISTS native_lang VARCHAR(10) DEFAULT 'hi'",
+            "ALTER TABLE user_bookmarks ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW()",
+        ]
+        for query in migration_queries:
+            try:
+                await sess.execute(text(query))
+            except Exception as e:
+                logger.debug(f"Migration note: {e}")
+        
+        await sess.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_bookmarks_user_lang ON user_bookmarks(user_id, native_lang)
+        """))
+        await sess.commit()
+    logger.info("user_bookmarks table ready")
+
+
+async def init_all_pronunciation_tables():
+    """Initialize all pronunciation-related tables - call this at app startup"""
+    await init_pronunciation_tables()
+    await init_bookmarks_table()
+    logger.info("All pronunciation tables initialized")
+
+@router.post("/bookmark")
+async def add_bookmark(
+    word: str = Form(...),
+    meaning_target: str = Form(default=""),  
+    meaning_native: str = Form(default=""),  
+    target_lang: str = Form(default="en"),
+    native_lang: str = Form(default="hi"),
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Bookmark a word with meanings in both target and native languages.
+    
+    When moving to auth project:
+    - Remove user_id from Form
+    - Add: current_user: User = Depends(get_current_user)
+    - Use: user_id = current_user.id
+    """
+    user_id = current_user.id
+    async with async_session() as sess:
+        
+        existing = await sess.execute(
+            text("SELECT id FROM user_bookmarks WHERE user_id = :uid AND word = :word"),
+            {"uid": user_id, "word": word.lower().strip()}
+        )
+        if existing.fetchone():
+            return {"status": "already_bookmarked", "word": word}
+        
+        
+        await sess.execute(
+            text("""
+                INSERT INTO user_bookmarks (user_id, word, meaning_target, meaning_native, target_lang, native_lang, created_at)
+                VALUES (:uid, :word, :m_target, :m_native, :t_lang, :n_lang, NOW())
+            """),
+            {
+                "uid": user_id,
+                "word": word.lower().strip(),
+                "m_target": meaning_target,
+                "m_native": meaning_native,
+                "t_lang": target_lang,
+                "n_lang": native_lang
+            }
+        )
+        await sess.commit()
+    
+    return {"status": "bookmarked", "word": word, "user_id": user_id}
+
+
+@router.get("/bookmarks")
+async def get_bookmarks(
+    native_lang: Optional[str] = None,  
+    target_lang: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get all bookmarked words for a user.
+    Optionally filter by native_lang, target_lang, or both.
+    
+    When moving to auth project:
+    - Remove user_id query param
+    - Add: current_user: User = Depends(get_current_user)
+    - Use: user_id = current_user.id
+    """
+    user_id = current_user.id
+    async with async_session() as sess:
+        
+        base_query = """
+            SELECT word, meaning_target, meaning_native, target_lang, native_lang, created_at
+            FROM user_bookmarks
+            WHERE user_id = :uid
+        """
+        params = {"uid": user_id}
+        
+        if native_lang and target_lang:
+            query = base_query + " AND native_lang = :n_lang AND target_lang = :t_lang ORDER BY created_at DESC"
+            params["n_lang"] = native_lang
+            params["t_lang"] = target_lang
+        elif native_lang:
+            query = base_query + " AND native_lang = :n_lang ORDER BY created_at DESC"
+            params["n_lang"] = native_lang
+        elif target_lang:
+            query = base_query + " AND target_lang = :t_lang ORDER BY created_at DESC"
+            params["t_lang"] = target_lang
+        else:
+            query = base_query + " ORDER BY created_at DESC"
+        
+        result = await sess.execute(text(query), params)
+        rows = result.fetchall()
+    
+    words = [
+        {
+            "word": r[0],
+            "meaning_target": r[1],
+            "meaning_native": r[2],
+            "target_lang": r[3],
+            "native_lang": r[4],
+            "created_at": str(r[5]) if r[5] else None
+        }
+        for r in rows
+    ]
+    
+    
+    filter_info = {}
+    if native_lang:
+        filter_info["native_lang"] = native_lang
+    if target_lang:
+        filter_info["target_lang"] = target_lang
+    
+    return {
+        "user_id": user_id,
+        "total": len(words),
+        "filter": filter_info if filter_info else None,
+        "words": words
+    }
+
+
+@router.delete("/bookmark/{word}")
+async def remove_bookmark(
+    word: str,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Remove a bookmarked word.
+    
+    When moving to auth project:
+    - Remove user_id query param
+    - Add: current_user: User = Depends(get_current_user)
+    - Use: user_id = current_user.id
+    """
+    user_id = current_user.id
+    async with async_session() as sess:
+        result = await sess.execute(
+            text("DELETE FROM user_bookmarks WHERE user_id = :uid AND word = :word RETURNING id"),
+            {"uid": user_id, "word": word.lower().strip()}
+        )
+        deleted = result.fetchone()
+        await sess.commit()
+    
+    if deleted:
+        return {"status": "removed", "word": word}
+    else:
+        return {"status": "not_found", "word": word}
+
+
+@router.get("/user_sessions")
+async def get_pronunciation_sessions_by_user(current_user: User = Depends(get_current_user)):
+    """
+    Get all Pronunciation sessions for a specific user.
+    
+    Returns all session_ids, scores, and status for the user.
+    """
+    user_id = current_user.id
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="pronunciation")
+    # Add session_number for frontend display
+    for idx, session in enumerate(sessions, 1):
+        session["session_number"] = f"Session {idx}"
+    return {
+        "user_id": user_id,
+        "total_sessions": len(sessions),
+        "sessions": sessions
+    }
+
+
+@router.get("/user_sessions/ids")
+async def get_pronunciation_session_ids(current_user: User = Depends(get_current_user)):
+    """
+    Get just the session IDs for a user.
+    
+    Returns only session_ids list that can be used to fetch individual feedback.
+    """
+    user_id = current_user.id
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="pronunciation")
+    session_ids = [s.get("session_id") for s in sessions]
+    return {
+        "user_id": user_id,
+        "total_sessions": len(session_ids),
+        "session_ids": session_ids
+    }
+
+
+@router.get("/user_sessions/detailed")
+async def get_pronunciation_sessions_detailed(current_user: User = Depends(get_current_user)):
+    """
+
+    Returns sessions labeled as Session 1, Session 2, etc.
+    with complete turn-by-turn feedback.
+    """
+    user_id = current_user.id
+    sessions = await db.get_sessions_by_user_id(user_id, session_type="pronunciation")
+    
+    detailed_sessions = []
+    for idx, session in enumerate(sessions, 1):
+        session_id = session.get("session_id")
+        session_data = await db.get_user_session(session_id)
+        feedback = await db.get_session_feedback(session_id)
+        
+        # Get session metadata
+        lesson_id = session_data.get("lesson_id") if session_data else None
+        target_lang = session_data.get("target_lang", "en") if session_data else "en"
+        
+        # Get full turn feedback
+        full_turns = []
+        if feedback and feedback.get("turn_feedback"):
+            for turn in feedback.get("turn_feedback", []):
+                full_turns.append({
+                    "turn": turn.get("turn"),
+                    "word": turn.get("word", {}),
+                    "transcription": turn.get("transcription", ""),
+                    "pronunciation_score": turn.get("pronunciation_score", 0),
+                    "pronunciation": turn.get("pronunciation", {}),
+                    "fluency": turn.get("fluency", {}),
+                    "wpm": turn.get("wpm", 0)
+                })
+        
+        # Get full final feedback
+        final = feedback.get("final_feedback", {}) if feedback else {}
+        
+        detailed_sessions.append({
+            "session_number": f"Session {idx}",
+            "session_id": session_id,
+            "lesson_id": lesson_id,
+            "target_lang": target_lang,
+            "overall_score": session.get("overall_score", 0),
+            "status": session.get("status", "active"),
+            "created_at": session.get("created_at"),
+            "total_turns": len(full_turns),
+            "turns": full_turns,
+            "final_feedback": final
+        })
+    
+    return {
+        "user_id": user_id,
+        "total_sessions": len(detailed_sessions),
+        "sessions": detailed_sessions
+    }
+
+
+@router.get("/pronunciation_vocab_sets")
+async def get_pronunciation_vocab_sets():
+   """Get all unique set numbers from pronunciation vocabulary"""
+   async with async_session() as sess:
+       result = await sess.execute(
+           text("SELECT DISTINCT set_number FROM pronunciation_vocab WHERE set_number IS NOT NULL ORDER BY set_number")
+       )
+       rows = result.fetchall()
+
+       set_numbers = [row[0] for row in rows]
+
+       return {
+           "status": "success",
+           "total": len(set_numbers),
+           "set_numbers": set_numbers
+       }
