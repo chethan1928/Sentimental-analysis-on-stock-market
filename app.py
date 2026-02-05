@@ -2389,11 +2389,16 @@ async def practice_interview(
                 session["waiting_retry_decision"] = False
                 return await handle_session_termination(session, session_id, model)
             
-            retry_keywords = ["yes", "retry", "practice", "again", "try", "redo", "repeat", "once more", "one more"]
-            skip_keywords = ["no", "skip", "next", "move", "forward", "pass", "don't want", "not now", "let's move", "move on", "go ahead"]
-            
-            wants_retry = any(keyword in user_choice for keyword in retry_keywords)
-            wants_skip = any(keyword in user_choice for keyword in skip_keywords)
+            is_english = target_language.lower() in ["en", "english"]
+            if is_english:
+                retry_keywords = ["yes", "retry", "practice", "again", "try", "redo", "repeat", "once more", "one more"]
+                skip_keywords = ["no", "skip", "next", "move", "forward", "pass", "don't want", "not now", "let's move", "move on", "go ahead"]
+                wants_retry = any(keyword in user_choice for keyword in retry_keywords)
+                wants_skip = any(keyword in user_choice for keyword in skip_keywords)
+            else:
+                cleaned_choice = re.sub(r"[\s\W_]+", "", user_choice)
+                wants_retry = cleaned_choice == "1"
+                wants_skip = cleaned_choice == "2"
             
             if wants_retry:
                 
@@ -2565,7 +2570,11 @@ async def practice_interview(
                     
                     
                     if clarify_count == 1:
-                        clarify_msg = "I heard you say something, but I'm not sure if you want to practice again or move on. Just say 'retry' or 'skip' - or you can try answering the question again!"
+                is_english = target_language.lower() in ["en", "english"]
+                if is_english:
+                    clarify_msg = "I heard you say something, but I'm not sure if you want to practice again or move on. Just say 'retry' or 'skip' - or you can try answering the question again!"
+                else:
+                    clarify_msg = "I heard you say something, but I'm not sure if you want to practice again or move on. Type 1 to retry, 2 to skip."
                     else:
                         clarify_msg = "Still not quite sure what you'd like to do. Say 'yes' to practice the same question, or 'skip' to get a new one. One more unclear response and I'll move you to the next question."
                     
@@ -2884,7 +2893,7 @@ async def practice_interview(
             current_h = session.get("current_hint", "")
             
             
-            retry_ask = "I see your answer, but it could be stronger. Would you like to practice this question again?"
+            retry_ask = "I see your answer, but it could be stronger. Type 1 to retry, 2 to skip."
             
             
             base_tasks = [
