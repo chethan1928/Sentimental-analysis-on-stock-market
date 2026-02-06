@@ -99,5 +99,12 @@ IMPORTANT RULES:
 Return STRICTLY valid JSON:
 {{"question": "[your interactive reaction + follow-up question IN {target_language}]", "hint": "[example response in {target_language}]"}}"""
 
+# Add language instruction lang_instruction = "" if target_language.lower() not in ["en", "english"]: lang_instruction = f"\n\nCRITICAL: Write the ENTIRE message in {target_language} language. DO NOT use English."
+
+Return ONLY the message in {target_language}, no JSON."""
+
+
+
     try:
         raw = await call_llm(prompt, mode="strict_json", model=model, target_language=target_language)  # ✅ Pass target_language
+
