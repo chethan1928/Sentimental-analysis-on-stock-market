@@ -1,0 +1,1755 @@
+import base64
+import os
+import re
+import json
+import uuid
+import requests
+import pdfplumber
+from openai import AzureOpenAI
+from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import RGBColor, Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+from pdf2docx import Converter
+from tqdm import tqdm
+from fuzzywuzzy import fuzz
+
+# from config import settings
+# from utils.azure_client import client
+
+ 
+)
+
+
+# ================================
+# Configuration & Output Setup
+# ================================
+
+
+
+# Base output directory (local)
+BASE_OUTPUT_DIR = os.path.abspath("output")
+
+HIGHLIGHT_DIR = os.path.join(BASE_OUTPUT_DIR, "questions_evaluation", "highlighted")
+FINAL_DIR = os.path.join(BASE_OUTPUT_DIR, "questions_evaluation", "final")
+
+RE_HIGHLIGHT_DIR = os.path.join(BASE_OUTPUT_DIR, "questions_re_evaluation", "highlighted")
+RE_FINAL_DIR = os.path.join(BASE_OUTPUT_DIR, "questions_re_evaluation", "final")
+
+# Ensure directories exist
+for d in [HIGHLIGHT_DIR, FINAL_DIR, RE_HIGHLIGHT_DIR, RE_FINAL_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+
+import unicodedata
+
+def normalize_text(text):
+    return unicodedata.normalize("NFC", text)
+
+
+def set_run_font(run, font_name):
+    run.font.name = font_name
+    rpr = run._element.get_or_add_rPr()
+    rfonts = rpr.get_or_add_rFonts()
+    rfonts.set(qn("w:ascii"), font_name)
+    rfonts.set(qn("w:hAnsi"), font_name)
+    rfonts.set(qn("w:cs"), font_name)
+    rfonts.set(qn("w:eastAsia"), font_name)
+
+
+def is_math_char(ch):
+    o = ord(ch)
+    if ch in "+-*/=<>^%()[]{}|~×÷±∓√∞∑∏∫∆∂∇≈≠≤≥∝":
+        return True
+    if unicodedata.category(ch) == "Sm":
+        return True
+    if 0x2200 <= o <= 0x22FF:  # Mathematical Operators
+        return True
+    if 0x2070 <= o <= 0x209F:  # Superscripts and Subscripts
+        return True
+    return False
+
+
+def add_mixed_font_text(para, text, normal_font=None, math_font="Noto Sans Math"):
+    if not text:
+        return []
+
+    start = 0
+    current_math = is_math_char(text[0])
+    runs = []
+
+    for i in range(1, len(text)):
+        this_math = is_math_char(text[i])
+        if this_math != current_math:
+            chunk = text[start:i]
+            run = para.add_run(chunk)
+            target_font = math_font if current_math else normal_font
+            if target_font:
+                set_run_font(run, target_font)
+            runs.append(run)
+            start = i
+            current_math = this_math
+
+    chunk = text[start:]
+    run = para.add_run(chunk)
+    target_font = math_font if current_math else normal_font
+    if target_font:
+        set_run_font(run, target_font)
+    runs.append(run)
+    return runs
+
+
+def is_text_corrupted(text, threshold=0.3):
+    """
+    Detects font-mapped garbage text.
+    Returns True if corrupted.
+    """
+
+    if not text.strip():
+        return True
+
+    weird_chars = sum(
+        1 for c in text
+        if ord(c) > 127 and not c.isalpha()
+    )
+
+    ratio = weird_chars / len(text)
+
+    return ratio > threshold
+
+
+def convert_pdf_to_docx(pdf_path):
+    """Convert PDF to DOCX while preserving layout."""
+    output_path = pdf_path.replace(".pdf", "_converted.docx")
+    try:
+        cv = Converter(pdf_path)
+        cv.convert(output_path, start=0, end=None)
+        cv.close()
+        print(f"✅ PDF converted to DOCX: {output_path}")
+    except Exception as e:
+        print(f"❌ Error converting PDF to DOCX: {e}")
+        raise
+    return output_path
+
+# def extract_pages(pdf_path):
+#     """Extract text from each PDF page using pdfplumber."""
+#     try:
+#         pages = []
+#         with pdfplumber.open(pdf_path) as pdf:
+#             for page in pdf.pages:
+#                 text = page.extract_text() or ""
+#                 # Normalize text: remove extra whitespace, non-breaking spaces, etc.
+#                 text = re.sub(r'\s+', ' ', text.replace('\xa0', ' ').strip())
+#                 pages.append(text)
+#         return pages
+#     except Exception as e:
+#         print(f"❌ Error extracting text from PDF: {e}")
+#         return []
+
+
+import fitz  # PyMuPDF
+
+# def extract_pages(pdf_path):
+#     """Extract text using PyMuPDF (better for Indian languages)."""
+#     try:
+#         pages = []
+#         doc = fitz.open(pdf_path)
+
+#         for page in doc:
+#             text = page.get_text("text")
+
+#             text = re.sub(r'\s+', ' ', text.replace('\xa0', ' ').strip())
+
+#             pages.append(text)
+
+#         return pages
+
+#     except Exception as e:
+#         print(f"❌ PyMuPDF extraction error: {e}")
+#         return []
+
+import pytesseract
+from pdf2image import convert_from_path
+
+def extract_pages_ocr(pdf_path):
+    pages = []
+    images = convert_from_path(pdf_path, dpi=300)
+
+    for img in images:
+        text = pytesseract.image_to_string(
+            img,
+            lang="eng+hin+tel+tam+ben+mar"
+        )
+        pages.append(text)
+
+    return pages
+
+
+
+def extract_pages(pdf_path):
+    try:
+        pages = []
+        doc = fitz.open(pdf_path)
+
+        for page in doc:
+            text = page.get_text("text")
+
+            if is_text_corrupted(text):
+                print("⚠️ Detected corrupted extraction. Switching to OCR...")
+                return extract_pages_ocr(pdf_path)
+
+            pages.append(text)
+
+        return pages
+
+    except Exception as e:
+        print(f"❌ Extraction error: {e}")
+        return extract_pages_ocr(pdf_path)
+
+# ============================================================
+# Telugu/Tamil-only Azure OCR flow (new functions, old flow unchanged)
+# Handles complex script rendering and layout preservation via GPT-4o Vision.
+# ============================================================
+SPECIAL_AZURE_OCR_LANGUAGES = {"telugu", "tamil"}
+SPECIAL_AZURE_FONT_MAP = {
+    "telugu": "Gidugu",
+    "tamil": "Noto Sans Tamil",
+}
+SPECIAL_AZURE_DEFAULT_FONT = "Gidugu"
+
+
+def normalize_flow_language(language):
+    """Normalizes language codes/names to standard 'telugu' or 'tamil'."""
+    if not language:
+        return ""
+    language = str(language).strip().lower()
+    aliases = {
+        "te": "telugu",
+        "ta": "tamil",
+    }
+    return aliases.get(language, language)
+
+
+def should_use_special_azure_flow(language):
+    """Checks if the document language requires the Azure Vision OCR flow."""
+    return normalize_flow_language(language) in SPECIAL_AZURE_OCR_LANGUAGES
+
+
+def get_special_azure_normal_font(language):
+    normalized = normalize_flow_language(language)
+    return SPECIAL_AZURE_FONT_MAP.get(normalized, SPECIAL_AZURE_DEFAULT_FONT)
+
+
+def telugu_pixmap_to_base64(pix):
+    """Convert PyMuPDF pixmap to base64 for Azure Vision API request."""
+    return base64.b64encode(pix.tobytes("png")).decode("utf-8")
+
+
+def telugu_call_azure_vision_ocr(b64_image, page_no=None):
+    """
+    Sends one page image to Azure GPT-4o Vision with a detailed prompt 
+    designed to preserve structural integrity, tables, and centered titles.
+    """
+    url = f"{endpoint.rstrip('/')}/openai/deployments/{AZURE_DEPLOYMENT_NAME}/chat/completions?api-version={api_version}"
+    headers = {"Content-Type": "application/json", "api-key": subscription_key}
+    page_tag_hint = f"[PAGE:{page_no}]" if page_no is not None else "[PAGE:n]"
+    
+    # Prompt optimized for strict layout-faithful extraction.
+    user_prompt = (
+        "Task: OCR this page and return a strict transcription of EVERYTHING visible.\n"
+        "Extract all visible text blocks: header, footer, question text, options, numbers, marks, page labels, table text, math symbols, punctuation, and standalone symbols.\n"
+        "Strict rules:\n"
+        "1) Character-level fidelity: copy exactly as seen, with no correction.\n"
+        "2) Do not add, remove, translate, rewrite, normalize, summarize, or infer missing words.\n"
+        "3) Preserve original script exactly (Telugu/Tamil/Hindi/English as seen).\n"
+        "4) Preserve complex-script shaping marks exactly (including ZWJ/ZWNJ and combining marks).\n"
+        f"5) First non-empty line MUST be {page_tag_hint}.\n"
+        "6) Preserve line order, line breaks, and numbering exactly.\n"
+        "7) Preserve spacing intent:\n"
+        "   - Use [BLANK] for a visually blank line.\n"
+        "   - Use [INDENT:n] text for leading indentation where n is visible leading-space count.\n"
+        "8) Centered text:\n"
+        "   - If a line is visually centered, wrap it as [CENTER]...[/CENTER].\n"
+        "9) Tables/grids (only if visually present as a real table):\n"
+        "   [TABLE_START]\n"
+        "   | cell1 | cell2 | ... |\n"
+        "   | ... |\n"
+        "   [TABLE_END]\n"
+        "10) If content is not truly tabular, do NOT create table markers.\n"
+        "11) Keep right-aligned marks/values as separate visible columns when present.\n"
+        "12) If any character is unreadable, place [UNCLEAR] at the exact position only.\n"
+        "13) Return plain text only using these markers; no markdown, no commentary.\n"
+        "Examples:\n"
+        "Example A:\n"
+        f"{page_tag_hint}\n"
+        "[CENTER]Model Question Paper[/CENTER]\n"
+        "1. Define photosynthesis.\n"
+        "[BLANK]\n"
+        "Example B:\n"
+        f"{page_tag_hint}\n"
+        "[INDENT:4](a) Solve: x^2 + 5x + 6 = 0\n"
+        "Example C (table):\n"
+        f"{page_tag_hint}\n"
+        "[TABLE_START]\n"
+        "| Question | Marks |\n"
+        "| Q1       | 5     |\n"
+        "[TABLE_END]"
+    )
+
+    last_error = None
+    for attempt in range(1, 4):  # Retry logic for network/API stability
+        payload = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a strict OCR layout transcriber for exam papers.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{b64_image}",
+                                "detail": "high",
+                            },
+                        },
+                    ],
+                },
+            ],
+            "max_tokens": 4096,
+            "temperature": 0.0,
+        }
+
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=150)
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"].strip()
+            if content:
+                return content
+        except Exception as e:
+            last_error = e
+            print(f"Warning: Azure OCR attempt {attempt} failed: {e}")
+
+    raise RuntimeError(f"Azure OCR failed after retries: {last_error}")
+
+
+def extract_pages_ocr_azure_special(pdf_path):
+    """Extract PDF pages via Azure OCR on rendered images."""
+    pages = []
+    doc = fitz.open(pdf_path)
+    try:
+        for page_no, page in enumerate(doc, start=1):
+            print(f"[*] Azure OCR page {page_no}...")
+            pix = page.get_pixmap(dpi=300)
+            b64_image = telugu_pixmap_to_base64(pix)
+            try:
+                content = telugu_call_azure_vision_ocr(b64_image, page_no=page_no)
+                expected_tag = f"[PAGE:{page_no}]"
+                if expected_tag not in content:
+                    content = f"{expected_tag}\n{content}"
+                pages.append(content)
+            except Exception as e:
+                print(f"Error on Azure OCR page {page_no}: {e}")
+                pages.append("")
+    finally:
+        doc.close()
+    return pages
+
+
+def _is_special_table_separator_line(line):
+    cleaned = line.replace("|", "").replace("-", "").replace(":", "").strip()
+    return cleaned == ""
+
+
+def _special_table_cells_from_line(line):
+    row = line.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|"):
+        row = row[:-1]
+    return [c.strip() for c in row.split("|")]
+
+
+def _add_special_table(doc, table_rows, normal_font, math_font):
+    if not table_rows:
+        return
+    col_count = max(len(r) for r in table_rows)
+    table = doc.add_table(rows=len(table_rows), cols=col_count)
+    table.style = "Table Grid"
+    for r_idx, row in enumerate(table_rows):
+        for c_idx in range(col_count):
+            value = row[c_idx] if c_idx < len(row) else ""
+            para = table.cell(r_idx, c_idx).paragraphs[0]
+            add_mixed_font_text(para, value, normal_font=normal_font, math_font=math_font)
+
+
+def convert_pdf_to_docx_special_ocr(pdf_path, extracted_pages_list, language=None):
+    """Build DOCX from OCR text, preserving structure for Telugu/Tamil."""
+    output_path = pdf_path.replace(".pdf", "_converted.docx")
+    normal_font = get_special_azure_normal_font(language)
+    math_font = "Noto Sans Math"
+    try:
+        doc = Document()
+        section = doc.sections[0]
+        section.left_margin = section.right_margin = Inches(0.5)
+
+        total_pages = len(extracted_pages_list)
+        for page_idx, page_text in enumerate(extracted_pages_list):
+            table_rows = []
+            in_table_block = False
+
+            def flush_table():
+                nonlocal table_rows
+                if table_rows:
+                    _add_special_table(doc, table_rows, normal_font, math_font)
+                    table_rows = []
+
+            for line in (page_text or "").splitlines():
+                raw_line = line.rstrip()
+                clean_line = raw_line.strip()
+
+                if not clean_line or clean_line == "[BLANK]":
+                    flush_table()
+                    doc.add_paragraph()
+                    continue
+
+                if re.match(r"^\[PAGE:\s*\d+\s*\]$", clean_line):
+                    # Page tag is metadata for reconstruction; page breaks are handled per page list.
+                    continue
+
+                if clean_line == "[TABLE_START]":
+                    flush_table()
+                    in_table_block = True
+                    continue
+
+                if clean_line == "[TABLE_END]":
+                    flush_table()
+                    in_table_block = False
+                    continue
+
+                if in_table_block:
+                    if "|" in clean_line and clean_line.count("|") > 1 and not _is_special_table_separator_line(clean_line):
+                        table_rows.append(_special_table_cells_from_line(clean_line))
+                    continue
+
+                if "|" in clean_line and clean_line.count("|") > 1:
+                    if _is_special_table_separator_line(clean_line):
+                        continue
+                    table_rows.append(_special_table_cells_from_line(clean_line))
+                    continue
+
+                flush_table()
+
+                indent_match = re.match(r"^\[INDENT:(\d+)\]\s*(.*)$", raw_line)
+                if indent_match:
+                    indent_spaces = int(indent_match.group(1))
+                    text_value = indent_match.group(2)
+                    para = doc.add_paragraph()
+                    para.paragraph_format.left_indent = Inches(min(indent_spaces * 0.06, 3.0))
+                    add_mixed_font_text(para, text_value, normal_font=normal_font, math_font=math_font)
+                elif "[CENTER]" in clean_line or "[/CENTER]" in clean_line:
+                    para = doc.add_paragraph()
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    text_value = clean_line.replace("[CENTER]", "").replace("[/CENTER]", "").strip()
+                    add_mixed_font_text(para, text_value, normal_font=normal_font, math_font=math_font)
+                else:
+                    para = doc.add_paragraph()
+                    if clean_line[0:1].isdigit():
+                        para.paragraph_format.left_indent = Inches(0.2)
+                        para.paragraph_format.first_line_indent = Inches(-0.2)
+                    add_mixed_font_text(para, clean_line, normal_font=normal_font, math_font=math_font)
+
+            flush_table()
+            if page_idx < total_pages - 1:
+                doc.add_page_break()
+
+        doc.save(output_path)
+        print(f"OCR DOCX created: {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"Error building OCR DOCX: {e}")
+        raise
+
+
+def evaluate_document_special_azure(input_path: str, save_json=False, language=None):
+    """New Telugu/Tamil flow using Azure OCR; old evaluate_document remains untouched."""
+    try:
+        if input_path.endswith(".pdf"):
+            pages = extract_pages_ocr_azure_special(input_path)
+            docx_path = convert_pdf_to_docx_special_ocr(input_path, pages, language=language)
+        else:
+            docx_path = input_path
+            pages = extract_pages_from_docx(docx_path)
+
+        if not pages:
+            print(f"No pages extracted from {input_path}")
+            return None, None, None, None
+
+        all_results = []
+        for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
+            result = primary_student_answersheet_evaluation(page_content, i)
+            all_results.append(result)
+
+        json_output = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
+        if save_json:
+            with open(json_output, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, ensure_ascii=False, indent=4)
+
+        highlighted_docx = os.path.join(
+            RE_HIGHLIGHT_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
+        )
+        highlight_and_summarize(docx_path, all_results, highlighted_docx)
+
+        final_docx = os.path.join(
+            RE_FINAL_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
+        )
+        generate_final_corrected_document(docx_path, all_results, final_docx)
+
+        markdown = generate_markdown_report(all_results)
+        return highlighted_docx, final_docx, markdown, all_results
+    except Exception as e:
+        print(f"Error in evaluate_document_special_azure: {e}")
+        return None, None, None, None
+
+
+def extract_pages_from_docx(docx_path, words_per_page=1500):
+    """Split DOCX into pseudo-pages if no real pages exist."""
+    try:
+        doc = Document(docx_path)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        # Normalize text
+        #text = re.sub(r'\s+', ' ', text.replace('\xa0', ' ').strip())
+        words = text.split()
+        pages = [" ".join(words[i:i+words_per_page]) for i in range(0, len(words), words_per_page)]
+        return pages
+    except Exception as e:
+        print(f"❌ Error extracting text from DOCX: {e}")
+        return []
+
+   
+
+def primary_student_answersheet_evaluation(
+    page_content,
+    page_num,
+    raw_output_dir="raw_llm_outputs"
+):
+    """Call AzureOpenAI and return parsed JSON result for a single page.
+
+    IMPORTANT: api_key and azure_endpoint should be provided via environment variables
+    or function arguments to avoid hardcoding secrets in source.
+    """
+    try:
+        if not page_content.strip():
+            return {
+                "page": page_num,
+                "grammar_spelling": [],
+                "worksheet_format": [],
+                "answer_key": [],
+                "logical_flow": [],
+                "british_english": [],
+                "paragraph_corrections": [],
+                "question_relevance": [],
+                "question_answers": [],
+                "summary": "Empty page, skipped."
+            }
+
+        # prompt = f"""
+        # You are an experienced language teacher and worksheet editor.
+
+        # Carefully check the worksheet line by line. Evaluate ONLY the text provided.
+
+        # ### Identify ALL errors in:
+        # - Spelling
+        # - Grammar
+        # - Punctuation
+        # - Capitalisation
+        # - Sentence structure
+        # - Word usage (tense, articles, prepositions, subject–verb agreement)
+
+        # ### Check questions and instructions for:
+        # - Clarity
+        # - Correct grammar
+        # - Appropriate vocabulary for the stated grade level
+
+        # ### Verify the answer key:
+        # - Answers are accurate
+        # - Answers align with the questions
+        # - Flag ambiguous, incomplete, or incorrect answers
+
+        # ### Check for:
+        # - Repetition of questions
+        # - Mismatch between questions and answers
+        # - Inconsistent numbering or formatting
+
+        # ### STRICT RULES:
+        # - Quote the incorrect part EXACTLY as it appears.
+        # - Do NOT rewrite correct text.
+        # - Do NOT infer missing content.
+        # - Avoid duplicate or redundant errors.
+        # - Use British English conventions only.
+        # - Be strict but fair (teacher standard).
+
+        # ### Output format (JSON ONLY):
+        # For every issue, include:
+        # - incorrect: quoted incorrect text
+        # - correct: corrected version
+        # - comment: brief, clear reason
+        # - category: one of
+        # [spelling, grammar, punctuation, capitalisation,
+        # sentence_structure, word_usage, clarity,
+        # answer_key, repetition, formatting]
+
+        # Text to evaluate:
+        # ---
+        # {page_content}
+        # ---
+
+        # Return ONLY valid JSON in this schema:
+        # {{
+        # "grammar_spelling": [],
+        # "worksheet_format": [],
+        # "answer_key": [],
+        # "logical_flow": [],
+        # "british_english": [],
+        # "paragraph_corrections": [],
+        # "question_relevance": [],
+        # "question_answers": [],
+        # "summary": ""
+        # }}
+        # """
+
+        prompt = f"""
+        You are a strict academic worksheet evaluator skilled in language and subject accuracy. Evaluate only the question sheet provided in `page_content`. Do not provide answers for questions unless explicitly provided in the text. Conduct a strict, thorough review of the given page content to ensure clarity and accuracy with the passage.
+        
+        First, detect the primary language of the text.
+        Apply grammar rules of that language
+        Evaluate the text strictly according to the grammatical, spelling,
+        and punctuation rules of THAT language.
+        Do NOT apply English grammar rules to non-English languages.
+        Do NOT translate the text.
+
+        You must evaluate BOTH:
+
+        1. Language quality
+        2. Subject content accuracy (Science, general knowledge, academic facts if present)
+
+        Carefully check the worksheet line by line. Evaluate ONLY the text provided.
+
+        --------------------------------------------------
+        ### PART 1: Language Evaluation
+        --------------------------------------------------
+
+        Identify ALL errors applicable to the detected language, such as:
+        - Spelling (for that language)
+        - Grammar (language-specific rules)
+        - Punctuation (language-specific usage)
+        - Sentence structure (if applicable)
+        - Script consistency (e.g., Devanagari, Telugu script)
+        - Incorrect mixing of languages (unless intentional)
+        
+        For Indian languages (e.g., Hindi, Telugu, Bengali, Tamil):
+
+        - Ensure correct script usage
+        - Check matras, conjuncts, and diacritics
+        - Do not flag absence of articles or tense markers
+        - Respect free word order where applicable
+        - Flag incorrect transliteration only if inconsistent
+
+
+
+        --------------------------------------------------
+        ### PART 2: Academic / Science Evaluation (Apply ONLY if relevant content exists)
+        --------------------------------------------------
+
+        If the worksheet contains scientific, factual, or subject knowledge content, verify:
+
+        - Scientific facts, laws, definitions, and explanations are correct
+        - Units, formulas, symbols, subscripts, superscripts are accurate
+        - No outdated or incorrect scientific concepts
+        - No repetition of questions or concepts
+        - Internal choices are meaningfully different
+        - Ensure each question has an answer key
+
+        --------------------------------------------------
+        ### PART 3: Worksheet Quality Checks
+        --------------------------------------------------
+
+        Check for:
+
+        - Question repetition
+        - Logical flow between questions
+        - Instruction clarity
+        - Formatting consistency
+        - Alignment between questions and answers
+        - Vocabulary is appropriate for the stated grade level
+        - Each question has a corresponding answer key
+        - Question numbering is sequential and consistent
+        - Diagrams (if present) follow scientific conventions and are accurate
+        - Avoid testing the same concept multiple times unless intentionally progressive
+
+        --------------------------------------------------
+        ### STRICT RULES
+        --------------------------------------------------
+
+        - Quote incorrect text EXACTLY as it appears
+        - Do NOT rewrite correct text
+        - Do NOT invent missing information
+        - Avoid duplicate corrections
+        - If the language is English, use British English conventions.
+        - Be strict but fair (teacher standard)
+        - If content is correct → DO NOT flag it
+        - Sentence must start with capital letter
+        - Proper nouns capitalised
+
+        
+        If the text contains mixed languages (e.g., English instructions with Hindi questions):
+        - Evaluate each segment using its respective language rules
+        - Do NOT force consistency across languages
+
+
+        --------------------------------------------------
+        ### Output format (JSON ONLY)
+
+        For every issue include:
+
+        - incorrect
+        - correct
+        - comment
+        - category
+
+        Allowed categories:
+
+        [spelling, grammar, punctuation, capitalisation,
+        sentence_structure, word_usage, clarity,
+        science_fact, formula, unit, symbol,
+        answer_key, repetition, formatting, logical_flow, 
+        diagram, vocabulary_grade_level, numbering_consistency
+        concept_duplication, missing_answer_key]
+
+        --------------------------------------------------
+        Text to evaluate:
+        --------------------------------------------------
+        {page_content}
+        --------------------------------------------------
+
+        Return ONLY valid JSON in this schema:
+
+        {{
+        "grammar_spelling": [],
+        "worksheet_format": [],
+        "answer_key": [],
+        "logical_flow": [],
+        "british_english": [],
+        "paragraph_corrections": [],
+        "question_relevance": [],
+        "question_answers": [],
+        "summary": ""
+        }}
+        """
+
+
+        # response = client.chat.completions.create(
+        #     model=settings.AZURE_DEPLOYMENT_NAME,
+        response = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,
+
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "You are a strict primary student answer sheet evaluator."},
+                {"role": "user", "content": prompt},
+            ],
+            stream=False,
+        )
+
+        raw_output = response.choices[0].message.content.strip()
+
+        os.makedirs(raw_output_dir, exist_ok=True)
+        raw_path = os.path.join(raw_output_dir, f"page_{page_num}_raw.txt")
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(raw_output)
+
+        # Try to find JSON object inside raw_output
+        json_start = raw_output.find("{")
+        json_end = raw_output.rfind("}")
+        if json_start != -1 and json_end != -1:
+            cleaned = raw_output[json_start:json_end+1]
+            try:
+                parsed_json = json.loads(cleaned)
+            except json.JSONDecodeError:
+                parsed_json = {
+                    "page": page_num,
+                    
+                    "worksheet_format": [],
+                    "answer_key": [],
+                    "logical_flow": [],
+                    "british_english": [],
+                    "paragraph_corrections": [],
+                    "question_relevance": [],
+                    "question_answers": [],
+                    "summary": "Invalid JSON or no output"
+                }
+        else:
+            parsed_json = {
+                "page": page_num,
+                "grammar_spelling": [],
+                "worksheet_format": [],
+                "answer_key": [],
+                "logical_flow": [],
+                "british_english": [],
+                "paragraph_corrections": [],
+                "question_relevance": [],
+                "question_answers": [],
+                "summary": "Invalid JSON or no output"
+            }
+
+        # Validate and filter out invalid corrections
+        for key in ["grammar_spelling", "worksheet_format",  "answer_key", "logical_flow", "british_english"]:
+            valid_items = []
+            for item in parsed_json.get(key, []):
+                incorrect = item.get("incorrect", "").strip()
+                correct = item.get("correct", "").strip()
+                comment = item.get("comment", "").strip()
+                if incorrect and correct and comment and incorrect != correct:
+                    valid_items.append(item)
+                else:
+                    # keep entries that might be part of other structures (e.g., one-word spelling entries)
+                    # but avoid noisy empty items
+                    if incorrect and correct and incorrect != correct:
+                        valid_items.append(item)
+                    else:
+                        print(f"⚠️ Skipped invalid {key} correction: {item}")
+            parsed_json[key] = valid_items
+
+        # Ensure required keys exist
+        for key in ["paragraph_corrections", "question_relevance", "question_answers"]:
+            if key not in parsed_json:
+                parsed_json[key] = []
+
+        parsed_json["page"] = page_num
+
+        # Enhanced logging
+        print(f"\n📘 PAGE {page_num} SUMMARY 📘")
+        for key in ["grammar_spelling", "worksheet_format",  "answer_key", "logical_flow", "british_english"]:
+            if not parsed_json.get(key, []):
+                print(f"  ✅ No {key.replace('_', ' ').title()} issues detected.")
+            else:
+                for err in parsed_json.get(key, []):
+                    print(f"  ❌ {err.get('incorrect')} → ✅ {err.get('correct')} ({err.get('comment','')})")
+        print(f"📝 Summary: {parsed_json.get('summary', '')}")
+
+        return parsed_json
+
+    except Exception as e:
+        print(f"❌ Error analyzing page {page_num}: {e}")
+        return {
+            "page": page_num,
+            "grammar_spelling": [],
+            "worksheet_format": [],
+            "answer_key": [],
+            "logical_flow": [],
+            "british_english": [],
+            "paragraph_corrections": [],
+            "question_relevance": [],
+            "question_answers": [],
+            "summary": f"Error: {e}"
+        }
+    
+def apply_color(run, color):
+    """Apply red or green color to text."""
+    if color == "red":
+        run.font.color.rgb = RGBColor(255, 0, 0)
+    elif color == "green":
+        run.font.color.rgb = RGBColor(0, 128, 0)
+    run.font.bold = True
+    
+def highlight_errors_in_doc(doc, errors):
+    """Highlight incorrect words/sentences inline with color, correction, and small-font comment."""
+    highlights_applied = False
+    for para in doc.paragraphs:
+        #para_text = para.text
+        para_text = normalize_text(para.text)
+        if not para_text.strip():
+            continue
+        matches = []
+        for err in errors:
+            #wrong = err.get("incorrect", "").strip()
+            wrong = normalize_text(err.get("incorrect", ""))
+            if not wrong:
+                continue
+            # Use exact matching with re.finditer
+            pattern = re.escape(wrong)  # Escape special characters in the error text
+            for match in re.finditer(pattern, para_text, re.IGNORECASE):
+                start, end = match.start(), match.end()
+                matches.append((start, end, err))
+            if not matches:
+                print(f"⚠️ No exact match for '{wrong}' in paragraph: {para_text[:50]}...")
+        if not matches:
+            continue
+        # Sort matches by start position
+        matches.sort(key=lambda x: x[0])
+        # Rebuild paragraph runs
+        para.clear()
+        last_end = 0
+        for start, end, err in matches:
+            if start > last_end:
+                add_mixed_font_text(para, para_text[last_end:start], normal_font=None, math_font="Noto Sans Math")
+            # Check if it's a spelling error
+            is_spelling = err.get("comment", "").lower() in [
+                "american spelling detected", "spelling error", "incorrect spelling",
+                "british spelling required", "contraction not allowed"
+            ] or err.get("category", "") in ["grammar_spelling", "british_english"]
+            wrong_text = para_text[start:end]
+            if is_spelling:
+                for red_run in add_mixed_font_text(para, wrong_text, normal_font=None, math_font="Noto Sans Math"):
+                    apply_color(red_run, "red")
+            else:
+                for red_run in add_mixed_font_text(para, wrong_text, normal_font=None, math_font="Noto Sans Math"):
+                    apply_color(red_run, "red")
+            # Add green correction
+            right = err.get("correct", "").strip()
+            if right:
+                for green_run in add_mixed_font_text(para, f" ({right})", normal_font=None, math_font="Noto Sans Math"):
+                    apply_color(green_run, "green")
+            # Add small-font comment
+            if comment := err.get("comment", ""):
+                comment_run = para.add_run(f" [{comment}]")
+                comment_run.font.size = Pt(8)
+                comment_run.font.color.rgb = RGBColor(128, 128, 128)
+            last_end = end
+            highlights_applied = True
+            print(f"✅ Highlighted '{wrong_text}' → '{right}' ({comment}) at position {start}-{end}")
+        if last_end < len(para_text):
+            add_mixed_font_text(para, para_text[last_end:], normal_font=None, math_font="Noto Sans Math")
+    return highlights_applied
+
+
+def highlight_errors_in_pdf(pdf_path, analysis, output_pdf_path):
+    """
+    Highlight incorrect text directly inside PDF using bounding boxes.
+    """
+
+    try:
+        doc = fitz.open(pdf_path)
+
+        for page_result in analysis:
+            page_index = page_result["page"] - 1
+
+            if page_index >= len(doc):
+                continue
+
+            page = doc[page_index]
+
+            all_errors = []
+            for key in ["grammar_spelling", "worksheet_format", "answer_key",
+                        "logical_flow", "british_english"]:
+                all_errors.extend(page_result.get(key, []))
+
+            for err in all_errors:
+                incorrect = err.get("incorrect", "").strip()
+                correct = err.get("correct", "").strip()
+                comment = err.get("comment", "")
+
+                if not incorrect:
+                    continue
+
+                # Search text directly in PDF
+                text_instances = page.search_for(incorrect)
+
+                if not text_instances:
+                    print(f"⚠️ No match in PDF for: {incorrect}")
+                    continue
+
+                for inst in text_instances:
+                    highlight = page.add_highlight_annot(inst)
+
+                    # Add popup comment
+                    highlight.set_info({
+                        "title": "Correction",
+                        "content": f"{incorrect} → {correct}\n{comment}"
+                    })
+
+        doc.save(output_pdf_path, garbage=4, deflate=True)
+        print(f"✅ Highlighted PDF saved to: {output_pdf_path}")
+
+    except Exception as e:
+        print(f"❌ PDF highlight error: {e}")
+
+def gray_box_paragraph(doc, text):
+    """Add shaded paragraph for page summary."""
+    p = doc.add_paragraph()
+    run = p.add_run(text)
+    run.bold = True
+    p_format = p.paragraph_format
+    p_format.space_before = Pt(12)
+    p_format.space_after = Pt(12)
+    shading_elm = OxmlElement("w:shd")
+    shading_elm.set(qn("w:fill"), "D9D9D9")
+    p._element.get_or_add_pPr().append(shading_elm)
+    return p
+
+def add_page_summary(doc, page_result):
+    """Add detailed summary at the end of the current page. Also appends question answers."""
+    summary_text = f"📘 Page {page_result['page']} Summary 📘\n"
+    summary_text += f"📝 {page_result.get('summary','')}\n\n"
+    for key in ["grammar_spelling", "worksheet_format",  "answer_key", "logical_flow", "british_english"]:
+        items = page_result.get(key, [])
+        if items:
+            summary_text += f"--- {key.replace('_',' ').title()} ---\n"
+            for err in items:
+                summary_text += f"{err.get('incorrect')} → {err.get('correct')} ({err.get('comment','')})\n"
+
+    # Append question answers if present
+    if page_result.get("question_answers"):
+        summary_text += "\n📚 Answers for Questions\n"
+        for ans in page_result.get("question_answers", []):
+            qno = ans.get("question_no") or ans.get("question_no", "")
+            question_text = ans.get("question", "")
+            answer_text = ans.get("answer", "")
+            explanation = ans.get("explanation", "")
+            summary_text += f"Q{qno}: {question_text}\nAnswer: {answer_text}\nExplanation: {explanation}\n\n"
+
+    gray_box_paragraph(doc, summary_text)
+
+# def highlight_and_summarize(docx_path, analysis, output_docx):
+#     """Apply highlights and add summary for each page."""
+#     try:
+#         doc = Document(docx_path)
+#         highlights_applied = False
+#         for page_result in analysis:
+#             all_errors = []
+#             for key in ["grammar_spelling", "worksheet_format", "answer_key", "logical_flow", "british_english"]:
+#                 for err in page_result.get(key, []):
+#                     err["category"] = key  # Add category for spelling check
+#                     all_errors.append(err)
+#             print(f"📄 Processing page {page_result['page']} with {len(all_errors)} errors to highlight")
+#             if highlight_errors_in_doc(doc, all_errors):
+#                 highlights_applied = True
+#             add_page_summary(doc, page_result)
+#         if not highlights_applied:
+#             print("⚠️ Warning: No highlights applied to any paragraph. Check text extraction or PDF conversion.")
+#         doc.save(output_docx)
+#         print(f"✅ Highlighted DOCX saved to: {output_docx}")
+#     except Exception as e:
+#         print(f"❌ Error in highlight_and_summarize: {e}")
+
+
+def highlight_and_summarize(doc_path, analysis, output_path):
+    """
+    Works for both DOCX and PDF
+    """
+
+    if doc_path.lower().endswith(".pdf"):
+        highlight_errors_in_pdf(doc_path, analysis, output_path)
+        return
+
+    # Existing DOCX logic (unchanged)
+    try:
+        doc = Document(doc_path)
+        highlights_applied = False
+
+        for page_result in analysis:
+            all_errors = []
+            for key in ["grammar_spelling", "worksheet_format",
+                        "answer_key", "logical_flow", "british_english"]:
+                for err in page_result.get(key, []):
+                    err["category"] = key
+                    all_errors.append(err)
+
+            if highlight_errors_in_doc(doc, all_errors):
+                highlights_applied = True
+
+            add_page_summary(doc, page_result)
+
+        doc.save(output_path)
+        print(f"✅ Highlighted DOCX saved to: {output_path}")
+
+    except Exception as e:
+        print(f"❌ DOCX highlight error: {e}")
+
+
+def generate_markdown_report(final_json):
+    lines = ["# Evaluation Report", ""]
+
+    for page in final_json:
+        lines.append(f"## Page {page.get('page')}")
+        lines.append(f"**Summary:** {page.get('summary','')}\n")
+
+        for section in ["grammar_spelling", "worksheet_format", "answer_key", "logical_flow", "british_english"]:
+            items = page.get(section, [])
+            if items:
+                lines.append(f"### {section.replace('_',' ').title()}")
+                for err in items:
+                    lines.append(f"- **{err.get('incorrect')}** → {err.get('correct')} ({err.get('comment','')})")
+                lines.append("")
+
+        if page.get("question_answers"):
+            lines.append("### Question Answers")
+            for ans in page.get("question_answers", []):
+                qno = ans.get("question_no", "")
+                lines.append(f"**Q{qno}: {ans.get('question','')}** \n")
+                lines.append(f"- **Answer:** {ans.get('answer','')} \n")
+                lines.append(f"- **Explanation:** {ans.get('explanation','')}\n")
+                lines.append(f"------------------------------------\n")
+
+        lines.append("---")
+
+    content = "\n".join(lines)
+    return content
+
+def generate_final_corrected_document(input_docx_path, final_json, output_docx_path):
+    """Generates a clean corrected DOCX without highlights, applying all final corrections from final_json."""
+    doc = Document(input_docx_path)
+
+    # Build replacement map (longer incorrect strings first to avoid partial overlap)
+    replacements = []
+    for page in final_json:
+        for key in ["grammar_spelling", "worksheet_format", "answer_key", "logical_flow", "british_english"]:
+            for err in page.get(key, []):
+                incorrect = err.get("incorrect", "")
+                correct = err.get("correct", "")
+                if incorrect and correct and incorrect != correct:
+                    replacements.append((incorrect, correct))
+
+    # Sort replacements by length of incorrect desc (desc) to reduce partial matches
+    replacements.sort(key=lambda x: len(x[0]), reverse=True)
+
+    for para in doc.paragraphs:
+        original = para.text
+        corrected = original
+        for inc, cor in replacements:
+            # Use word-boundary replace when possible
+            try:
+                corrected = re.sub(r"\b" + re.escape(inc) + r"\b", cor, corrected)
+            except re.error:
+                corrected = corrected.replace(inc, cor)
+        if corrected != original:
+            para.clear()
+            add_mixed_font_text(para, corrected, normal_font=None, math_font="Noto Sans Math")
+
+    doc.save(output_docx_path)
+    print(f"✅ Final corrected DOCX generated: {output_docx_path}")
+    return output_docx_path
+
+# def evaluate_document(input_path: str, save_json=False):
+#     try:
+#         if input_path.endswith(".pdf"):
+#             pages = extract_pages(input_path)
+#             docx_path = convert_pdf_to_docx(input_path)
+#         else:
+#             docx_path = input_path
+#             pages = extract_pages_from_docx(docx_path)
+
+#         if not pages:
+#             print(f"❌ No pages extracted from {input_path}")
+#             return None, None, None   # <-- fixed
+
+#         all_results = []
+#         for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
+#             result = primary_student_answersheet_evaluation(page_content, i)
+#             all_results.append(result)
+
+#         json_output = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
+#         if save_json:
+#             with open(json_output, "w", encoding="utf-8") as f:
+#                 json.dump(all_results, f, ensure_ascii=False, indent=4)
+
+#         output_docx = docx_path.replace(".docx", "_evaluated.docx")
+#         highlight_and_summarize(docx_path, all_results, output_docx)
+
+#         markdown = generate_markdown_report(all_results)
+
+#         return output_docx, markdown, all_results
+
+#     except Exception as e:
+#         print(f"❌ Error in evaluate_document: {e}")
+#         return None, None, None
+
+
+
+def evaluate_document(input_path: str, save_json=False, language=None):
+    try:
+        if should_use_special_azure_flow(language):
+            return evaluate_document_special_azure(
+                input_path=input_path,
+                save_json=save_json,
+                language=language,
+            )
+
+        if input_path.endswith(".pdf"):
+            pages = extract_pages(input_path)
+            docx_path = convert_pdf_to_docx(input_path)
+        else:
+            docx_path = input_path
+            pages = extract_pages_from_docx(docx_path)
+
+        if not pages:
+            print(f"❌ No pages extracted from {input_path}")
+            return None, None, None, None
+
+        all_results = []
+        for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
+            result = primary_student_answersheet_evaluation(page_content, i)
+            all_results.append(result)
+
+        # Optional JSON save
+        json_output = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
+        if save_json:
+            with open(json_output, "w", encoding="utf-8") as f:
+                json.dump(all_results, f, ensure_ascii=False, indent=4)
+
+        # # Highlighted DOCX
+        # highlighted_docx = docx_path.replace(".docx", "_evaluated_highlighted.docx")
+        # highlight_and_summarize(docx_path, all_results, highlighted_docx)
+
+        # Highlighted DOCX
+        # highlighted_docx = os.path.join(
+        #     settings.UPLOAD_DIR, "questions_evaluation", "highlighted",
+        #     os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
+        # )
+        highlighted_docx = os.path.join(
+            RE_HIGHLIGHT_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
+        )
+        #highlight_and_summarize(docx_path, all_results, highlighted_docx)
+        highlight_and_summarize(input_path, all_results, highlighted_docx.replace(".docx", ".pdf"))
+
+
+        # Final corrected DOCX
+        # final_docx = os.path.join(
+        #     settings.UPLOAD_DIR, "questions_evaluation", "final",
+        #     os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
+        # )
+        
+        final_docx = os.path.join(
+            RE_FINAL_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
+        )
+        generate_final_corrected_document(docx_path, all_results, final_docx)
+
+
+
+        # # Final corrected DOCX
+        # final_docx = docx_path.replace(".docx", "_evaluated_final.docx")
+        # generate_final_corrected_document(docx_path, all_results, final_docx)
+
+        # Markdown report
+        markdown = generate_markdown_report(all_results)
+
+        return highlighted_docx, final_docx, markdown, all_results
+
+    except Exception as e:
+        print(f"❌ Error in evaluate_document: {e}")
+        return None, None, None, None
+
+
+
+# def evaluate_document(input_path:str, save_json=False):
+#     try:
+#         if input_path.endswith(".pdf"):
+#             pages = extract_pages(input_path)
+#             docx_path = convert_pdf_to_docx(input_path)
+#         else:
+#             docx_path = input_path
+#             pages = extract_pages_from_docx(docx_path)
+
+#         if not pages:
+#             print(f"❌ No pages extracted from {input_path}")
+#             return None, None
+
+#         all_results = []
+#         for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
+#             result = primary_student_answersheet_evaluation(
+#                 page_content, i
+#             )
+#             all_results.append(result)
+
+#         # Save JSON
+#         json_output = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
+#         if save_json:
+#             with open(json_output, "w", encoding="utf-8") as f:
+#                 json.dump(all_results, f, ensure_ascii=False, indent=4)
+
+#         # Save highlighted DOCX
+#         output_docx = docx_path.replace(".docx", "_evaluated.docx")
+#         highlight_and_summarize(docx_path, all_results, output_docx)
+
+#         # Log summary of issues
+#         print(f"\n✅ Evaluation Complete for {input_path}")
+#         if save_json:
+#             print(f"💾 JSON saved to: {json_output}")
+#         print(f"📄 Highlighted DOCX saved to: {output_docx}")
+#         for result in all_results:
+#             print(f"\n📘 Page {result['page']} Issues:")
+#             for key in ["british_english",  "worksheet_format", "answer_key", "logical_flow"]:
+#                 if result.get(key, []):
+#                     print(f"  {key.replace('_', ' ').title()}:")
+#                     for err in result.get(key, []):
+#                         print(f"    ❌ {err.get('incorrect')} → ✅ {err.get('correct')} ({err.get('comment','')})")
+#                 else:
+#                     print(f"  ✅ No {key.replace('_', ' ').title()} issues.")
+
+#         markdown = generate_markdown_report(all_results)
+        
+#         return output_docx, markdown, all_results
+
+#     except Exception as e:
+#         print(f"❌ Error in evaluate_document: {e}")
+#         return None, None
+
+
+
+
+def re_evaluate_with_user_feedback(
+    user_feedback_text: str,
+    original_results,
+    input_path: str
+):
+    """Re-evaluate or revise the LLM analysis using user feedback."""
+
+    if input_path.endswith(".pdf"):
+        docx_path = convert_pdf_to_docx(input_path)
+    else:
+        docx_path = input_path
+
+    feedback_prompt = (
+        "You are provided with a previously generated evaluation JSON for a document. "
+        "Apply the user feedback exactly and produce a revised JSON array of page evaluations. "
+        "Do not add new keys outside the existing schema. Return ONLY valid JSON.\n\n"
+        f"User feedback:\n{user_feedback_text}\n\n"
+        f"Original evaluation JSON:\n{json.dumps(original_results, ensure_ascii=False)}\n\n"
+        "Return the revised JSON only."
+    )
+
+    # response = client.chat.completions.create(
+    #     model=settings.AZURE_DEPLOYMENT_NAME,
+    response = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+
+        temperature=0,
+        messages=[
+            {"role": "system", "content": "You are a JSON editor specialized in educational assessment outputs."},
+            {"role": "user", "content": feedback_prompt}
+        ],
+        stream=False
+    )
+
+    raw = response.choices[0].message.content.strip()
+    json_start = raw.find("{")
+    json_end = raw.rfind("}")
+
+    if json_start != -1 and json_end != -1:
+        cleaned = raw[json_start:json_end+1]
+        try:
+            updated = json.loads(cleaned)
+        except json.JSONDecodeError:
+            try:
+                updated = json.loads(raw)
+            except Exception as e:
+                raise ValueError(f"Unable to parse LLM re-evaluation output: {e}\nRaw output:\n{raw}")
+
+        filename = os.path.basename(input_path).split(".")[0]
+
+        # # Highlighted DOCX
+        # highlighted_docx = f"{settings.UPLOAD_DIR}/{filename}_{uuid.uuid4().hex[:6]}_reevaluated_highlighted.docx"
+        # highlight_and_summarize(docx_path, updated, highlighted_docx)
+
+        # # Final corrected DOCX
+        # final_docx = f"{settings.UPLOAD_DIR}/{filename}_{uuid.uuid4().hex[:6]}_reevaluated_final.docx"
+        # generate_final_corrected_document(docx_path, updated, final_docx)
+
+        # highlighted_docx = os.path.join(
+        #     settings.UPLOAD_DIR, "questions_re_evaluation", "highlighted",
+        #     os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
+        # )
+        
+        highlighted_docx = os.path.join(
+            HIGHLIGHT_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
+        )
+
+        highlight_and_summarize(docx_path, updated, highlighted_docx)
+
+        # Final corrected DOCX
+        # final_docx = os.path.join(
+        #     settings.UPLOAD_DIR, "questions_re_evaluation", "final",
+        #     os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
+        # )
+        
+        final_docx = os.path.join(
+            FINAL_DIR,
+            os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
+        )
+
+        generate_final_corrected_document(docx_path, updated, final_docx)
+
+
+
+        # Markdown report
+        markdown = generate_markdown_report(updated)
+
+        return highlighted_docx, final_docx, markdown, updated
+
+    else:
+        raise ValueError(f"No JSON object detected in LLM response. Raw output:\n{raw}")
+
+
+
+
+# def re_evaluate_with_user_feedback(
+#     user_feedback_text: str,
+#     original_results,
+#     input_path: str
+# ):
+#     """Re-evaluate or revise the LLM analysis using user feedback.
+
+#     original_results can be a Python list (parsed JSON) or path to a JSON file.
+#     Returns the updated JSON (Python list/dict).
+#     """
+#     # if isinstance(original_results, str) and os.path.exists(original_results):
+#     #     with open(original_results, "r", encoding="utf-8") as f:
+#     #         original = json.load(f)
+#     # else:
+#     #     original = original_results
+
+#     if input_path.endswith(".pdf"):
+#         docx_path = convert_pdf_to_docx(input_path)
+#     else:
+#         docx_path = input_path
+
+
+#     feedback_prompt = (
+#         "You are provided with a previously generated evaluation JSON for a document. "
+#         "Apply the user feedback exactly and produce a revised JSON array of page evaluations. "
+#         "Do not add new keys outside the existing schema. Return ONLY valid JSON.\n\n"
+#         f"User feedback:\n{user_feedback_text}\n\n"
+#         f"Original evaluation JSON:\n{json.dumps(original_results, ensure_ascii=False)}\n\n"
+#         "Return the revised JSON only."
+#     )
+
+#     response = client.chat.completions.create(
+#         model=settings.AZURE_DEPLOYMENT_NAME,
+#         temperature=0,
+#         messages=[{"role": "system", "content": "You are a JSON editor specialized in educational assessment outputs."},
+#                   {"role": "user", "content": feedback_prompt}],
+#         stream=False
+#     )
+
+#     raw = response.choices[0].message.content.strip()
+#     json_start = raw.find("{")
+#     json_end = raw.rfind("}")
+#     if json_start != -1 and json_end != -1:
+#         cleaned = raw[json_start:json_end+1]
+#         try:
+#             updated = json.loads(cleaned)
+#         except json.JSONDecodeError:
+#             # If LLM returned an array
+#             try:
+#                 updated = json.loads(raw)
+#             except Exception as e:
+#                 raise ValueError(f"Unable to parse LLM re-evaluation output: {e}\nRaw output:\n{raw}")
+            
+#         filename = os.path.basename(input_path).split(".")[0]
+#         output_docx_path = f"{settings.UPLOAD_DIR}/{filename}_{uuid.uuid4().hex[:6]}.docx"
+#         generate_final_corrected_document(docx_path, updated, output_docx_path)
+#         markdown = generate_markdown_report(updated)
+#         return output_docx_path, markdown, updated
+#     else:
+#         raise ValueError(f"No JSON object detected in LLM response. Raw output:\n{raw}")
+
+
+def main():
+    # CHANGE THIS PATH TO YOUR FILE
+    input_path = r"C:\Users\arpichau\Downloads\Question_evaluation\Input_files\hindi-question-paper_434b8d..pdf"
+    # input_path = r"C:\path\to\your\input_file.docx"
+
+    save_json = True  # set False if you do not want JSON output
+    language = "hindi"  # e.g. telugu, tamil, hindi, english
+
+    if not os.path.exists(input_path):
+        print(f"File not found: {input_path}")
+        return
+
+    print(f"Evaluating file: {input_path}")
+
+    if should_use_special_azure_flow(language):
+        highlighted_docx, final_docx, markdown, results = evaluate_document_special_azure(
+            input_path=input_path,
+            save_json=save_json,
+            language=language
+        )
+    else:
+        highlighted_docx, final_docx, markdown, results = evaluate_document(
+            input_path=input_path,
+            save_json=save_json
+        )
+
+    if not results:
+        print("Evaluation failed.")
+        return
+
+    print("\nEvaluation completed successfully!")
+    print(f"Highlighted DOCX: {highlighted_docx}")
+    print(f"Final Corrected DOCX: {final_docx}")
+
+    if save_json:
+        json_path = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
+        print(f"JSON saved at: {json_path}")
+
+    print("\nMarkdown report is available in `markdown` variable.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+async def generate_and_save_question_evaluate(user_id, data:Dict, file:UploadFile, db:Session):
+    tool = get_tool(data.get("tool_id"), db)
+
+    # Save uploaded file
+    data['files'] = await save_file([file])
+
+    sources = {
+        "youtube": data.get("video_links", []),
+        "websites": data.get("website_links", []),
+        "files": data.get("files") if data.get("files", None) else [],
+        "text": [data.get("text")] if data.get("text", None) else []
+    }
+
+    # Unpack 4 values
+    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(
+        data.get("files")[0],
+        language=data.get("language"),
+    )
+
+    if markdown_content is None:
+        handle_error("Markdown content could not be generated", 500)
+
+    title = get_title(highlighted_docx, markdown_content)
+
+    resource = Resource(
+        user_id=user_id,
+        tool_id=data.get("tool_id"),
+        course_id=data.get("course_id"),
+        unit_id=data.get("unit_id"),
+        lesson_id=data.get("lesson_id"),
+        lesson_plan_id = data.get("lesson_plan_id"),
+        grade=data.get("grade_level"),
+        language=data.get("language"),
+        title=title,
+        query=data.get("query"),
+        depth_of_knowledge=data.get("depth_of_knowledge"),
+        lexile_read_level=data.get("lexile_reading_levels"),
+        blooms_taxonomy=data.get("blooms_taxonomy"),
+        selected_standard_set=data.get("standard_curriculum_id"),
+        selected_standard_course=data.get("standard_course_id"),
+        standard = data.get("standard")
+    )
+    db.add(resource)
+    db.commit()
+    db.refresh(resource)
+
+    highlighted_url = Path(highlighted_docx).as_posix()
+    final_url = Path(final_docx).as_posix()
+
+    resource_version = ResourceVersion(
+        title=title,
+        resource_id=resource.id,
+        version_number=get_resource_version(resource.id, db),
+        content=json.dumps({
+            "text": markdown_content,
+            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
+            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
+        }),
+        generated_json=generated_json
+    )
+    db.add(resource_version)
+    db.commit()
+    db.refresh(resource_version)
+
+    process_source_material(db, resource.id, sources)
+    return resource.id
+
+
+
+async def generate_and_update_question_evaluate(user_id, data:dict, file:UploadFile, db:Session):
+    resource:Resource = get_resource(data.get("resource_id"), db)
+
+    file_path = None
+    if file:
+        data['files'] = await save_file([file])
+        file_path = data.get("files")[0]
+
+    request_sources = {
+        "youtube": data.get("video_links", []),
+        "websites": data.get("website_links", []),
+        "files": data.get("files") if data.get("files", None) else [],
+        "text": [data.get("text")] if data.get("text", None) else []
+    }
+    process_source_material(db, data.get("resource_id"), request_sources)
+
+    sources = get_existing_source_material(data.get("resource_id"), request_sources, db)
+
+    if not file_path:
+        try:
+            all_files = sources.get("files")
+            if len(all_files) <= 0:
+                handle_error("Existing file not found", 404)
+            file_path = all_files[0]
+        except:
+            handle_error("Unable to handle request due to invalid data")
+
+    # Unpack 4 values
+    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(
+        file_path,
+        language=data.get("language") or getattr(resource, "language", None),
+    )
+
+    if markdown_content is None:
+        handle_error("Markdown content could not be generated", 500)
+
+    title = get_title(highlighted_docx, markdown_content)
+
+    # Update resource fields
+    resource.user_id = user_id
+    resource.tool_id = data.get("tool_id")
+    resource.course_id = data.get("course_id")
+    resource.unit_id = data.get("unit_id")
+    resource.lesson_id = data.get("lesson_id")
+    # resource.lesson_plan_id = data.get("lesson_plan_id")
+    resource.grade = data.get("grade_level")
+    resource.language = data.get("language")
+    resource.title = title
+    resource.query = data.get("query")
+    resource.depth_of_knowledge = data.get("depth_of_knowledge")
+    resource.lexile_read_level = data.get("lexile_reading_levels")
+    resource.blooms_taxonomy = data.get("blooms_taxonomy")
+    resource.selected_standard_set = data.get("standard_curriculum_id")
+    resource.selected_standard_course = data.get("standard_course_id")
+    resource.standard = data.get("standard")
+
+    db.commit()
+    db.refresh(resource)
+
+    highlighted_url = Path(highlighted_docx).as_posix()
+    final_url = Path(final_docx).as_posix()
+
+    resource_version = ResourceVersion(
+        title=title,
+        resource_id=resource.id,
+        version_number=get_resource_version(resource.id, db),
+        content=json.dumps({
+            "text": markdown_content,
+            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
+            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
+        }),
+        generated_json=generated_json
+    )
+    db.add(resource_version)
+    db.commit()
+    db.refresh(resource_version)
+
+    return resource_version
+
+async def enhance_and_update_existing_question_evaluate(user_id, data:dict, db:Session):
+    resource:Resource = get_resource(data.get("resource_id"), db)
+    })
+    resource_id = await generate_and_update_image(current_user.id, data, db)
+    return {"message": "Image updated successfully", "resource_id": resource_id}
+
+@router.put("/quick-update-image")
+async def quick_update_image(
+    resource_id:int = Form(...),
+    query: str = Form(...),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    data = {"resource_id": resource_id, "query": query}
+    generated_data = await enhance_and_update_existing_image(
+        current_user.id,
+        data,
+        db
+    )
+    return generated_data
+
+@router.post("/question-evaluation/")
+async def question_evaluation(
+    file: UploadFile = File(...),
+    tool_id:int = Form(...),
+    grade_level:str = Form("Class 10"),
+    language:str = Form("English"),
+    # data: Dict = Depends(get_common_fields),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    # Check file type
+    allowed_extensions = {"pdf", "docx"}
+    file_ext = file.filename.split(".")[-1].lower()
+    data = {
+        "tool_id":tool_id,
+        "grade_level":grade_level,
+        "language":language,
+    }
+
+    if file_ext not in allowed_extensions:
+        handle_error("Only pdf and docx files are allowed.", 400)
+
+    resource_id = await generate_and_save_question_evaluate(current_user.id, data, file, db)
+        
+    return {"message": "Question evaluated successfully", "resource_id": resource_id}
+
+@router.post("/update-question-evaluation/")
+async def update_question_evaluation(
+    resource_id:int = Form(...),
+    file: UploadFile = File(None),
+    tool_id:int = Form(...),
+    grade_level:str = Form("Class 10"),
+    language:str = Form("English"),
+    # data: Dict = Depends(get_common_fields),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    # Check file type
+    allowed_extensions = {"pdf", "docx"}
+
+    file_ext = file.filename.split(".")[-1].lower() if file else None
+    data = {
+        "tool_id":tool_id,
+        "resource_id":resource_id,
+        "grade_level":grade_level,
+        "language":language,
+    }
+
+    if file and file_ext not in allowed_extensions:
+        handle_error("Only pdf and docx files are allowed.", 400)
+
+    generated_data = await generate_and_update_question_evaluate(current_user.id, data, file, db)
+    return generated_data
+
+@router.put("/quick-update-question-evaluation")
+async def quick_update_question_evaluation(
+    resource_id:int = Form(...),
+    query: str = Form(...),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    data = {"resource_id": resource_id, "query": query}
+    generated_data = await enhance_and_update_existing_question_evaluate(
+        current_user.id,
+        data,
+        db
+    )
+    return generated_data
+
+@router.post("/image-generator-paid")
+async def create_image(
+
+
+
+
+
