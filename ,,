@@ -19,8 +19,7 @@ from fuzzywuzzy import fuzz
 # from config import settings
 # from utils.azure_client import client
 
- 
-)
+  
 
 
 # ================================
@@ -242,6 +241,12 @@ def get_special_azure_normal_font(language):
     return SPECIAL_AZURE_FONT_MAP.get(normalized, SPECIAL_AZURE_DEFAULT_FONT)
 
 
+def get_normal_font_for_language(language):
+    """Return language font only when explicitly mapped; otherwise use default document font."""
+    normalized = normalize_flow_language(language)
+    return SPECIAL_AZURE_FONT_MAP.get(normalized)
+
+
 def telugu_pixmap_to_base64(pix):
     """Convert PyMuPDF pixmap to base64 for Azure Vision API request."""
     return base64.b64encode(pix.tobytes("png")).decode("utf-8")
@@ -256,46 +261,17 @@ def telugu_call_azure_vision_ocr(b64_image, page_no=None):
     headers = {"Content-Type": "application/json", "api-key": subscription_key}
     page_tag_hint = f"[PAGE:{page_no}]" if page_no is not None else "[PAGE:n]"
     
-    # Prompt optimized for strict layout-faithful extraction.
+    # Keep OCR prompt simple and robust.
     user_prompt = (
-        "Task: OCR this page and return a strict transcription of EVERYTHING visible.\n"
-        "Extract all visible text blocks: header, footer, question text, options, numbers, marks, page labels, table text, math symbols, punctuation, and standalone symbols.\n"
-        "Strict rules:\n"
-        "1) Character-level fidelity: copy exactly as seen, with no correction.\n"
-        "2) Do not add, remove, translate, rewrite, normalize, summarize, or infer missing words.\n"
-        "3) Preserve original script exactly (Telugu/Tamil/Hindi/English as seen).\n"
-        "4) Preserve complex-script shaping marks exactly (including ZWJ/ZWNJ and combining marks).\n"
-        f"5) First non-empty line MUST be {page_tag_hint}.\n"
-        "6) Preserve line order, line breaks, and numbering exactly.\n"
-        "7) Preserve spacing intent:\n"
-        "   - Use [BLANK] for a visually blank line.\n"
-        "   - Use [INDENT:n] text for leading indentation where n is visible leading-space count.\n"
-        "8) Centered text:\n"
-        "   - If a line is visually centered, wrap it as [CENTER]...[/CENTER].\n"
-        "9) Tables/grids (only if visually present as a real table):\n"
-        "   [TABLE_START]\n"
-        "   | cell1 | cell2 | ... |\n"
-        "   | ... |\n"
-        "   [TABLE_END]\n"
-        "10) If content is not truly tabular, do NOT create table markers.\n"
-        "11) Keep right-aligned marks/values as separate visible columns when present.\n"
-        "12) If any character is unreadable, place [UNCLEAR] at the exact position only.\n"
-        "13) Return plain text only using these markers; no markdown, no commentary.\n"
-        "Examples:\n"
-        "Example A:\n"
-        f"{page_tag_hint}\n"
-        "[CENTER]Model Question Paper[/CENTER]\n"
-        "1. Define photosynthesis.\n"
-        "[BLANK]\n"
-        "Example B:\n"
-        f"{page_tag_hint}\n"
-        "[INDENT:4](a) Solve: x^2 + 5x + 6 = 0\n"
-        "Example C (table):\n"
-        f"{page_tag_hint}\n"
-        "[TABLE_START]\n"
-        "| Question | Marks |\n"
-        "| Q1       | 5     |\n"
-        "[TABLE_END]"
+        "Task: OCR this page and extract all visible text exactly as it appears.\n"
+        "Rules:\n"
+        "1) Keep original language/script exactly.\n"
+        "2) Do not translate, correct, summarize, or rewrite.\n"
+        "3) Preserve line breaks and reading order.\n"
+        "4) Keep punctuation, numbers, and math symbols exactly.\n"
+        "5) If text is unreadable, use [UNCLEAR] at that location.\n"
+        f"6) First non-empty line must be {page_tag_hint}.\n"
+        "7) Return plain text only."
     )
 
     last_error = None
@@ -388,7 +364,7 @@ def _add_special_table(doc, table_rows, normal_font, math_font):
 
 
 def convert_pdf_to_docx_special_ocr(pdf_path, extracted_pages_list, language=None):
-    """Build DOCX from OCR text, preserving structure for Telugu/Tamil."""
+    """Build DOCX from OCR text in a simple, robust way."""
     output_path = pdf_path.replace(".pdf", "_converted.docx")
     normal_font = get_special_azure_normal_font(language)
     math_font = "Noto Sans Math"
@@ -399,71 +375,18 @@ def convert_pdf_to_docx_special_ocr(pdf_path, extracted_pages_list, language=Non
 
         total_pages = len(extracted_pages_list)
         for page_idx, page_text in enumerate(extracted_pages_list):
-            table_rows = []
-            in_table_block = False
-
-            def flush_table():
-                nonlocal table_rows
-                if table_rows:
-                    _add_special_table(doc, table_rows, normal_font, math_font)
-                    table_rows = []
-
             for line in (page_text or "").splitlines():
-                raw_line = line.rstrip()
-                clean_line = raw_line.strip()
-
-                if not clean_line or clean_line == "[BLANK]":
-                    flush_table()
+                line_text = line.rstrip()
+                if not line_text.strip():
                     doc.add_paragraph()
                     continue
 
-                if re.match(r"^\[PAGE:\s*\d+\s*\]$", clean_line):
-                    # Page tag is metadata for reconstruction; page breaks are handled per page list.
+                # page marker is metadata only
+                if re.match(r"^\[PAGE:\s*\d+\s*\]$", line_text.strip()):
                     continue
 
-                if clean_line == "[TABLE_START]":
-                    flush_table()
-                    in_table_block = True
-                    continue
-
-                if clean_line == "[TABLE_END]":
-                    flush_table()
-                    in_table_block = False
-                    continue
-
-                if in_table_block:
-                    if "|" in clean_line and clean_line.count("|") > 1 and not _is_special_table_separator_line(clean_line):
-                        table_rows.append(_special_table_cells_from_line(clean_line))
-                    continue
-
-                if "|" in clean_line and clean_line.count("|") > 1:
-                    if _is_special_table_separator_line(clean_line):
-                        continue
-                    table_rows.append(_special_table_cells_from_line(clean_line))
-                    continue
-
-                flush_table()
-
-                indent_match = re.match(r"^\[INDENT:(\d+)\]\s*(.*)$", raw_line)
-                if indent_match:
-                    indent_spaces = int(indent_match.group(1))
-                    text_value = indent_match.group(2)
-                    para = doc.add_paragraph()
-                    para.paragraph_format.left_indent = Inches(min(indent_spaces * 0.06, 3.0))
-                    add_mixed_font_text(para, text_value, normal_font=normal_font, math_font=math_font)
-                elif "[CENTER]" in clean_line or "[/CENTER]" in clean_line:
-                    para = doc.add_paragraph()
-                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    text_value = clean_line.replace("[CENTER]", "").replace("[/CENTER]", "").strip()
-                    add_mixed_font_text(para, text_value, normal_font=normal_font, math_font=math_font)
-                else:
-                    para = doc.add_paragraph()
-                    if clean_line[0:1].isdigit():
-                        para.paragraph_format.left_indent = Inches(0.2)
-                        para.paragraph_format.first_line_indent = Inches(-0.2)
-                    add_mixed_font_text(para, clean_line, normal_font=normal_font, math_font=math_font)
-
-            flush_table()
+                para = doc.add_paragraph()
+                add_mixed_font_text(para, line_text, normal_font=normal_font, math_font=math_font)
             if page_idx < total_pages - 1:
                 doc.add_page_break()
 
@@ -503,13 +426,13 @@ def evaluate_document_special_azure(input_path: str, save_json=False, language=N
             RE_HIGHLIGHT_DIR,
             os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
         )
-        highlight_and_summarize(docx_path, all_results, highlighted_docx)
+        highlight_and_summarize(docx_path, all_results, highlighted_docx, language=language)
 
         final_docx = os.path.join(
             RE_FINAL_DIR,
             os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
         )
-        generate_final_corrected_document(docx_path, all_results, final_docx)
+        generate_final_corrected_document(docx_path, all_results, final_docx, language=language)
 
         markdown = generate_markdown_report(all_results)
         return highlighted_docx, final_docx, markdown, all_results
@@ -868,7 +791,7 @@ def apply_color(run, color):
         run.font.color.rgb = RGBColor(0, 128, 0)
     run.font.bold = True
     
-def highlight_errors_in_doc(doc, errors):
+def highlight_errors_in_doc(doc, errors, normal_font=None, math_font="Noto Sans Math"):
     """Highlight incorrect words/sentences inline with color, correction, and small-font comment."""
     highlights_applied = False
     for para in doc.paragraphs:
@@ -898,7 +821,7 @@ def highlight_errors_in_doc(doc, errors):
         last_end = 0
         for start, end, err in matches:
             if start > last_end:
-                add_mixed_font_text(para, para_text[last_end:start], normal_font=None, math_font="Noto Sans Math")
+                add_mixed_font_text(para, para_text[last_end:start], normal_font=normal_font, math_font=math_font)
             # Check if it's a spelling error
             is_spelling = err.get("comment", "").lower() in [
                 "american spelling detected", "spelling error", "incorrect spelling",
@@ -906,15 +829,15 @@ def highlight_errors_in_doc(doc, errors):
             ] or err.get("category", "") in ["grammar_spelling", "british_english"]
             wrong_text = para_text[start:end]
             if is_spelling:
-                for red_run in add_mixed_font_text(para, wrong_text, normal_font=None, math_font="Noto Sans Math"):
+                for red_run in add_mixed_font_text(para, wrong_text, normal_font=normal_font, math_font=math_font):
                     apply_color(red_run, "red")
             else:
-                for red_run in add_mixed_font_text(para, wrong_text, normal_font=None, math_font="Noto Sans Math"):
+                for red_run in add_mixed_font_text(para, wrong_text, normal_font=normal_font, math_font=math_font):
                     apply_color(red_run, "red")
             # Add green correction
             right = err.get("correct", "").strip()
             if right:
-                for green_run in add_mixed_font_text(para, f" ({right})", normal_font=None, math_font="Noto Sans Math"):
+                for green_run in add_mixed_font_text(para, f" ({right})", normal_font=normal_font, math_font=math_font):
                     apply_color(green_run, "green")
             # Add small-font comment
             if comment := err.get("comment", ""):
@@ -925,7 +848,7 @@ def highlight_errors_in_doc(doc, errors):
             highlights_applied = True
             print(f"✅ Highlighted '{wrong_text}' → '{right}' ({comment}) at position {start}-{end}")
         if last_end < len(para_text):
-            add_mixed_font_text(para, para_text[last_end:], normal_font=None, math_font="Noto Sans Math")
+            add_mixed_font_text(para, para_text[last_end:], normal_font=normal_font, math_font=math_font)
     return highlights_applied
 
 
@@ -1039,7 +962,7 @@ def add_page_summary(doc, page_result):
 #         print(f"❌ Error in highlight_and_summarize: {e}")
 
 
-def highlight_and_summarize(doc_path, analysis, output_path):
+def highlight_and_summarize(doc_path, analysis, output_path, language=None):
     """
     Works for both DOCX and PDF
     """
@@ -1052,6 +975,8 @@ def highlight_and_summarize(doc_path, analysis, output_path):
     try:
         doc = Document(doc_path)
         highlights_applied = False
+        normal_font = get_normal_font_for_language(language)
+        math_font = "Noto Sans Math"
 
         for page_result in analysis:
             all_errors = []
@@ -1061,7 +986,7 @@ def highlight_and_summarize(doc_path, analysis, output_path):
                     err["category"] = key
                     all_errors.append(err)
 
-            if highlight_errors_in_doc(doc, all_errors):
+            if highlight_errors_in_doc(doc, all_errors, normal_font=normal_font, math_font=math_font):
                 highlights_applied = True
 
             add_page_summary(doc, page_result)
@@ -1102,9 +1027,11 @@ def generate_markdown_report(final_json):
     content = "\n".join(lines)
     return content
 
-def generate_final_corrected_document(input_docx_path, final_json, output_docx_path):
+def generate_final_corrected_document(input_docx_path, final_json, output_docx_path, language=None):
     """Generates a clean corrected DOCX without highlights, applying all final corrections from final_json."""
     doc = Document(input_docx_path)
+    normal_font = get_normal_font_for_language(language)
+    math_font = "Noto Sans Math"
 
     # Build replacement map (longer incorrect strings first to avoid partial overlap)
     replacements = []
@@ -1130,7 +1057,7 @@ def generate_final_corrected_document(input_docx_path, final_json, output_docx_p
                 corrected = corrected.replace(inc, cor)
         if corrected != original:
             para.clear()
-            add_mixed_font_text(para, corrected, normal_font=None, math_font="Noto Sans Math")
+            add_mixed_font_text(para, corrected, normal_font=normal_font, math_font=math_font)
 
     doc.save(output_docx_path)
     print(f"✅ Final corrected DOCX generated: {output_docx_path}")
@@ -1216,8 +1143,7 @@ def evaluate_document(input_path: str, save_json=False, language=None):
             RE_HIGHLIGHT_DIR,
             os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
         )
-        #highlight_and_summarize(docx_path, all_results, highlighted_docx)
-        highlight_and_summarize(input_path, all_results, highlighted_docx.replace(".docx", ".pdf"))
+        highlight_and_summarize(docx_path, all_results, highlighted_docx, language=language)
 
 
         # Final corrected DOCX
@@ -1230,7 +1156,7 @@ def evaluate_document(input_path: str, save_json=False, language=None):
             RE_FINAL_DIR,
             os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
         )
-        generate_final_corrected_document(docx_path, all_results, final_docx)
+        generate_final_corrected_document(docx_path, all_results, final_docx, language=language)
 
 
 
@@ -1308,7 +1234,8 @@ def evaluate_document(input_path: str, save_json=False, language=None):
 def re_evaluate_with_user_feedback(
     user_feedback_text: str,
     original_results,
-    input_path: str
+    input_path: str,
+    language=None
 ):
     """Re-evaluate or revise the LLM analysis using user feedback."""
 
@@ -1373,7 +1300,7 @@ def re_evaluate_with_user_feedback(
             os.path.basename(docx_path).replace(".docx", "_evaluated_highlighted.docx")
         )
 
-        highlight_and_summarize(docx_path, updated, highlighted_docx)
+        highlight_and_summarize(docx_path, updated, highlighted_docx, language=language)
 
         # Final corrected DOCX
         # final_docx = os.path.join(
@@ -1386,7 +1313,7 @@ def re_evaluate_with_user_feedback(
             os.path.basename(docx_path).replace(".docx", "_evaluated_final.docx")
         )
 
-        generate_final_corrected_document(docx_path, updated, final_docx)
+        generate_final_corrected_document(docx_path, updated, final_docx, language=language)
 
 
 
@@ -1506,250 +1433,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-async def generate_and_save_question_evaluate(user_id, data:Dict, file:UploadFile, db:Session):
-    tool = get_tool(data.get("tool_id"), db)
-
-    # Save uploaded file
-    data['files'] = await save_file([file])
-
-    sources = {
-        "youtube": data.get("video_links", []),
-        "websites": data.get("website_links", []),
-        "files": data.get("files") if data.get("files", None) else [],
-        "text": [data.get("text")] if data.get("text", None) else []
-    }
-
-    # Unpack 4 values
-    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(
-        data.get("files")[0],
-        language=data.get("language"),
-    )
-
-    if markdown_content is None:
-        handle_error("Markdown content could not be generated", 500)
-
-    title = get_title(highlighted_docx, markdown_content)
-
-    resource = Resource(
-        user_id=user_id,
-        tool_id=data.get("tool_id"),
-        course_id=data.get("course_id"),
-        unit_id=data.get("unit_id"),
-        lesson_id=data.get("lesson_id"),
-        lesson_plan_id = data.get("lesson_plan_id"),
-        grade=data.get("grade_level"),
-        language=data.get("language"),
-        title=title,
-        query=data.get("query"),
-        depth_of_knowledge=data.get("depth_of_knowledge"),
-        lexile_read_level=data.get("lexile_reading_levels"),
-        blooms_taxonomy=data.get("blooms_taxonomy"),
-        selected_standard_set=data.get("standard_curriculum_id"),
-        selected_standard_course=data.get("standard_course_id"),
-        standard = data.get("standard")
-    )
-    db.add(resource)
-    db.commit()
-    db.refresh(resource)
-
-    highlighted_url = Path(highlighted_docx).as_posix()
-    final_url = Path(final_docx).as_posix()
-
-    resource_version = ResourceVersion(
-        title=title,
-        resource_id=resource.id,
-        version_number=get_resource_version(resource.id, db),
-        content=json.dumps({
-            "text": markdown_content,
-            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
-            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
-        }),
-        generated_json=generated_json
-    )
-    db.add(resource_version)
-    db.commit()
-    db.refresh(resource_version)
-
-    process_source_material(db, resource.id, sources)
-    return resource.id
-
-
-
-async def generate_and_update_question_evaluate(user_id, data:dict, file:UploadFile, db:Session):
-    resource:Resource = get_resource(data.get("resource_id"), db)
-
-    file_path = None
-    if file:
-        data['files'] = await save_file([file])
-        file_path = data.get("files")[0]
-
-    request_sources = {
-        "youtube": data.get("video_links", []),
-        "websites": data.get("website_links", []),
-        "files": data.get("files") if data.get("files", None) else [],
-        "text": [data.get("text")] if data.get("text", None) else []
-    }
-    process_source_material(db, data.get("resource_id"), request_sources)
-
-    sources = get_existing_source_material(data.get("resource_id"), request_sources, db)
-
-    if not file_path:
-        try:
-            all_files = sources.get("files")
-            if len(all_files) <= 0:
-                handle_error("Existing file not found", 404)
-            file_path = all_files[0]
-        except:
-            handle_error("Unable to handle request due to invalid data")
-
-    # Unpack 4 values
-    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(
-        file_path,
-        language=data.get("language") or getattr(resource, "language", None),
-    )
-
-    if markdown_content is None:
-        handle_error("Markdown content could not be generated", 500)
-
-    title = get_title(highlighted_docx, markdown_content)
-
-    # Update resource fields
-    resource.user_id = user_id
-    resource.tool_id = data.get("tool_id")
-    resource.course_id = data.get("course_id")
-    resource.unit_id = data.get("unit_id")
-    resource.lesson_id = data.get("lesson_id")
-    # resource.lesson_plan_id = data.get("lesson_plan_id")
-    resource.grade = data.get("grade_level")
-    resource.language = data.get("language")
-    resource.title = title
-    resource.query = data.get("query")
-    resource.depth_of_knowledge = data.get("depth_of_knowledge")
-    resource.lexile_read_level = data.get("lexile_reading_levels")
-    resource.blooms_taxonomy = data.get("blooms_taxonomy")
-    resource.selected_standard_set = data.get("standard_curriculum_id")
-    resource.selected_standard_course = data.get("standard_course_id")
-    resource.standard = data.get("standard")
-
-    db.commit()
-    db.refresh(resource)
-
-    highlighted_url = Path(highlighted_docx).as_posix()
-    final_url = Path(final_docx).as_posix()
-
-    resource_version = ResourceVersion(
-        title=title,
-        resource_id=resource.id,
-        version_number=get_resource_version(resource.id, db),
-        content=json.dumps({
-            "text": markdown_content,
-            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
-            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
-        }),
-        generated_json=generated_json
-    )
-    db.add(resource_version)
-    db.commit()
-    db.refresh(resource_version)
-
-    return resource_version
-
-async def enhance_and_update_existing_question_evaluate(user_id, data:dict, db:Session):
-    resource:Resource = get_resource(data.get("resource_id"), db)
-    })
-    resource_id = await generate_and_update_image(current_user.id, data, db)
-    return {"message": "Image updated successfully", "resource_id": resource_id}
-
-@router.put("/quick-update-image")
-async def quick_update_image(
-    resource_id:int = Form(...),
-    query: str = Form(...),
-    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
-    db: Session = Depends(get_db)
-):
-    data = {"resource_id": resource_id, "query": query}
-    generated_data = await enhance_and_update_existing_image(
-        current_user.id,
-        data,
-        db
-    )
-    return generated_data
-
-@router.post("/question-evaluation/")
-async def question_evaluation(
-    file: UploadFile = File(...),
-    tool_id:int = Form(...),
-    grade_level:str = Form("Class 10"),
-    language:str = Form("English"),
-    # data: Dict = Depends(get_common_fields),
-    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
-    db: Session = Depends(get_db)
-):
-    # Check file type
-    allowed_extensions = {"pdf", "docx"}
-    file_ext = file.filename.split(".")[-1].lower()
-    data = {
-        "tool_id":tool_id,
-        "grade_level":grade_level,
-        "language":language,
-    }
-
-    if file_ext not in allowed_extensions:
-        handle_error("Only pdf and docx files are allowed.", 400)
-
-    resource_id = await generate_and_save_question_evaluate(current_user.id, data, file, db)
-        
-    return {"message": "Question evaluated successfully", "resource_id": resource_id}
-
-@router.post("/update-question-evaluation/")
-async def update_question_evaluation(
-    resource_id:int = Form(...),
-    file: UploadFile = File(None),
-    tool_id:int = Form(...),
-    grade_level:str = Form("Class 10"),
-    language:str = Form("English"),
-    # data: Dict = Depends(get_common_fields),
-    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
-    db: Session = Depends(get_db)
-):
-    # Check file type
-    allowed_extensions = {"pdf", "docx"}
-
-    file_ext = file.filename.split(".")[-1].lower() if file else None
-    data = {
-        "tool_id":tool_id,
-        "resource_id":resource_id,
-        "grade_level":grade_level,
-        "language":language,
-    }
-
-    if file and file_ext not in allowed_extensions:
-        handle_error("Only pdf and docx files are allowed.", 400)
-
-    generated_data = await generate_and_update_question_evaluate(current_user.id, data, file, db)
-    return generated_data
-
-@router.put("/quick-update-question-evaluation")
-async def quick_update_question_evaluation(
-    resource_id:int = Form(...),
-    query: str = Form(...),
-    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
-    db: Session = Depends(get_db)
-):
-    data = {"resource_id": resource_id, "query": query}
-    generated_data = await enhance_and_update_existing_question_evaluate(
-        current_user.id,
-        data,
-        db
-    )
-    return generated_data
-
-@router.post("/image-generator-paid")
-async def create_image(
-
-
-
 
 
