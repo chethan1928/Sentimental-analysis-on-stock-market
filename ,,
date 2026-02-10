@@ -211,21 +211,21 @@ def extract_pages(pdf_path):
 # Telugu/Tamil-only Azure OCR flow (new functions, old flow unchanged)
 # Handles complex script rendering and layout preservation via GPT-4o Vision.
 # ============================================================
-SPECIAL_AZURE_OCR_LANGUAGES = {"telugu", "tamil"}
+SPECIAL_AZURE_OCR_LANGUAGES = {"Telugu", "tamil"}
 SPECIAL_AZURE_FONT_MAP = {
-    "telugu": "Gidugu",
+    "Telugu": "Gidugu",
     "tamil": "Noto Sans Tamil",
 }
 SPECIAL_AZURE_DEFAULT_FONT = "Gidugu"
 
 
 def normalize_flow_language(language):
-    """Normalizes language codes/names to standard 'telugu' or 'tamil'."""
+    """Normalizes language codes/names to standard 'Telugu' or 'tamil'."""
     if not language:
         return ""
     language = str(language).strip().lower()
     aliases = {
-        "te": "telugu",
+        "te": "Telugu",
         "ta": "tamil",
     }
     return aliases.get(language, language)
@@ -247,12 +247,12 @@ def get_normal_font_for_language(language):
     return SPECIAL_AZURE_FONT_MAP.get(normalized)
 
 
-def telugu_pixmap_to_base64(pix):
+def Telugu_pixmap_to_base64(pix):
     """Convert PyMuPDF pixmap to base64 for Azure Vision API request."""
     return base64.b64encode(pix.tobytes("png")).decode("utf-8")
 
 
-def telugu_call_azure_vision_ocr(b64_image, page_no=None):
+def Telugu_call_azure_vision_ocr(b64_image, page_no=None):
     """
     Sends one page image to Azure GPT-4o Vision with a detailed prompt 
     designed to preserve structural integrity, tables, and centered titles.
@@ -321,9 +321,9 @@ def extract_pages_ocr_azure_special(pdf_path):
         for page_no, page in enumerate(doc, start=1):
             print(f"[*] Azure OCR page {page_no}...")
             pix = page.get_pixmap(dpi=300)
-            b64_image = telugu_pixmap_to_base64(pix)
+            b64_image = Telugu_pixmap_to_base64(pix)
             try:
-                content = telugu_call_azure_vision_ocr(b64_image, page_no=page_no)
+                content = Telugu_call_azure_vision_ocr(b64_image, page_no=page_no)
                 expected_tag = f"[PAGE:{page_no}]"
                 if expected_tag not in content:
                     content = f"{expected_tag}\n{content}"
@@ -1396,7 +1396,7 @@ def main():
     # input_path = r"C:\path\to\your\input_file.docx"
 
     save_json = True  # set False if you do not want JSON output
-    language = "hindi"  # e.g. telugu, tamil, hindi, english
+    language = "hindi"  # e.g. Telugu, tamil, hindi, english
 
     if not os.path.exists(input_path):
         print(f"File not found: {input_path}")
