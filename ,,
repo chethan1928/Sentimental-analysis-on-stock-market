@@ -497,7 +497,7 @@ def convert_pdf_to_docx_special_ocr(pdf_path, extracted_pages_list, language=Non
         raise
 
 
-def evaluate_document_special_azure(input_path: str, save_json=False, language=None):
+def evaluate_document_special_azure(input_path: str, save_json=False, language=None, grade_level=None):
     try:
         if input_path.endswith(".pdf"):
             pages = extract_pages_ocr_azure_special(input_path, language=language)
@@ -512,7 +512,7 @@ def evaluate_document_special_azure(input_path: str, save_json=False, language=N
 
         all_results = []
         for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
-            result = primary_student_answersheet_evaluation(page_content, i)
+            result = primary_student_answersheet_evaluation(page_content, i, grade_level=grade_level)
             all_results.append(result)
 
         json_output = input_path.replace(".pdf", "_analysis.json").replace(".docx", "_analysis.json")
@@ -557,7 +557,8 @@ def extract_pages_from_docx(docx_path, words_per_page=1500):
 def primary_student_answersheet_evaluation(
     page_content,
     page_num,
-    raw_output_dir="raw_llm_outputs"
+    raw_output_dir="raw_llm_outputs",
+    grade_level=None
 ):
     """Call AzureOpenAI and return parsed JSON result for a single page.
 
@@ -1153,7 +1154,7 @@ def generate_final_corrected_document(input_docx_path, final_json, output_docx_p
 
 
 
-def evaluate_document(input_path: str, save_json=False, language=None):
+def evaluate_document(input_path: str, save_json=False, language=None, grade_level=None):
     try:
         normalized_language = normalize_flow_language(language)
         if should_use_special_azure_flow(normalized_language):
@@ -1161,6 +1162,7 @@ def evaluate_document(input_path: str, save_json=False, language=None):
                 input_path=input_path,
                 save_json=save_json,
                 language=normalized_language,
+                grade_level=grade_level,
             )
 
         if input_path.endswith(".pdf"):
@@ -1176,7 +1178,7 @@ def evaluate_document(input_path: str, save_json=False, language=None):
 
         all_results = []
         for i, page_content in enumerate(tqdm(pages, desc="Analyzing Pages"), start=1):
-            result = primary_student_answersheet_evaluation(page_content, i)
+            result = primary_student_answersheet_evaluation(page_content, i, grade_level=grade_level)
             all_results.append(result)
 
         # Optional JSON save
@@ -2337,6 +2339,271 @@ if __name__ == "__main__":
 
 #         return highlighted_docx, final_docx, markdown, updated
 
-#     else:
-#         raise ValueError(f"No JSON object detected in LLM response. Raw output:\n{raw}")
+from api forn import *
 
+
+async def generate_and_save_question_evaluate(user_id, data:Dict, file:UploadFile, db:Session):
+    tool = get_tool(data.get("tool_id"), db)
+
+    # Save uploaded file
+    data['files'] = await save_file([file])
+
+    sources = {
+        "youtube": data.get("video_links", []),
+        "websites": data.get("website_links", []),
+        "files": data.get("files") if data.get("files", None) else [],
+        "text": [data.get("text")] if data.get("text", None) else []
+    }
+
+    # Unpack 4 values
+    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(data.get("files")[0], grade_level=data.get("grade_level"), language=data.get("language"))
+
+    if markdown_content is None:
+        handle_error("Markdown content could not be generated", 500)
+
+    title = get_title(highlighted_docx, markdown_content)
+
+    resource = Resource(
+        user_id=user_id,
+        tool_id=data.get("tool_id"),
+        course_id=data.get("course_id"),
+        unit_id=data.get("unit_id"),
+        lesson_id=data.get("lesson_id"),
+        lesson_plan_id = data.get("lesson_plan_id"),
+        grade=data.get("grade_level"),
+        language=data.get("language"),
+        title=title,
+        query=data.get("query"),
+        depth_of_knowledge=data.get("depth_of_knowledge"),
+        lexile_read_level=data.get("lexile_reading_levels"),
+        blooms_taxonomy=data.get("blooms_taxonomy"),
+        selected_standard_set=data.get("standard_curriculum_id"),
+        selected_standard_course=data.get("standard_course_id"),
+        standard = data.get("standard")
+    )
+    db.add(resource)
+    db.commit()
+    db.refresh(resource)
+
+    highlighted_url = Path(highlighted_docx).as_posix()
+    final_url = Path(final_docx).as_posix()
+
+    resource_version = ResourceVersion(
+        title=title,
+        resource_id=resource.id,
+        version_number=get_resource_version(resource.id, db),
+        content=json.dumps({
+            "text": markdown_content,
+            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
+            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
+        }),
+        generated_json=generated_json
+    )
+    db.add(resource_version)
+    db.commit()
+    db.refresh(resource_version)
+
+    process_source_material(db, resource.id, sources)
+    return resource.id
+
+
+
+async def generate_and_update_question_evaluate(user_id, data:dict, file:UploadFile, db:Session):
+    resource:Resource = get_resource(data.get("resource_id"), db)
+
+    file_path = None
+    if file:
+        data['files'] = await save_file([file])
+        file_path = data.get("files")[0]
+
+    request_sources = {
+        "youtube": data.get("video_links", []),
+        "websites": data.get("website_links", []),
+        "files": data.get("files") if data.get("files", None) else [],
+        "text": [data.get("text")] if data.get("text", None) else []
+    }
+    process_source_material(db, data.get("resource_id"), request_sources)
+
+    sources = get_existing_source_material(data.get("resource_id"), request_sources, db)
+
+    if not file_path:
+        try:
+            all_files = sources.get("files")
+            if len(all_files) <= 0:
+                handle_error("Existing file not found", 404)
+            file_path = all_files[0]
+        except Exception:
+            handle_error("Unable to handle request due to invalid data")
+
+    # Unpack 4 values
+    highlighted_docx, final_docx, markdown_content, generated_json = evaluate_document(file_path, grade_level=data.get("grade_level"), language=data.get("language"))
+
+    if markdown_content is None:
+        handle_error("Markdown content could not be generated", 500)
+
+    title = get_title(highlighted_docx, markdown_content)
+
+    # Update resource fields
+    resource.user_id = user_id
+    resource.tool_id = data.get("tool_id")
+    resource.course_id = data.get("course_id")
+    resource.unit_id = data.get("unit_id")
+    resource.lesson_id = data.get("lesson_id")
+    # resource.lesson_plan_id = data.get("lesson_plan_id")
+    resource.grade = data.get("grade_level")
+    resource.language = data.get("language")
+    resource.title = title
+    resource.query = data.get("query")
+    resource.depth_of_knowledge = data.get("depth_of_knowledge")
+    resource.lexile_read_level = data.get("lexile_reading_levels")
+    resource.blooms_taxonomy = data.get("blooms_taxonomy")
+    resource.selected_standard_set = data.get("standard_curriculum_id")
+    resource.selected_standard_course = data.get("standard_course_id")
+    resource.standard = data.get("standard")
+
+    db.commit()
+    db.refresh(resource)
+
+    highlighted_url = Path(highlighted_docx).as_posix()
+    final_url = Path(final_docx).as_posix()
+
+    resource_version = ResourceVersion(
+        title=title,
+        resource_id=resource.id,
+        version_number=get_resource_version(resource.id, db),
+        content=json.dumps({
+            "text": markdown_content,
+            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
+            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
+        }),
+        generated_json=generated_json
+    )
+    db.add(resource_version)
+    db.commit()
+    db.refresh(resource_version)
+
+    return resource_version
+
+
+@router.post("/question-evaluation/")
+async def question_evaluation(
+    file: UploadFile = File(...),
+    tool_id:int = Form(...),
+    grade_level:str = Form("Class 10"),
+    language:str = Form("English"),
+    # data: Dict = Depends(get_common_fields),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    # Check file type
+    allowed_extensions = {"pdf", "docx"}
+    file_ext = file.filename.split(".")[-1].lower()
+    data = {
+        "tool_id":tool_id,
+        "grade_level":grade_level,
+        "language":language,
+    }
+
+    if file_ext not in allowed_extensions:
+        handle_error("Only pdf and docx files are allowed.", 400)
+
+    resource_id = await generate_and_save_question_evaluate(current_user.id, data, file, db)
+        
+    return {"message": "Question evaluated successfully", "resource_id": resource_id}
+
+
+async def enhance_and_update_existing_question_evaluate(user_id, data:dict, db:Session):
+    resource:Resource = get_resource(data.get("resource_id"), db)
+
+    existing_resource_version = db.query(ResourceVersion).filter(
+        ResourceVersion.resource_id == data.get("resource_id")
+    ).order_by(ResourceVersion.version_number.desc()).first()
+
+    try:
+        request_sources = {"youtube": [], "websites": [], "files": [], "text": []}
+        sources = get_existing_source_material(data.get("resource_id"), request_sources, db)
+        all_files = sources.get("files")
+        if len(all_files) <= 0:
+            handle_error("Existing file not found", 404)
+        file_path = all_files[-1]
+    except Exception:
+        handle_error("Unable to handle request due to invalid data")
+
+    # Unpack 4 values from re-evaluation
+    highlighted_docx, final_docx, markdown_content, generated_json = re_evaluate_with_user_feedback(
+        data.get("query"),
+        existing_resource_version.generated_json,
+        file_path,
+        language=resource.language
+    )
+
+    if markdown_content is None:
+        handle_error("Markdown content could not be generated", 500)
+
+    title = get_title(highlighted_docx, markdown_content)
+
+    highlighted_url = Path(highlighted_docx).as_posix()
+    final_url = Path(final_docx).as_posix()
+
+    resource_version = ResourceVersion(
+        title=title,
+        resource_id=resource.id,
+        version_number=get_resource_version(resource.id, db),
+        prompt=data.get("query"),
+        content=json.dumps({
+            "text": markdown_content,
+            "highlighted_path": f"{settings.PROJECT_BASE_URL}/{highlighted_url}",
+            "final_path": f"{settings.PROJECT_BASE_URL}/{final_url}"
+        }),
+        generated_json=generated_json
+    )
+    db.add(resource_version)
+    db.commit()
+    db.refresh(resource_version)
+
+    return resource_version
+ 
+
+@router.post("/update-question-evaluation/")
+async def update_question_evaluation(
+    resource_id:int = Form(...),
+    file: UploadFile = File(None),
+    tool_id:int = Form(...),
+    grade_level:str = Form("Class 10"),
+    language:str = Form("English"),
+    # data: Dict = Depends(get_common_fields),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    # Check file type
+    allowed_extensions = {"pdf", "docx"}
+
+    file_ext = file.filename.split(".")[-1].lower() if file else None
+    data = {
+        "tool_id":tool_id,
+        "resource_id":resource_id,
+        "grade_level":grade_level,
+        "language":language,
+    }
+
+    if file and file_ext not in allowed_extensions:
+        handle_error("Only pdf and docx files are allowed.", 400)
+
+    generated_data = await generate_and_update_question_evaluate(current_user.id, data, file, db)
+    return generated_data
+
+@router.put("/quick-update-question-evaluation")
+async def quick_update_question_evaluation(
+    resource_id:int = Form(...),
+    query: str = Form(...),
+    current_user: User = Depends(get_current_user([UserRole.ADMIN, UserRole.USER])),
+    db: Session = Depends(get_db)
+):
+    data = {"resource_id": resource_id, "query": query}
+    generated_data = await enhance_and_update_existing_question_evaluate(
+        current_user.id,
+        data,
+        db
+    )
+    return generated_data
+#         raise ValueError(f"No JSON object detected in LLM response. Raw output:\n{raw}")
