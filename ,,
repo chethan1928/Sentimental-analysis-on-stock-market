@@ -185,20 +185,59 @@ TYPE_CANONICAL = {
     "mcq": "Multiple Choice Questions",
     "multiple choice": "Multiple Choice Questions",
     "multiple-choice": "Multiple Choice Questions",
+    "multiple choice questions": "Multiple Choice Questions",
     "true/false": "True/False Questions",
     "true false": "True/False Questions",
     "t/f": "True/False Questions",
     "tf": "True/False Questions",
+    "true/false questions": "True/False Questions",
     "fill in the blank": "Fill in the Blank Questions",
     "fill-in-the-blank": "Fill in the Blank Questions",
     "fill blank": "Fill in the Blank Questions",
     "fitb": "Fill in the Blank Questions",
+    "fill in the blank questions": "Fill in the Blank Questions",
+    "essential question": "Essential Question",
+    "passage questions": "Passage Questions",
+    "short answer questions": "Short Answer Questions",
+    "essay questions": "Essay Questions",
+    "open-ended prompts": "Open-ended Prompts",
 }
 
 
 def canonical_type(name: str) -> str:
     key = name.strip().lower()
     return TYPE_CANONICAL.get(key, name)
+
+
+RC_TYPE_SYNONYMS = {
+    "Multiple Choice Questions": ["mcq", "multiple choice", "multiple-choice", "mc", "choice questions"],
+    "True/False Questions": ["true/false", "true false", "true-false", "t/f", "tf"],
+    "Fill in the Blank Questions": ["fill in the blank", "fill in the blanks", "fill-in-the-blank", "fill blank", "fitb"],
+    "Short Answer Questions": ["short answer", "short"],
+    "Essay Questions": ["essay"],
+    "Open-ended Prompts": ["open-ended", "open ended"],
+    "Essential Question": ["essential"],
+    "Passage Questions": ["passage"],
+}
+
+
+def detect_rc_type(user_prompt: str, available_types: List[str]) -> Optional[str]:
+    prompt = (user_prompt or "").lower()
+    for t in available_types or []:
+        t_canon = canonical_type(str(t))
+        if t_canon.lower() in prompt:
+            return t_canon
+        for alias in RC_TYPE_SYNONYMS.get(t_canon, []):
+            if alias in prompt:
+                return t_canon
+
+    for t_canon, aliases in RC_TYPE_SYNONYMS.items():
+        if t_canon.lower() in prompt:
+            return t_canon
+        if any(alias in prompt for alias in aliases):
+            return t_canon
+
+    return None
 
 
 def normalize_question_types(qt: Union[str, list, tuple, None]) -> List[str]:
@@ -479,50 +518,31 @@ Return example structure:
                     add_count = val
                     break
 
-    # Detect requested type (supports abbreviations like "MCQ", "T/F", etc.)
-    type_aliases = {
-        "multiple choice questions": ["mcq", "multiple choice", "multiple-choice", "mc"],
-        "fill in the blank questions": ["fill in the blank", "fill-in-the-blank", "fill blank", "fitb", "blank"],
-        "true/false questions": ["true/false", "true false", "true-false", "t/f", "tf"],
-        "short answer questions": ["short answer", "short"],
-        "essay questions": ["essay"],
-        "open-ended prompts": ["open-ended", "open ended"],
-        "essential question": ["essential"],
-        "passage questions": ["passage"],
-    }
-
-    requested_types = []
-    req_lower = describe_requirement.lower()
-    for qt in question_types:
-        qt_lower = qt.lower()
-        # Check exact full name
-        if qt_lower in req_lower:
-            requested_types.append(qt)
-            continue
-        # Check aliases
-        aliases = type_aliases.get(qt_lower, [])
-        if any(alias in req_lower for alias in aliases):
-            requested_types.append(qt)
-
-    # Fallback to all types only if nothing matched
-    if not requested_types:
+    detected_type = detect_rc_type(describe_requirement, question_types)
+    if detected_type:
+        requested_types = [detected_type]
+    else:
         requested_types = question_types
 
-    prompt = f"""
-You are adding questions ONLY.
+    if not requested_types:
+        requested_types = ["Multiple Choice Questions"]
 
+    prompt = f"""
+You are adding questions to an existing comprehension assessment.
 DO NOT rewrite the passage.
 DO NOT modify existing questions.
 
 Passage:
 {passage}
 
-Task:
-Add EXACTLY {add_count} new questions TOTAL (not per type).
-Distribute them among these type(s): {", ".join(requested_types)}
+CRITICAL CONSTRAINT (DO NOT VIOLATE):
+- Generate ONLY this question type: {requested_types[0]}
+- DO NOT generate any other question types
+- Generate EXACTLY {add_count} new questions
+- The JSON key MUST be exactly: "{requested_types[0]}"
 
 Return JSON ONLY:
-{{ "questions": {{ "Type": ["Q1", "Q2"] }} }}
+{{ "questions": {{ "{requested_types[0]}": ["Q1", "Q2"] }} }}
 """
 
     response = client.chat.completions.create(
