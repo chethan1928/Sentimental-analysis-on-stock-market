@@ -527,6 +527,24 @@ Return example structure:
     if not requested_types:
         requested_types = ["Multiple Choice Questions"]
 
+    extra_rules = ""
+    if requested_types[0] == "Multiple Choice Questions":
+        extra_rules = """
+MCQ FORMAT RULES:
+- Each question MUST include 4 options labeled A), B), C), D)
+- Options must be part of the question text
+"""
+    elif requested_types[0] == "True/False Questions":
+        extra_rules = """
+TRUE/FALSE RULES:
+- Each question must be a statement that can be answered True or False
+"""
+    elif requested_types[0] == "Fill in the Blank Questions":
+        extra_rules = """
+FILL IN THE BLANK RULES:
+- Each question must include a blank (use ___) for the missing word/phrase
+"""
+
     prompt = f"""
 You are adding questions to an existing comprehension assessment.
 DO NOT rewrite the passage.
@@ -540,6 +558,8 @@ CRITICAL CONSTRAINT (DO NOT VIOLATE):
 - DO NOT generate any other question types
 - Generate EXACTLY {add_count} new questions
 - The JSON key MUST be exactly: "{requested_types[0]}"
+
+{extra_rules}
 
 Return JSON ONLY:
 {{ "questions": {{ "{requested_types[0]}": ["Q1", "Q2"] }} }}
