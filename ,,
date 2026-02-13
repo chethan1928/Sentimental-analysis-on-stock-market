@@ -1,8 +1,1173 @@
-6 +    passage = assessment_data["passage"]                          
-    579 +    if isinstance(num_questions, str) and num_questions.isdigit():
-    580 +        num_questions = int(num_questions)
-    581 +
-    582 +    # Determine how many to add
-    583 +    add_count = num_questions or 1
-    584 +    if isinstance(add_count, str) and add_count.isdigit():        
-    585 +        add_count = int(add_count)
+import os
+import re
+import json
+import requests
+from datetime import datetime
+from typing import List, Optional
+from urllib.parse import urlparse
+
+from openai import AzureOpenAI
+from ddgs import DDGS
+from bs4 import BeautifulSoup
+from pytube import YouTube
+from PIL import Image
+import pytesseract
+import fitz  # PyMuPDF
+import docx
+import openpyxl
+from pptx import Presentation
+
+
+
+client = AzureOpenAI(
+    api_version=api_version,
+    azure_endpoint=endpoint,
+    api_key=subscription_key,
+)
+
+
+
+# ---------- File / Web / YouTube Text Extractors ----------
+
+def extract_text_from_file(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    text = ""
+
+    try:
+        if ext == ".pdf":
+            with fitz.open(file_path) as doc:
+                for page in doc:
+                    text += page.get_text("text") + "\n"
+        elif ext == ".docx":
+            doc_file = docx.Document(file_path)
+            text = "\n".join(p.text for p in doc_file.paragraphs)
+        elif ext in [".xlsx", ".xls"]:
+            wb = openpyxl.load_workbook(file_path, data_only=True)
+            for sheet in wb.worksheets:
+                for row in sheet.iter_rows(values_only=True):
+                    text += " ".join(str(cell) for cell in row if cell) + "\n"
+        elif ext == ".pptx":
+            prs = Presentation(file_path)
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        text += shape.text + "\n"
+        elif ext in [".png", ".jpg", ".jpeg"]:
+            image = Image.open(file_path)
+            text = pytesseract.image_to_string(image)
+
+    except Exception as e:
+        text = f"[Error reading file {os.path.basename(file_path)}: {e}]"
+
+    return text.strip()
+
+
+def extract_text_from_website(url: str) -> str:
+    try:
+        response = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        if response.status_code != 200:
+            return f"[Website returned {response.status_code} for {url}]"
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        for tag in soup(["script", "style", "header", "footer", "nav", "noscript", "aside"]):
+            tag.decompose()
+
+        content_blocks = []
+        for section in soup.find_all(["article", "section", "main", "div"]):
+            text = section.get_text(separator=" ", strip=True)
+            if len(text.split()) > 40:
+                content_blocks.append(text)
+
+        title = soup.title.string.strip() if soup.title else ""
+        if not content_blocks:
+            paragraphs = " ".join(p.get_text(strip=True) for p in soup.find_all("p"))
+            main_text = paragraphs
+        else:
+            main_text = max(content_blocks, key=len)
+
+        combined = f"{title}\n\n{main_text}"
+        combined = re.sub(r"\s+", " ", combined).strip()
+        return combined[:5000]
+
+    except Exception as e:
+        return f"[Website extraction failed for {url}: {e}]"
+
+
+def extract_text_from_youtube(url: str) -> str:
+    text = ""
+    try:
+        yt = YouTube(url)
+        text = f"{yt.title}\n{yt.description}"
+    except Exception:
+        try:
+            video_id = url.split("v=")[-1] if "v=" in url else url.split("/")[-1].split("?")[0]
+            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+            res = requests.get(oembed_url, timeout=10)
+            if res.status_code == 200:
+                info = res.json()
+                title = info.get("title", "")
+                author = info.get("author_name", "")
+                text = f"{title}\nBy {author}"
+            else:
+                text = f"[YouTube metadata unavailable: {res.status_code}]"
+        except Exception as e:
+            text = f"[YouTube extraction failed for {url}: {e}]"
+
+    if not text.strip() or "failed" in text.lower():
+        text = "Video about a science or educational topic"
+
+    return text.strip()
+
+
+# ---------- Topic Extraction ----------
+
+
+def extract_topic_from_inputs(
+    describe_requirement: Optional[str] = None,
+    text_input: Optional[str] = None,
+    youtube_links: Optional[List[str]] = None,
+    files: Optional[List[str]] = None,
+    websites: Optional[List[str]] = None
+) -> str:
+    combined_text = ""
+
+    if describe_requirement:
+        combined_text += f"Requirement:\n{describe_requirement}\n"
+    if text_input:
+        combined_text += f"Text:\n{text_input}\n"
+    if youtube_links:
+        for link in youtube_links:
+            yt_text = extract_text_from_youtube(link)
+            if "failed" not in yt_text.lower():
+                combined_text += f"YouTube Content:\n{yt_text}\n"
+    if files:
+        for f in files:
+            file_text = extract_text_from_file(f)
+            if "error" not in file_text.lower():
+                combined_text += f"File Content ({os.path.basename(f)}):\n{file_text}\n"
+    if websites:
+        for w in websites:
+            web_text = extract_text_from_website(w)
+            if "failed" not in web_text.lower():
+                combined_text += f"Website Content:\n{web_text}\n"
+
+    if not combined_text.strip():
+        return "General Educational Resources"
+
+    prompt = f"""
+    Based on the following content, extract a short educational topic suitable for comprehension-based reading material.
+    Respond with ONLY the topic name (e.g., 'Newton’s Laws of Motion').
+
+    Content:
+    {combined_text[:3500]}
+    """
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": "You are a precise topic extractor for educational comprehension."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3
+            #max_tokens=200
+        )
+        topic = response.choices[0].message.content.strip()
+    except Exception as e:
+        topic = f"Topic extraction failed: {e}"
+
+    return topic
+
+import json
+from typing import List, Union
+
+TYPE_CANONICAL = {
+    "mcq": "Multiple Choice Questions",
+    "multiple choice": "Multiple Choice Questions",
+    "multiple-choice": "Multiple Choice Questions",
+    "multiple choice questions": "Multiple Choice Questions",
+    "true/false": "True/False Questions",
+    "true false": "True/False Questions",
+    "t/f": "True/False Questions",
+    "tf": "True/False Questions",
+    "true/false questions": "True/False Questions",
+    "fill in the blank": "Fill in the Blank Questions",
+    "fill-in-the-blank": "Fill in the Blank Questions",
+    "fill blank": "Fill in the Blank Questions",
+    "fitb": "Fill in the Blank Questions",
+    "fill in the blank questions": "Fill in the Blank Questions",
+    "essential question": "Essential Question",
+    "passage questions": "Passage Questions",
+    "short answer questions": "Short Answer Questions",
+    "essay questions": "Essay Questions",
+    "open-ended prompts": "Open-ended Prompts",
+}
+
+
+def canonical_type(name: str) -> str:
+    key = name.strip().lower()
+    return TYPE_CANONICAL.get(key, name)
+
+
+RC_TYPE_SYNONYMS = {
+    "Multiple Choice Questions": ["mcq", "multiple choice", "multiple-choice", "mc", "choice questions"],
+    "True/False Questions": ["true/false", "true false", "true-false", "t/f", "tf"],
+    "Fill in the Blank Questions": ["fill in the blank", "fill in the blanks", "fill-in-the-blank", "fill blank", "fitb"],
+    "Short Answer Questions": ["short answer", "short"],
+    "Essay Questions": ["essay"],
+    "Open-ended Prompts": ["open-ended", "open ended"],
+    "Essential Question": ["essential"],
+    "Passage Questions": ["passage"],
+}
+
+
+def detect_rc_type(user_prompt: str, available_types: List[str]) -> Optional[str]:
+    prompt = (user_prompt or "").lower()
+    for t in available_types or []:
+        t_canon = canonical_type(str(t))
+        if t_canon.lower() in prompt:
+            return t_canon
+        for alias in RC_TYPE_SYNONYMS.get(t_canon, []):
+            if alias in prompt:
+                return t_canon
+
+    for t_canon, aliases in RC_TYPE_SYNONYMS.items():
+        if t_canon.lower() in prompt:
+            return t_canon
+        if any(alias in prompt for alias in aliases):
+            return t_canon
+
+    return None
+
+
+WORD_NUMS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10
+}
+
+
+def _parse_count_token(token: str) -> Optional[int]:
+    if not token:
+        return None
+    token = token.strip().lower()
+    if token.isdigit():
+        return int(token)
+    return WORD_NUMS.get(token)
+
+
+def extract_type_counts(user_prompt: str, available_types: List[str]) -> dict:
+    prompt = (user_prompt or "").lower()
+    if not prompt:
+        return {}
+
+    counts = {}
+
+    candidates = []
+    for t in (available_types or []):
+        t_canon = canonical_type(str(t))
+        if t_canon not in [c[0] for c in candidates]:
+            candidates.append((t_canon, RC_TYPE_SYNONYMS.get(t_canon, [])))
+
+    for t_canon, aliases in RC_TYPE_SYNONYMS.items():
+        if t_canon not in [c[0] for c in candidates]:
+            candidates.append((t_canon, aliases))
+
+    for t_canon, aliases in candidates:
+        all_aliases = [t_canon.lower()] + [a.lower() for a in aliases]
+        for alias in all_aliases:
+            alias_esc = re.escape(alias)
+            m = re.search(
+                rf'(?:add\s*)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+'
+                rf'(?:more\s+)?(?:questions\s+)?(?:in\s+)?{alias_esc}',
+                prompt
+            )
+            if not m:
+                m = re.search(
+                    rf'{alias_esc}\s*(?:questions\s*)?(?:=|:)?\s*'
+                    rf'(\d+|one|two|three|four|five|six|seven|eight|nine|ten)',
+                    prompt
+                )
+            if m:
+                cnt = _parse_count_token(m.group(1))
+                if cnt:
+                    counts[t_canon] = cnt
+                    break
+
+    return counts
+
+
+def build_extra_rules(types: List[str]) -> str:
+    rules = []
+    if "Multiple Choice Questions" in types:
+        rules.append(
+            "MCQ FORMAT RULES:\n"
+            "- Each question MUST include 4 options labeled A), B), C), D)\n"
+            "- Options must be part of the question text"
+        )
+    if "True/False Questions" in types:
+        rules.append(
+            "TRUE/FALSE RULES:\n"
+            "- Each question must be a statement that can be answered True or False"
+        )
+    if "Fill in the Blank Questions" in types:
+        rules.append(
+            "FILL IN THE BLANK RULES:\n"
+            "- Each question must include a blank (use ___) for the missing word/phrase"
+        )
+    return "\n".join(rules)
+
+
+def normalize_question_types(qt: Union[str, list, tuple, None]) -> List[str]:
+    """
+    Ensures question_types is ALWAYS a List[str].
+    Handles DB strings, JSON strings, tuples, None.
+    """
+    if not qt:
+        return []
+
+    # Already correct
+    if isinstance(qt, list):
+        return [canonical_type(str(x)) for x in qt]
+
+    # Tuple → list
+    if isinstance(qt, tuple):
+        return [canonical_type(str(x)) for x in qt]
+
+    # JSON string from DB
+    if isinstance(qt, str):
+        qt = qt.strip()
+
+        # Try JSON decode
+        try:
+            parsed = json.loads(qt)
+            if isinstance(parsed, list):
+                return [canonical_type(str(x)) for x in parsed]
+        except Exception:
+            pass
+
+        # Fallback: comma-separated string
+        if "," in qt:
+            return [canonical_type(q.strip()) for q in qt.split(",") if q.strip()]
+
+        # Last resort: single type
+        return [canonical_type(qt)]
+
+    # Absolute fallback
+    return []
+
+
+import json
+from json_repair import repair_json
+
+def safe_json_loads(text: str, *, debug=False):
+    if not text or not text.strip():
+        raise ValueError("Empty response from LLM")
+
+    # 1. Normalize smart quotes
+    text = (
+        text.replace("“", '"')
+            .replace("”", '"')
+            .replace("’", "'")
+    )
+
+    # 2. Remove markdown fences
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`").replace("json", "").strip()
+
+    # 3. First attempt: strict JSON
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Repair attempt (LLM-safe)
+    try:
+        fixed = repair_json(text)
+
+        if debug:
+            print("🔧 REPAIRED JSON:\n", fixed)
+
+        return json.loads(fixed)
+    except Exception as e:
+        print("❌ JSON REPAIR FAILED")
+        print(text)
+        raise RuntimeError("Unable to parse or repair JSON") from e
+
+
+# ---------- Comprehension Question Generator (Enhanced with Question Control) ----------
+
+def generate_comprehension(
+    topic: str,
+    grade: str,
+    language: str,
+    dok_level: Optional[str] = None,
+    lexile_level: Optional[str] = None,
+    bloom_level: Optional[str] = None,
+    describe_requirement: Optional[str] = None,
+    num_questions: Optional[int] = None,
+    question_types: Optional[List[str]] = None,
+    assessment_data: Optional[dict] = None   # 👈 SAFE OPTIONAL
+) -> dict:
+    """
+    Generate a comprehension passage and questions obeying exact totals and distribution.
+    Returns a dict with 'title', 'passage', and 'questions' (a dict mapping question type -> list).
+    """
+
+    # -------------------------------------------------
+    # 🔍 Detect incremental intent
+    # -------------------------------------------------
+    is_incremental = (
+        assessment_data is not None and
+        describe_requirement and
+        any(k in describe_requirement.lower()
+            for k in ["add", "more", "additional", "extra"])
+    )
+
+    question_types = normalize_question_types(question_types)
+
+    # -------------------------------------------------
+    # 🧱 INITIAL GENERATION MODE
+    # -------------------------------------------------
+    if not is_incremental:
+
+        if num_questions is not None:
+            if isinstance(num_questions, (list, tuple)):
+                num_questions = num_questions[0]
+            num_questions = int(num_questions)
+
+        
+        distribution = {}
+        if num_questions and question_types and len(question_types) > 0:
+            base = num_questions // len(question_types)
+            remainder = num_questions % len(question_types)
+            for i, qt in enumerate(question_types):
+                distribution[qt] = base + (1 if i < remainder else 0)
+        elif num_questions and (not question_types or len(question_types) == 0):
+            # if question types not specified, produce variety
+            # default types order:
+            default_types = ["Essential Question", "Multiple Choice Questions", "Fill in the Blank Questions",
+                            "True/False Questions", "Short Answer Questions",
+                            "Open-ended Prompts", "Essay Questions", "Passage Questions"]
+            question_types = default_types
+            base = num_questions // len(question_types)
+            remainder = num_questions % len(question_types)
+            for i, qt in enumerate(question_types):
+                distribution[qt] = base + (1 if i < remainder else 0)
+        else:
+            # no num specified: use defaults (one per type)
+            if not question_types:
+                question_types = [
+                    "Essential Question",
+                    "Multiple Choice Questions",
+                    "Fill in the Blank Questions",
+                    "True/False Questions",
+                    "Short Answer Questions",
+                    "Open-ended Prompts",
+                    "Essay Questions",
+                    "Passage Questions"
+                ]
+                
+            for qt in question_types:
+                distribution[qt] = 1
+
+        framework_details = []
+        if dok_level:
+            framework_details.append(f"DOK Level: {dok_level}")
+        if lexile_level:
+            framework_details.append(f"Lexile Level: {lexile_level}")
+        if bloom_level:
+            framework_details.append(f"Bloom’s Taxonomy Level: {bloom_level}")
+        framework_summary = "\n".join(framework_details) if framework_details else "None"
+
+        # Build distribution text for prompt
+        distribution_lines = "\n".join([f"- {qt}: {cnt}" for qt, cnt in distribution.items()])
+        prompt = f"""
+Requirements (STRICT):
+1) Return JSON only with these top-level keys: "title", "passage", "questions".
+2) "passage" should be a single coherent passage of 250-400 words. Put it under "passage" exactly once.
+3) "questions" must be an object mapping question-type names to arrays of question strings.
+4) Generate EXACT numbers of questions for each type as specified below (do NOT include answers here):
+{distribution_lines}
+
+LATEX FORMATTING RULES (MANDATORY):
+- Whenever mathematical, scientific, chemical, or symbolic notation is required, YOU MUST use valid LaTeX.
+- Inline expressions MUST be wrapped in single dollar signs: $ ... $
+  Example: "The derivative of $f(x)=x^2$ is $f'(x)=2x$."
+- Standalone equations MUST be wrapped in double dollar signs: $$ ... $$
+- Use proper LaTeX syntax only:
+  - Fractions: \frac{{a}}{{b}}
+  - Powers: x^2 → x^{{2}}
+  - Subscripts: H_2O
+  - Roots: \sqrt{{x}}
+  - Derivatives: \frac{{d}}{{dx}}
+  - Integrals: \int_a^b
+  - Greek letters: \alpha, \beta, \theta
+- Chemistry reactions MUST use LaTeX arrows and notation:
+  Example: $$2H_2 + O_2 \rightarrow 2H_2O$$
+- Physics units must be in LaTeX where appropriate:
+  Example: $9.8\,\text{{m/s}}^2$
+- DO NOT use Unicode math symbols (×, ÷, →, ≤, ≥, ², ³).
+- LaTeX MUST be JSON-safe:
+  - Do NOT include raw line breaks inside LaTeX.
+  - Do NOT escape dollar signs.
+- If no math or notation is required, use plain text.
+
+For Multiple Choice Questions (MCQs):
+- ALWAYS generate 4 options labeled \nA), \nB), \nC), and \nD)
+- ALWAYS embed the options inside the question text as a list.
+- Options MAY contain LaTeX if the question involves formulas or symbols.
+- LaTeX inside options must follow the same rules ($...$ or $$...$$).
+  Example:
+  "What is acceleration?\nA) rate of change of displacement\nB) ...\nC) ...\nD) ..."
+- always add \n wherever neccessary.
+- do not skip \n for new question or options or wherever neccessary.
+- Each option must be meaningful and distinct.
+- The correct answer must be one of the four options.
+
+Framework/context:
+{framework_summary}
+
+Additional refinement:
+{describe_requirement or "None"}
+
+Return example structure:
+{{
+  "title": "Short Title",
+  "passage": "The passage text ...",
+  "questions": {{
+     "Multiple Choice Questions": ["Q1 ...", "Q2 ..."],
+     "Short Answer Questions": ["Q3 ..."],
+     ...
+  }}
+}}
+
+"""
+
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            response_format={"type": "json_object"}
+        )
+            
+        data = response.choices[0].message.content.strip()
+        data = safe_json_loads(data, debug=True)
+
+
+
+        return {
+            "title": data.get("title", topic),
+            "passage": data["passage"],
+            "questions": data["questions"]
+        }
+
+    # -------------------------------------------------
+    # 🔁 INCREMENTAL MODE (ADD ONLY)
+    # -------------------------------------------------
+    if not isinstance(assessment_data, dict):
+        assessment_data = {}
+    passage = assessment_data.get("passage", "")
+    existing_questions = assessment_data.get("questions", {})
+    if not isinstance(existing_questions, dict):
+        existing_questions = {}
+
+    if isinstance(num_questions, str) and num_questions.isdigit():
+        num_questions = int(num_questions)
+
+    # Determine how many to add
+    add_count = num_questions or 1
+    if isinstance(add_count, str) and add_count.isdigit():
+        add_count = int(add_count)
+   
+    # 🔍 Auto-detect "add 2 more", "add 3 questions"
+    if describe_requirement:
+        match = re.search(r'add\s+(\d+)', describe_requirement.lower())
+        if match:
+            add_count = int(match.group(1))
+        else:
+            req_lower = describe_requirement.lower()
+            for word, val in WORD_NUMS.items():
+                if f"add {word}" in req_lower:
+                    add_count = val
+                    break
+
+    type_counts = extract_type_counts(describe_requirement, question_types)
+    if type_counts:
+        requested_types = list(type_counts.keys())
+    else:
+        detected_type = detect_rc_type(describe_requirement, question_types)
+        if detected_type:
+            requested_types = [detected_type]
+        else:
+            requested_types = []
+
+    if type_counts:
+        extra_rules = build_extra_rules(requested_types)
+        type_lines = "\n".join([f"- {t}: {type_counts[t]}" for t in requested_types])
+        prompt = f"""
+You are adding questions to an existing comprehension assessment.
+DO NOT rewrite the passage.
+DO NOT modify existing questions.
+
+Passage:
+{passage}
+
+CRITICAL CONSTRAINT (DO NOT VIOLATE):
+- Generate ONLY these question types
+- Generate EXACTLY the number of questions per type listed below
+- JSON keys MUST exactly match the type names
+
+Counts per type:
+{type_lines}
+
+{extra_rules}
+
+Return JSON ONLY:
+{{ "questions": {{ "Type": ["Q1", "Q2"] }} }}
+"""
+    else:
+        if not requested_types:
+            requested_types = ["Multiple Choice Questions"]
+
+        extra_rules = build_extra_rules([requested_types[0]])
+        prompt = f"""
+You are adding questions to an existing comprehension assessment.
+DO NOT rewrite the passage.
+DO NOT modify existing questions.
+
+Passage:
+{passage}
+
+CRITICAL CONSTRAINT (DO NOT VIOLATE):
+- Generate ONLY this question type: {requested_types[0]}
+- DO NOT generate any other question types
+- Generate EXACTLY {add_count} new questions
+- The JSON key MUST be exactly: "{requested_types[0]}"
+
+{extra_rules}
+
+Return JSON ONLY:
+{{ "questions": {{ "{requested_types[0]}": ["Q1", "Q2"] }} }}
+"""
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.4,
+        response_format={"type": "json_object"}
+    )
+
+    new_data = safe_json_loads(response.choices[0].message.content or "")
+    if type_counts:
+        trimmed = {}
+        for qt in requested_types:
+            qlist = new_data.get("questions", {}).get(qt, [])
+            if not isinstance(qlist, list):
+                qlist = [qlist]
+            trimmed[qt] = qlist[:type_counts.get(qt, 0)]
+        new_data = {"questions": trimmed}
+    else:
+        trimmed = {}
+        remaining = add_count
+        for qt in requested_types:
+            qlist = new_data.get("questions", {}).get(qt, [])
+            if not isinstance(qlist, list):
+                qlist = [qlist]
+            if remaining <= 0:
+                break
+            take = qlist[:remaining]
+            if take:
+                trimmed.setdefault(qt, []).extend(take)
+                remaining -= len(take)
+        new_data = {"questions": trimmed}
+
+    # Merge questions safely (canonicalize type names)
+    for qt, qlist in new_data.get("questions", {}).items():
+        qt = canonical_type(qt)
+        existing_questions.setdefault(qt, []).extend(qlist)
+
+    return {
+        "title": assessment_data["title"],
+        "passage": passage,
+        "questions": existing_questions
+    }
+
+
+def restructure_to_single_markdown_json(assessment_data: dict, client, model_name: str):
+    """
+    Produces EXACT format:
+    {
+      title: "...",
+      questions: "<markdown>",
+      answers: "<markdown>"
+    }
+    """
+
+    title = assessment_data.get(
+        "title",
+        assessment_data.get("topic", "Reading Comprehension")
+    )
+
+    passage = assessment_data.get("passage", "")
+    questions_data = assessment_data.get("questions", {})
+
+    # ---------------- QUESTIONS MARKDOWN ----------------
+    questions_md = []
+    questions_md.append(f"# {title}\n")
+    questions_md.append("## Passage Question\n")
+    questions_md.append("Read the following passage and answer the related questions:\n")
+    questions_md.append(passage + "\n")
+
+    q_counter = 1    # because passage question is 1
+
+    for qtype, qlist in questions_data.items():
+        if qtype.lower() == "passage":
+            continue
+
+        questions_md.append("\n---\n")
+        questions_md.append(f"## {qtype}\n")
+
+        if not isinstance(qlist, list):
+            qlist = [qlist]
+
+        for q in qlist:
+            questions_md.append(f"{q_counter}. {q}")
+            q_counter += 1
+
+    # ---------------- ANSWERS MARKDOWN ----------------
+    answers_md = []
+    answers_md.append(f"# Answer Key: {title}\n")
+
+    global_answer_counter = 1  # must match question numbering start
+
+    for qtype, qlist in questions_data.items():
+        if not isinstance(qlist, list):
+            qlist = [qlist]
+
+        answers_md.append(f"\n## {qtype}\n")
+
+        for q in qlist:
+            qa_prompt = f"""
+    Based on the passage below, answer the question.
+
+    Passage:
+    {passage}
+
+    Question:
+    {q}
+
+    Return JSON only:
+    {{ "answer": "<markdown>" }}
+    """
+            try:
+                resp = client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": "Answer generator. JSON only."},
+                        {"role": "user", "content": qa_prompt}
+                    ],
+                    temperature=0.3
+                    #max_tokens=250
+                )
+                content = resp.choices[0].message.content.strip()
+                if content.startswith("```"):
+                    content = content.strip("`").replace("json", "").strip()
+                answer = json.loads(content).get("answer", "Answer unavailable.")
+            except Exception:
+                answer = "Answer unavailable."
+
+            answers_md.append(f"{global_answer_counter}. {answer}")
+            global_answer_counter += 1
+ 
+    # ---------------- FINAL JSON ----------------
+    final_json = {
+        "questions": "\n".join(questions_md).strip(),
+        "answers": "\n".join(answers_md).strip()
+    }
+    print("+++++++++++++++++++++++++++++++++")
+    print(final_json)
+    return final_json
+
+# ---------- Markdown Exporter ----------
+
+def save_assessment_to_markdown(assessment_data: dict):
+    """
+    Converts comprehension assessment JSON into a readable Markdown file.
+    """
+    try:
+        title = assessment_data.get("title", "Untitled Assessment")
+        topic = assessment_data.get("topic", "")
+
+        # -------------------------------------------------------
+        # 📌 Determine passage in all possible JSON shapes
+        # -------------------------------------------------------
+        if "passage" in assessment_data:
+            passage = assessment_data.get("passage", "")
+        elif "passages" in assessment_data and isinstance(assessment_data["passages"], dict):
+            passage = next(iter(assessment_data["passages"].values()), "")
+        else:
+            passage = assessment_data.get("assessment", {}).get("passage", "")
+
+        # -------------------------------------------------------
+        # 📌 Determine questions in all possible shapes
+        # -------------------------------------------------------
+        questions = (
+            assessment_data.get("questions", []) or
+            assessment_data.get("assessment", {}).get("questions", {})
+        )
+
+        # -------------------------------------------------------
+        # 📝 Generate Markdown
+        # -------------------------------------------------------
+        markdown_content = f"# {title}\n\n"
+        markdown_content += f"**Topic:** {topic}\n\n"
+        markdown_content += f"**Generated on:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+        markdown_content += "## 📘 Passage\n\n"
+        markdown_content += passage + "\n\n"
+
+        markdown_content += "## ❓ Questions\n\n"
+
+        # Support for both structures
+        if isinstance(questions, dict):
+            # Original structure: grouped by question type
+            for qtype, qlist in questions.items():
+                markdown_content += f"### {qtype}\n"
+                if isinstance(qlist, list):
+                    for i, q in enumerate(qlist, 1):
+                        markdown_content += f"{i}. {q}\n"
+                else:
+                    markdown_content += f"- {qlist}\n"
+                markdown_content += "\n"
+
+        else:
+            # Unified structure with type/id/instructions/answer
+            for q in questions:
+                markdown_content += f"### {q['type']}\n"
+                markdown_content += f"**Q{q['id']}. {q['instructions']}**\n\n"
+                markdown_content += f"**Answer:** {q['answer']['text']}\n\n"
+                markdown_content += f"**Explanation:** {q.get('explanation', '')}\n\n"
+                markdown_content += "---\n"
+
+        # -------------------------------------------------------
+        # 💾 Save Markdown File
+        # -------------------------------------------------------
+        # with open(output_path, "w", encoding="utf-8") as f:
+        #     f.write(markdown_content)
+
+        # print(f"✅ Markdown worksheet saved: {output_path}")
+
+    except Exception as e:
+        print(f"⚠️ Failed to save markdown: {e}")
+        
+        
+
+def resolve_topic(
+    existing_topic: Optional[str],
+    describe_requirement: Optional[str],
+    text_input: Optional[str],
+    youtube_links: Optional[List[str]],
+    files: Optional[List[str]],
+    websites: Optional[List[str]]
+):
+
+    # ------------------------------------------------
+    # If user provides requirement → extract new topic
+    # ------------------------------------------------
+    if describe_requirement and describe_requirement.strip():
+
+        new_topic = extract_topic_from_inputs(
+            describe_requirement=describe_requirement,
+            text_input=text_input,
+            youtube_links=youtube_links,
+            files=files,
+            websites=websites
+        )
+
+        print(f"\n🧠 Detected Topic: {new_topic}")
+        return new_topic
+
+    # ------------------------------------------------
+    # If no new requirement → reuse old topic
+    # ------------------------------------------------
+    if existing_topic:
+        print(f"\n📌 Using Existing Topic: {existing_topic}")
+        return existing_topic
+
+    # ------------------------------------------------
+    # Absolute fallback
+    # ------------------------------------------------
+    fallback_topic = "General Educational Resources"
+    print(f"\n⚠️ No topic detected. Using fallback: {fallback_topic}")
+    return fallback_topic
+
+
+# ---------- Example Run with Feedback Memory ----------
+
+# if __name__ == "__main__":
+#     describe_requirement = "solar system"
+#     text_input = ""
+#     youtube_links = []
+#     files, websites = [], []
+#     grade, language = "Grade 12", "English"
+#     num_questions=10
+#     question_types=[
+#         "Multiple Choice Questions"
+#     ]
+
+#         # "Essential Question",
+#         # "Multiple Choice Questions",
+#         # "Fill in the Blank Questions",
+#         # "True/False Questions",
+#         # "Short Answer Questions",
+#         # "Open-ended prompts",
+#         # "Essay Questions",
+#         # "Passage"
+
+
+#     dok_level, lexile_level, bloom_level = None, None, None
+
+#     print("\nSelect Optional Frameworks:\n")
+
+#     if input("Add DOK level? (y/n): ").strip().lower() == "y":
+#         dok_levels = [
+#             "Level 1 (Recall)",
+#             "Level 2 (Skill/Concept)",
+#             "Level 3 (Strategic Thinking)",
+#             "Level 4 (Extended Thinking)"
+#         ]
+#         for i, d in enumerate(dok_levels, 1):
+#             print(f"{i}. {d}")
+#         choice = input("Enter (1-4): ").strip()
+#         if choice.isdigit() and 1 <= int(choice) <= 4:
+#             dok_level = dok_levels[int(choice) - 1]
+
+#     if input("Add Lexile level? (y/n): ").strip().lower() == "y":
+#         lexile_level = input("Enter Lexile Reading Level (e.g., 950L): ").strip()
+
+#     if input("Add Bloom’s Taxonomy level? (y/n): ").strip().lower() == "y":
+#         bloom_levels = ["Remember", "Understand", "Apply", "Analyze", "Evaluate", "Create"]
+#         for i, b in enumerate(bloom_levels, 1):
+#             print(f"{i}. {b}")
+#         choice = input("Enter (1-6): ").strip()
+#         if choice.isdigit() and 1 <= int(choice) <= 6:
+#             bloom_level = bloom_levels[int(choice) - 1]
+
+#     # --- Topic Extraction ---
+#     # topic = extract_topic_from_inputs(
+#     #     describe_requirement=describe_requirement,
+#     #     text_input=text_input,
+#     #     youtube_links=youtube_links,
+#     #     files=files,
+#     #     websites=websites
+#     # )
+
+#     # print(f"\n🧠 Extracted Topic: {topic}\n")
+    
+    
+#     topic = resolve_topic(
+#     existing_topic="General Educational Resources",
+#     describe_requirement=describe_requirement,
+#     text_input=text_input,
+#     youtube_links=youtube_links,
+#     files=files,
+#     websites=websites
+#     )
+
+
+#     # --- Initial Comprehension Generation ---
+#     print(f"\n📚 Current Topic Used: {topic}\n")
+
+#     result = generate_comprehension(topic, grade, language, dok_level, lexile_level, bloom_level, describe_requirement, num_questions, question_types)
+#     # print(json.dumps(result, indent=2, ensure_ascii=False))
+
+#     session_result = result
+
+#     #grouped_json = restructure_to_single_markdown_json(result)
+#     grouped_json = restructure_to_single_markdown_json(
+#     result,
+#     client=client,
+#     model_name=model_name
+# )
+
+
+#     print(json.dumps(grouped_json, indent=2, ensure_ascii=False))
+
+
+#     # === Regeneration Loop (Enhanced Logic) ===
+#     while True:
+#         regenerate = input("\n🔁 Do you want to regenerate comprehension worksheet? (y/n): ").strip().lower()
+#         if regenerate != "y":
+#             break
+
+#         print("\n--- Regeneration Mode ---")
+#         print("Enter new inputs to regenerate comprehension (Press Enter to keep old values):\n")
+
+#         #new_topic = input(f"Topic [{topic}]: ").strip() or topic
+        
+#         user_topic_input = input(f"Topic [{topic}] (leave blank to auto-detect/keep): ").strip()
+
+#         new_grade = input(f"Grade [{grade}]: ").strip() or grade
+#         new_language = input(f"Language [{language}]: ").strip() or language
+#         new_feedback = input("Describe new refinement or focus (optional): ").strip()
+
+#         # --- Topic Decision ---
+#         if user_topic_input:
+#             new_topic = user_topic_input
+#             combined_requirement = new_feedback or ""  # Reset old context
+#         else:
+#             new_topic = resolve_topic(
+#                 existing_topic=topic,
+#                 describe_requirement=new_feedback,
+#                 text_input=text_input,
+#                 youtube_links=youtube_links,
+#                 files=files,
+#                 websites=websites
+#             )
+        
+#         # Keep continuity if topic was auto-resolved
+#         combined_requirement = (
+#             f"Previous Requirements:\n{describe_requirement or 'None'}\n\n"
+#             f"New Inputs:\n{new_feedback or 'None'}"
+#         )
+
+
+#         # ✅ Ask whether to modify num_questions
+#         new_num_questions_input = input(f"Number of Questions [{num_questions}]: ").strip()
+#         new_num_questions = int(new_num_questions_input) if new_num_questions_input.isdigit() else num_questions
+
+#         # ✅ Ask whether to modify question types
+#         print("\nCurrent Question Types:")
+#         for i, qtype in enumerate(question_types, 1):
+#             print(f"{i}. {qtype}")
+#         change_qtypes = input("\nDo you want to modify question types? (y/n): ").strip().lower()
+
+#         new_question_types = question_types
+#         if change_qtypes == "y":
+#             print("Enter new question types separated by commas (e.g., Multiple Choice, Short Answer, True/False):")
+#             new_types_input = input("New Question Types: ").strip()
+#             if new_types_input:
+#                 new_question_types = [t.strip() for t in new_types_input.split(",") if t.strip()]
+
+#         # Combine previous and new context
+#         combined_requirement = (
+#             f"Previous Requirements:\n{describe_requirement or 'None'}\n\n"
+#             f"New Inputs:\n{new_feedback or 'None'}"
+#         )
+
+#         print("\n🔧 Regenerating comprehension with combined context...")
+#         #print(f"\n📚 Current Topic Used: {new_topic}\n")
+
+#         regenerated_result = generate_comprehension(
+#             topic=new_topic,
+#             grade=new_grade,
+#             language=new_language,
+#             dok_level=dok_level,
+#             lexile_level=lexile_level,
+#             bloom_level=bloom_level,
+#             describe_requirement=combined_requirement,
+#             num_questions=new_num_questions,
+#             question_types=new_question_types
+#         )
+#         session_result = regenerated_result
+
+#         grouped_json = restructure_to_single_markdown_json(regenerated_result, client=client, model_name=model_name)
+
+#         print(json.dumps(grouped_json, indent=2, ensure_ascii=False))
+        
+#         session_memory = combined_requirement
+
+#         # ✅ Update all variables for next regeneration iteration
+#         topic = new_topic
+#         grade = new_grade
+#         language = new_language
+#         #describe_requirement = combined_requirement
+#         session_memory = combined_requirement
+#         num_questions = new_num_questions
+#         question_types = new_question_types
+
+#     # === Quick Actions Loop ===
+#     while True:
+#         quick_action = input("\n⚡ Do you want to perform a quick action? (y/n): ").strip().lower()
+#         if quick_action != "y":
+#             print("\n✅ No further quick actions. Exiting.")
+#             break
+
+#         print("\nQuick Action Options:")
+#         print("1. Add More")
+#         print("2. Exit Quick Actions")
+
+#         choice = input("Select an option (1-2): ").strip()
+#         if choice == "2":
+#             break
+
+#         if choice == "1":
+#             print("\nAdd More Options:")
+#             print("1. Question Types")
+#             print("2. Questions")
+
+#             sub_choice = input("Select (1-2): ").strip()
+
+#             if sub_choice == "1":
+#                 editable_prompt = (
+#                     f"Add more types of questions to the provided text about {topic}, "
+#                     "including matching and scenario-based questions."
+#                 )
+#             elif sub_choice == "2":
+#                 editable_prompt = (
+#                     f"Add more questions under different question types to the provided resource about {topic}."
+#                 )
+#             else:
+#                 print("Invalid selection.")
+#                 continue
+
+#             print(f"\n📝 Editable Prompt:\n{editable_prompt}")
+#             confirm = input("\nWould you like to edit this prompt before generation? (y/n): ").strip().lower()
+#             if confirm == "y":
+#                 editable_prompt = input("Enter your modified quick action prompt:\n").strip() or editable_prompt
+
+#             # Combine old context + quick action
+#             combined_quick_context = (
+#                 f"Previous Requirements:\n{describe_requirement or 'None'}\n\n"
+#                 f"Quick Action Prompt:\n{editable_prompt}"
+#             )
+
+#             print("\n⚙️ Generating new comprehension content for quick action...")
+            
+#             topic = resolve_topic(
+#                 existing_topic=topic,
+#                 describe_requirement=editable_prompt,
+#                 text_input=text_input,
+#                 youtube_links=youtube_links,
+#                 files=files,
+#                 websites=websites
+#             )
+
+#             #print(f"\n📚 Current Topic Used: {new_topic}\n")
+
+#             quick_action_result = generate_comprehension(
+#                 topic=topic,
+#                 grade=grade,
+#                 language=language,
+#                 dok_level=dok_level,
+#                 lexile_level=lexile_level,
+#                 bloom_level=bloom_level,
+#                 describe_requirement=combined_quick_context,
+#                 assessment_data=quick_action_result if 'quick_action_result' in locals() else result
+#             )
+            
+#             session_result = quick_action_result
+
+
+#             grouped_json = restructure_to_single_markdown_json(quick_action_result, client=client, model_name=model_name)
+
+#             print(json.dumps(grouped_json, indent=2, ensure_ascii=False))
