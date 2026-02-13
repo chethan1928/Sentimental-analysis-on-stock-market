@@ -1067,4 +1067,4 @@ def resolve_topic(
 
 #             grouped_json = restructure_to_single_markdown_json(quick_action_result, client=client, model_name=model_name)
 
-#             print(json.dumps(grouped_json, indent=2, ensure_ascii=False))
+#             print(json.dumps(grouped_json, indent=2, ensure_ascii=False)
