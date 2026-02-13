@@ -1,3 +1,4 @@
+
 import os
 import re
 import json
@@ -440,12 +441,30 @@ Return example structure:
         match = re.search(r'add\s+(\d+)', describe_requirement.lower())
         if match:
             add_count = int(match.group(1))
+        else:
+            word_nums = {
+                "one": 1,
+                "two": 2,
+                "three": 3,
+                "four": 4,
+                "five": 5,
+                "six": 6,
+                "seven": 7,
+                "eight": 8,
+                "nine": 9,
+                "ten": 10
+            }
+            req_lower = describe_requirement.lower()
+            for word, val in word_nums.items():
+                if f"add {word}" in req_lower:
+                    add_count = val
+                    break
 
     # Detect requested type (supports abbreviations like "MCQ", "T/F", etc.)
     type_aliases = {
-        "multiple choice questions": ["mcq", "multiple choice", "mc"],
-        "fill in the blank questions": ["fill in the blank", "fitb", "blank"],
-        "true/false questions": ["true/false", "true false", "t/f", "tf"],
+        "multiple choice questions": ["mcq", "multiple choice", "multiple-choice", "mc"],
+        "fill in the blank questions": ["fill in the blank", "fill-in-the-blank", "fill blank", "fitb", "blank"],
+        "true/false questions": ["true/false", "true false", "true-false", "t/f", "tf"],
         "short answer questions": ["short answer", "short"],
         "essay questions": ["essay"],
         "open-ended prompts": ["open-ended", "open ended"],
@@ -490,10 +509,24 @@ Return JSON ONLY:
     response = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.4
+        temperature=0.4,
+        response_format={"type": "json_object"}
     )
 
-    new_data = json.loads(response.choices[0].message.content.strip())
+    new_data = safe_json_loads(response.choices[0].message.content or "")
+    trimmed = {}
+    remaining = add_count
+    for qt in requested_types:
+        qlist = new_data.get("questions", {}).get(qt, [])
+        if not isinstance(qlist, list):
+            qlist = [qlist]
+        if remaining <= 0:
+            break
+        take = qlist[:remaining]
+        if take:
+            trimmed.setdefault(qt, []).extend(take)
+            remaining -= len(take)
+    new_data = {"questions": trimmed}
 
     # Merge questions safely
     for qt, qlist in new_data.get("questions", {}).items():
