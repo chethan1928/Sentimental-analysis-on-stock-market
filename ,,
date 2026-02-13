@@ -1,4 +1,3 @@
-
 import os
 import re
 import json
@@ -182,6 +181,26 @@ def extract_topic_from_inputs(
 import json
 from typing import List, Union
 
+TYPE_CANONICAL = {
+    "mcq": "Multiple Choice Questions",
+    "multiple choice": "Multiple Choice Questions",
+    "multiple-choice": "Multiple Choice Questions",
+    "true/false": "True/False Questions",
+    "true false": "True/False Questions",
+    "t/f": "True/False Questions",
+    "tf": "True/False Questions",
+    "fill in the blank": "Fill in the Blank Questions",
+    "fill-in-the-blank": "Fill in the Blank Questions",
+    "fill blank": "Fill in the Blank Questions",
+    "fitb": "Fill in the Blank Questions",
+}
+
+
+def canonical_type(name: str) -> str:
+    key = name.strip().lower()
+    return TYPE_CANONICAL.get(key, name)
+
+
 def normalize_question_types(qt: Union[str, list, tuple, None]) -> List[str]:
     """
     Ensures question_types is ALWAYS a List[str].
@@ -192,11 +211,11 @@ def normalize_question_types(qt: Union[str, list, tuple, None]) -> List[str]:
 
     # Already correct
     if isinstance(qt, list):
-        return [str(x) for x in qt]
+        return [canonical_type(str(x)) for x in qt]
 
     # Tuple → list
     if isinstance(qt, tuple):
-        return [str(x) for x in qt]
+        return [canonical_type(str(x)) for x in qt]
 
     # JSON string from DB
     if isinstance(qt, str):
@@ -206,16 +225,16 @@ def normalize_question_types(qt: Union[str, list, tuple, None]) -> List[str]:
         try:
             parsed = json.loads(qt)
             if isinstance(parsed, list):
-                return [str(x) for x in parsed]
+                return [canonical_type(str(x)) for x in parsed]
         except Exception:
             pass
 
         # Fallback: comma-separated string
         if "," in qt:
-            return [q.strip() for q in qt.split(",") if q.strip()]
+            return [canonical_type(q.strip()) for q in qt.split(",") if q.strip()]
 
         # Last resort: single type
-        return [qt]
+        return [canonical_type(qt)]
 
     # Absolute fallback
     return []
@@ -528,8 +547,9 @@ Return JSON ONLY:
             remaining -= len(take)
     new_data = {"questions": trimmed}
 
-    # Merge questions safely
+    # Merge questions safely (canonicalize type names)
     for qt, qlist in new_data.get("questions", {}).items():
+        qt = canonical_type(qt)
         existing_questions.setdefault(qt, []).extend(qlist)
 
     return {
